@@ -1,0 +1,20 @@
+tool: scannet
+group: detection
+image: mnprot-scannet:latest
+gpu: false
+description: ScanNet residue-level PPI/interface prediction.
+inputs:
+  target_pdb:
+    type: pdb
+    required: true
+params:
+  no_msa:
+    type: bool
+    default: true
+outputs:
+  scored_pdb:
+    path: artifacts/scannet/**/*.pdb
+    type: pdb
+  residue_scores:
+    path: artifacts/scannet/**/*.csv
+    type: residue_score_table

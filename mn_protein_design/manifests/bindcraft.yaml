@@ -1,0 +1,38 @@
+tool: bindcraft
+group: design
+image: ovo-bindcraft:latest
+gpu: true
+description: BindCraft binder design or reduced trajectory generation against a prepared target.
+inputs:
+  target_pdb:
+    type: pdb
+    required: true
+params:
+  target_chains:
+    type: chain_list
+    required: true
+  hotspots:
+    type: residue_list
+    required: false
+  binder_length:
+    type: string
+    default: 55
+  number_of_final_designs:
+    type: integer
+    default: 1
+  time_limit_seconds:
+    type: integer
+    default: 900
+  single_af_model:
+    type: bool
+    default: true
+  enable_mpnn:
+    type: bool
+    default: false
+outputs:
+  bindcraft_output:
+    path: artifacts/raw/bindcraft/output/
+    type: directory
+  candidates:
+    path: artifacts/normalized_candidates/candidates.jsonl
+    type: normalized_candidates

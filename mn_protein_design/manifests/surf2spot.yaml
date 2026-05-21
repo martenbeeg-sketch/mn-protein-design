@@ -1,0 +1,24 @@
+tool: surf2spot
+group: hotspot-detection
+image: mnprot-surf2spot-cu128:latest
+gpu: true
+description: Surf2Spot hotspot prediction pipeline.
+inputs:
+  target_pdb:
+    type: pdb
+    required: true
+params:
+  mode:
+    type: enum
+    default: HS
+    choices: [HS]
+outputs:
+  hotspot_tables:
+    path: artifacts/surf2spot/predict/*.csv
+    type: hotspot_table
+  hotspot_surfaces:
+    path: artifacts/surf2spot/predict/*_pred.ply
+    type: surface_mesh
+  pymol_sessions:
+    path: artifacts/surf2spot/predict/*.pse
+    type: pymol_session

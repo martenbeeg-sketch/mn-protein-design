@@ -1,0 +1,5 @@
+tool: genie3
+group: design
+image: mnprot-genie3-cu128:latest
+gpu: true
+description: Genie3 target-conditioned BinderBench PDL1 generation contract.

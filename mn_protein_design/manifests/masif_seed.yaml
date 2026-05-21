@@ -1,0 +1,22 @@
+tool: masif_seed
+group: ppi-detection
+image: masif_seed:latest
+gpu: true
+description: MaSIF-seed target surface/site prediction for one prepared target chain.
+inputs:
+  target_pdb:
+    type: pdb
+    required: true
+  chain_id:
+    type: chain
+    required: true
+outputs:
+  predicted_surface:
+    path: artifacts/masif_seed/pred_surfaces/*.ply
+    type: surface_mesh
+  site_predictions:
+    path: artifacts/masif_seed/pred_data/*.npy
+    type: masif_site_prediction
+  target_run:
+    path: artifacts/masif_seed/target_run/
+    type: directory

@@ -1,0 +1,42 @@
+tool: rfdiffusion_classic
+group: design
+image: ovo-rfdiffusion:latest
+gpu: true
+description: RFdiffusion classic binder-backbone generation against a prepared target.
+inputs:
+  target_pdb:
+    type: pdb
+    required: true
+params:
+  target_chains:
+    type: chain_list
+    required: true
+  contig:
+    type: string
+    required: true
+  hotspots:
+    type: residue_list
+    required: false
+  binder_length:
+    type: string
+    default: 55-55
+  num_designs:
+    type: integer
+    default: 1
+  timesteps:
+    type: integer
+    default: 50
+  model_weights:
+    type: enum
+    default: Complex_base
+    choices: [Complex_base, Complex_beta]
+outputs:
+  complexes:
+    path: artifacts/raw/rfdiffusion/output/*.pdb
+    type: designed_complex_pdb
+  trb:
+    path: artifacts/raw/rfdiffusion/output/*.trb
+    type: rfdiffusion_trb
+  candidates:
+    path: artifacts/normalized_candidates/candidates.jsonl
+    type: normalized_candidates

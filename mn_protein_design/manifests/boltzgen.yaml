@@ -1,0 +1,5 @@
+tool: boltzgen
+group: design
+image: boltzgen:latest
+gpu: true
+description: BoltzGen design-only protein-anything run.

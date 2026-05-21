@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mn-protein-design"
+version = "0.0.1"
+description = "Small Streamlit workbench for Docker-orchestrated protein design workflows"
+readme = "APP_BUILD_PLAN.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas",
+  "pyyaml",
+  "streamlit",
+  "typer",
+]
+
+[project.scripts]
+mn-protein-design = "mn_protein_design.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["mn_protein_design*"]
+
+[tool.setuptools.package-data]
+"*" = [
+  "*.yaml",
+  "pipelines/**/*.nf",
+  "pipelines/**/*.config",
+  "app/components/molstar_viewer/frontend/build/*",
+]

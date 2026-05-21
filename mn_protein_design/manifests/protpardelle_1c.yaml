@@ -1,0 +1,5 @@
+tool: protpardelle_1c
+group: design
+image: mnprot-protpardelle-1c-cu128:latest
+gpu: true
+description: Protpardelle-1c motif-conditioned binder backbone sampling contract.

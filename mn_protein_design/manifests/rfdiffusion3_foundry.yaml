@@ -1,0 +1,5 @@
+tool: rfdiffusion3_foundry
+group: design
+image: ovoex-foundry-cu128:latest
+gpu: true
+description: RFdiffusion3 / Foundry binder design using staged JSON input.

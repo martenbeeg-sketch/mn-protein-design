@@ -1,0 +1,30 @@
+.msp-plugin {
+  width: inherit;
+}
+
+.msp-plugin .msp-layout-expanded {
+  position: inherit;
+}
+
+.msp-layout-top, .msp-selection-viewport-controls {
+  z-index: 2;
+}
+
+.msp-layout-contig {
+  z-index: 1;
+  position: absolute;
+  top: 4px;
+  left: 5px;
+}
+
+.msp-plugin .msp-sequence-wrapper .msp-sequence-residue-selected,
+.msp-plugin .msp-sequence-wrapper .msp-sequence-residue-highlighted,
+.msp-plugin .msp-sequence-wrapper .msp-sequence-residue-focused {
+  color: #2563eb !important;
+  font-weight: 700;
+}
+
+.msp-plugin .msp-sequence-wrapper .mnpd-sequence-highlighted-residue {
+  color: var(--mnpd-sequence-highlight-color, #2563eb) !important;
+  font-weight: 700;
+}

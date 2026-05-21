@@ -1,0 +1,55 @@
+name: mn-protein-design
+
+services:
+  scannet:
+    image: mnprot-scannet:latest
+    build:
+      context: .
+      dockerfile: containers/scannet/Dockerfile
+      platforms: ["linux/x86_64"]
+
+  surf2spot:
+    image: mnprot-surf2spot-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/surf2spot/Dockerfile
+      platforms: ["linux/x86_64"]
+      args:
+        INSTALL_ESMFOLD: "false"
+
+  masif-seed:
+    image: masif_seed:latest
+    build:
+      context: tools_to_implement/masif_seed
+      dockerfile: Dockerfile
+      platforms: ["linux/x86_64"]
+
+  genie3:
+    image: mnprot-genie3-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/genie3/Dockerfile
+      platforms: ["linux/x86_64"]
+      args:
+        DOWNLOAD_WEIGHTS: "false"
+        DOWNLOAD_TRAINING_DATA: "false"
+
+  pxdesign:
+    image: mnprot-pxdesign-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/pxdesign/Dockerfile
+      platforms: ["linux/x86_64"]
+
+  protpardelle-1c:
+    image: mnprot-protpardelle-1c-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/protpardelle-1c/Dockerfile
+      platforms: ["linux/x86_64"]
+
+  ligandmpnn:
+    image: ovo-ligandmpnn:latest
+
+  foundry-cu128:
+    image: ovoex-foundry-cu128:latest

@@ -1,0 +1,15 @@
+name: mn-protein-design
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pandas
+  - pdbfixer
+  - pyyaml
+  - openjdk=17
+  - nextflow
+  - streamlit
+  - typer
+  - pip
+  - pip:
+      - -e .

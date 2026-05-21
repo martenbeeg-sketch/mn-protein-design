@@ -1,0 +1,30 @@
+tool: foundry_mpnn
+group: design
+image: ovoex-foundry-cu128:latest
+gpu: true
+description: Foundry-native LigandMPNN sequence design for RFdiffusion3 / Foundry CIF candidates.
+inputs:
+  candidates_jsonl:
+    type: normalized_candidates
+    required: true
+params:
+  checkpoint_path:
+    type: path
+    default: /weights/ligandmpnn_v_32_010_25.pt
+  model_type:
+    type: enum
+    default: ligand_mpnn
+    choices: [ligand_mpnn]
+  batch_size:
+    type: integer
+    default: 10
+  number_of_batches:
+    type: integer
+    default: 1
+outputs:
+  sequence_structures:
+    path: artifacts/raw/foundry_mpnn/output/**/*.cif
+    type: cif
+  candidates:
+    path: artifacts/normalized_candidates/candidates.jsonl
+    type: normalized_candidates
