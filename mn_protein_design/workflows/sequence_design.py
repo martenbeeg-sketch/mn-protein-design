@@ -15,6 +15,29 @@ from mn_protein_design.core.manifests import load_manifest
 
 DESIGN_GROUP = "design"
 
+AA3_TO_1 = {
+    "ALA": "A",
+    "ARG": "R",
+    "ASN": "N",
+    "ASP": "D",
+    "CYS": "C",
+    "GLN": "Q",
+    "GLU": "E",
+    "GLY": "G",
+    "HIS": "H",
+    "ILE": "I",
+    "LEU": "L",
+    "LYS": "K",
+    "MET": "M",
+    "PHE": "F",
+    "PRO": "P",
+    "SER": "S",
+    "THR": "T",
+    "TRP": "W",
+    "TYR": "Y",
+    "VAL": "V",
+}
+
 
 def _rel_path(run_dir: Path, path: Path | None) -> str | None:
     if path is None:
@@ -81,6 +104,24 @@ def _read_fasta_sequences(path: Path) -> list[dict[str, Any]]:
     return parsed
 
 
+def _designed_sequence_from_multichain_fasta(sequence: str, input_pdb: Path | None, design_chains: list[str]) -> str:
+    sequence = sequence.strip().replace(" ", "")
+    if ":" not in sequence:
+        return sequence
+    parts = sequence.split(":")
+    if not input_pdb or not input_pdb.exists() or not design_chains:
+        return parts[0]
+    chain_order = _chain_ids_from_pdb(input_pdb)
+    by_chain = {chain: parts[index] for index, chain in enumerate(chain_order) if index < len(parts)}
+    selected = [by_chain[chain] for chain in design_chains if chain in by_chain]
+    return "".join(selected) if selected else parts[0]
+
+
+def _ligandmpnn_design_index(header: str) -> int | None:
+    match = re.search(r"(?:^|,\s*)id=(\d+)", header)
+    return int(match.group(1)) if match else None
+
+
 def _run_shell_steps(run_dir: Path, steps: list[dict]) -> int:
     write_json(run_dir / "command.json", {"mode": "docker", "steps": steps})
     update_status(run_dir, "running")
@@ -120,16 +161,29 @@ def _normalize_ligandmpnn_candidates(
         input_pdb = candidate_input_paths.get(source_id)
         design_chains = params.get("design_chains_by_candidate", {}).get(source_id, [])
         for fasta_path in fasta_files:
-            for index, seq_row in enumerate(_read_fasta_sequences(fasta_path), start=1):
+            designed_count = 0
+            for seq_row in _read_fasta_sequences(fasta_path):
+                header = str(seq_row.get("header") or "")
+                if " id=" not in f" {header}":
+                    continue
+                designed_count += 1
+                design_index = _ligandmpnn_design_index(header) or designed_count
+                sequence_index = designed_count
+                backbone_path = raw_root / "output" / source_id / "backbones" / f"{source_id}_{design_index}.pdb"
+                binder_sequence = _designed_sequence_from_multichain_fasta(
+                    str(seq_row.get("sequence") or ""),
+                    input_pdb,
+                    design_chains,
+                )
                 normalized.append(
                     {
-                        "candidate_id": f"{source_id}_{params['model_type']}_{index:03d}",
+                        "candidate_id": f"{source_id}_{params['model_type']}_{sequence_index:03d}",
                         "stage": STAGE_SEQUENCE_DESIGN,
                         "source_tool": params["model_type"],
                         "target_pdb": source.get("target_pdb"),
-                        "complex_pdb": _rel_path(run_dir, input_pdb),
+                        "complex_pdb": _rel_path(run_dir, backbone_path if backbone_path.exists() else input_pdb),
                         "binder_pdb": None,
-                        "binder_sequence": seq_row.get("sequence"),
+                        "binder_sequence": binder_sequence,
                         "target_chains": source.get("target_chains", []),
                         "binder_chains": design_chains,
                         "hotspots": source.get("hotspots", []),
@@ -141,6 +195,8 @@ def _normalize_ligandmpnn_candidates(
                             "source_candidate": source,
                             "fasta": _rel_path(run_dir, fasta_path),
                             "fasta_header": seq_row.get("header"),
+                            "sequence_index": sequence_index,
+                            "ligandmpnn_design_index": design_index,
                         },
                     }
                 )
@@ -156,6 +212,7 @@ def run_ligandmpnn_sequence_design(
     sampling_temp: float = 0.0001,
     omit_aas: str = "CX",
     seed: int | None = None,
+    require_backbone_hotspot_filter_pass: bool = False,
 ) -> Path:
     source_run_dir = Path(source_run_dir)
     candidates_jsonl = Path(candidates_jsonl)
@@ -166,8 +223,14 @@ def run_ligandmpnn_sequence_design(
     source_candidates = [
         candidate for candidate in read_candidates(candidates_jsonl) if candidate.get("stage") == STAGE_GENERATION_BACKBONE
     ]
+    if require_backbone_hotspot_filter_pass:
+        source_candidates = [
+            candidate
+            for candidate in source_candidates
+            if (candidate.get("metrics") or {}).get("passes_backbone_hotspot_filter") is not False
+        ]
     if not source_candidates:
-        raise ValueError("No generation.backbone candidates were found in the selected candidate set.")
+        raise ValueError("No generation.backbone candidates were found in the selected candidate set after filters.")
 
     manifest = load_manifest("ligandmpnn")
     params = {
@@ -179,6 +242,7 @@ def run_ligandmpnn_sequence_design(
         "sampling_temp": sampling_temp,
         "omit_AAs": omit_aas,
         "seed": seed,
+        "require_backbone_hotspot_filter_pass": require_backbone_hotspot_filter_pass,
     }
     job = create_job(
         DESIGN_GROUP,
@@ -241,7 +305,7 @@ def run_ligandmpnn_sequence_design(
             "-v",
             f"{job.run_dir}:/work",
             "-w",
-            "/work",
+            "/opt/LigandMPNN",
             manifest["image"],
             *args,
         ]
@@ -289,6 +353,65 @@ def _stage_foundry_structure(source_path: Path, staged_path: Path) -> None:
         shutil.copy2(source_path, staged_path)
 
 
+def _cif_atom_rows(path: Path) -> list[dict[str, str]]:
+    text = gzip.open(path, "rt", errors="ignore").read() if path.name.endswith(".gz") else path.read_text(errors="ignore")
+    rows: list[dict[str, str]] = []
+    atom_headers: list[str] = []
+    in_atom_loop = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line == "loop_":
+            atom_headers = []
+            in_atom_loop = False
+            continue
+        if line.startswith("_atom_site."):
+            atom_headers.append(line.split(".", 1)[1])
+            in_atom_loop = True
+            continue
+        if not in_atom_loop or not line.startswith(("ATOM ", "HETATM ")):
+            continue
+        parts = line.split()
+        if len(parts) >= len(atom_headers):
+            rows.append(dict(zip(atom_headers, parts)))
+    return rows
+
+
+def _chains_from_cif(path: Path) -> list[str]:
+    chains: list[str] = []
+    seen: set[str] = set()
+    for row in _cif_atom_rows(path):
+        chain = row.get("auth_asym_id") or row.get("label_asym_id") or "_"
+        if chain not in seen:
+            seen.add(chain)
+            chains.append(chain)
+    return chains
+
+
+def _sequence_from_cif(path: Path, chains: list[str] | None = None) -> str:
+    keep_chains = set(chains or [])
+    residues: list[tuple[str, int, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in _cif_atom_rows(path):
+        if (row.get("label_atom_id") or row.get("auth_atom_id")) != "CA":
+            continue
+        chain = row.get("auth_asym_id") or row.get("label_asym_id") or "_"
+        if keep_chains and chain not in keep_chains:
+            continue
+        residue = row.get("auth_seq_id") or row.get("label_seq_id") or "0"
+        insertion = row.get("pdbx_PDB_ins_code") or ""
+        key = (chain, residue, insertion)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            residue_number = int(residue)
+        except ValueError:
+            residue_number = 0
+        residues.append((chain, residue_number, insertion, AA3_TO_1.get((row.get("label_comp_id") or row.get("auth_comp_id") or "").upper(), "X")))
+    residues.sort(key=lambda item: (item[0], item[1], item[2]))
+    return "".join(row[3] for row in residues)
+
+
 def _normalize_foundry_mpnn_candidates(
     run_dir: Path,
     source_candidates: list[dict[str, Any]],
@@ -302,9 +425,18 @@ def _normalize_foundry_mpnn_candidates(
         if not source_id:
             continue
         output_dir = raw_root / "output" / source_id
-        cif_files = sorted(output_dir.glob("*.cif"))
+        cif_files = sorted([*output_dir.glob("*.cif"), *output_dir.glob("*.cif.gz")])
         input_path = candidate_input_paths.get(source_id)
         for index, cif_path in enumerate(cif_files, start=1):
+            output_chains = _chains_from_cif(cif_path)
+            target_chains = [chain for chain in source.get("target_chains", []) if chain in output_chains]
+            binder_chains = [chain for chain in output_chains if chain not in set(target_chains)]
+            if not binder_chains and len(output_chains) == 1 and source.get("source_tool") != "rfdiffusion3_foundry":
+                binder_chains = output_chains
+                target_chains = []
+            if not binder_chains:
+                continue
+            binder_sequence = _sequence_from_cif(cif_path, binder_chains or None)
             normalized.append(
                 {
                     "candidate_id": f"{source_id}_foundry_mpnn_{index:03d}",
@@ -313,9 +445,9 @@ def _normalize_foundry_mpnn_candidates(
                     "target_pdb": source.get("target_pdb"),
                     "complex_pdb": _rel_path(run_dir, cif_path),
                     "binder_pdb": None,
-                    "binder_sequence": None,
-                    "target_chains": source.get("target_chains", []),
-                    "binder_chains": [],
+                    "binder_sequence": binder_sequence,
+                    "target_chains": target_chains or source.get("target_chains", []),
+                    "binder_chains": binder_chains,
                     "hotspots": source.get("hotspots", []),
                     "binder_length": source.get("binder_length"),
                     "contig": source.get("contig"),
@@ -325,6 +457,7 @@ def _normalize_foundry_mpnn_candidates(
                         "source_candidate": source,
                         "input_cif": _rel_path(run_dir, input_path),
                         "mpnn_cif": _rel_path(run_dir, cif_path),
+                        "output_chains": output_chains,
                     },
                 }
             )
@@ -336,6 +469,7 @@ def run_foundry_mpnn_sequence_design(
     candidates_jsonl: Path,
     number_of_batches: int = 1,
     batch_size: int = 10,
+    model_type: str = "ligand_mpnn",
     checkpoint_path: str = "/weights/ligandmpnn_v_32_010_25.pt",
 ) -> Path:
     source_run_dir = Path(source_run_dir)
@@ -356,8 +490,8 @@ def run_foundry_mpnn_sequence_design(
         "candidates_jsonl": str(candidates_jsonl),
         "number_of_batches": number_of_batches,
         "batch_size": batch_size,
+        "model_type": model_type,
         "checkpoint_path": checkpoint_path,
-        "model_type": "ligand_mpnn",
     }
     job = create_job(
         DESIGN_GROUP,
@@ -376,6 +510,8 @@ def run_foundry_mpnn_sequence_design(
     steps: list[dict] = []
 
     for candidate in source_candidates:
+        if candidate.get("source_tool") == "rfdiffusion3_foundry" and not candidate.get("binder_chains"):
+            continue
         source_id = str(candidate["candidate_id"])
         source_structure = _resolve_candidate_path(source_run_dir, candidate.get("complex_pdb") or candidate.get("binder_pdb"))
         if source_structure is None or not source_structure.exists():
@@ -396,6 +532,8 @@ def run_foundry_mpnn_sequence_design(
             f"{job.run_dir}:/work",
             "-v",
             "/mnt/db/reference_files/foundry:/weights:ro",
+            "-v",
+            "/mnt/db/reference_files/protpardelle-1c/model_params/LigandMPNN:/ligandmpnn_weights:ro",
             "-w",
             "/work",
             manifest["image"],
@@ -407,7 +545,7 @@ def run_foundry_mpnn_sequence_design(
             "--is_legacy_weights",
             "True",
             "--model_type",
-            "ligand_mpnn",
+            model_type,
             "--batch_size",
             str(batch_size),
             "--number_of_batches",

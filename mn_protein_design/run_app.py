@@ -19,18 +19,17 @@ def _page(package_root: Path, relative: str, title: str, slug: str, default: boo
 
 
 def main() -> None:
-    st.set_page_config(page_title="mn-protein-design", layout="wide")
+    package_root = Path(mn_protein_design.__file__).resolve().parent
+    icon_path = package_root / "app" / "assets" / "icon.png"
+
+    st.set_page_config(page_title="mn-protein-design", page_icon=str(icon_path), layout="wide")
     st.sidebar.title("mn-protein-design")
     st.sidebar.caption("Docker-backed protein design workbench")
 
-    package_root = Path(mn_protein_design.__file__).resolve().parent
     pg = st.navigation(
         {
             "Jobs": [
-                _page(package_root, "app/pages/jobs.py", "Jobs / Results", "jobs", default=True),
-                _page(package_root, "app/pages/jobs_target.py", "Jobs - Target Prep", "jobs-target-prep"),
-                _page(package_root, "app/pages/jobs_detection.py", "Jobs - Detection", "jobs-detection"),
-                _page(package_root, "app/pages/jobs_design.py", "Jobs - Design", "jobs-design"),
+                _page(package_root, "app/pages/jobs.py", "Jobs", "jobs", default=True),
             ],
             "Tasks": [
                 _page(package_root, "app/pages/target_preparation.py", "Target Preparation", "target-preparation"),
@@ -38,7 +37,6 @@ def main() -> None:
                 _page(package_root, "app/pages/target_cropping.py", "Target Cropping", "target-cropping"),
                 _page(package_root, "app/pages/design.py", "Design", "design"),
                 _page(package_root, "app/pages/sequence_design.py", "Sequence Design", "sequence-design"),
-                _page(package_root, "app/pages/campaigns.py", "Campaigns", "campaigns"),
                 _page(package_root, "app/pages/refolding.py", "Refolding / Validation", "refolding-validation"),
                 _page(package_root, "app/pages/analysis.py", "Analysis", "analysis"),
             ],

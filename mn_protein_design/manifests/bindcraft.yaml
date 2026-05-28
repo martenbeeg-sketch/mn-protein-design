@@ -20,6 +20,9 @@ params:
   number_of_final_designs:
     type: integer
     default: 1
+  num_sequences:
+    type: integer
+    default: 1
   time_limit_seconds:
     type: integer
     default: 900

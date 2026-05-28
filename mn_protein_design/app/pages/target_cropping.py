@@ -784,34 +784,6 @@ with left:
         state["confirmed_draft_residues"] = set(current_candidate)
         _rerun_viewer()
 
-    st.divider()
-
-    state["debug_mapping"] = st.checkbox(
-        "Show Mol* / PDB residue mapping debug",
-        value=state.get("debug_mapping", False),
-    )
-
-    if state["debug_mapping"]:
-        with st.expander("Debug Mol* residue mapping", expanded=True):
-            st.write("Raw Mol* value:")
-            st.json(viewer_value if viewer_value else {})
-
-            st.write("Mapped Mol* residues used by Python:")
-            st.write(sorted(viewer_selected))
-
-            st.write("PDB sequence-index mapping preview:")
-            preview = {
-                chain: dict(list(chain_map.items())[:20])
-                for chain, chain_map in residue_index_map.items()
-            }
-            st.json(preview)
-
-            st.write("PDB residue-number preview:")
-            st.json({chain: sorted(values)[:20] for chain, values in residue_number_set.items()})
-
-            st.write("Sphere center residues:")
-            st.write(sorted(viewer_selected))
-
 
 # ---------------------------------------------------------------------
 # Confirmed draft crop

@@ -122,6 +122,7 @@ def collect_jobs(task_group: str | None = None) -> list[dict]:
             metadata = read_json(run_dir / "metadata.json")
             result = read_json(run_dir / "result.json")
             input_payload = read_json(run_dir / "input.json")
+            input_params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
             status = metadata.get("status") or ("completed" if result.get("success") else "unknown")
             if result.get("success") is False:
                 status = "failed"
@@ -133,6 +134,10 @@ def collect_jobs(task_group: str | None = None) -> list[dict]:
                     "job_type": metadata.get("job_type") or input_payload.get("job_type", ""),
                     "tool": metadata.get("tool") or input_payload.get("tool", ""),
                     "status": status,
+                    "campaign_name": metadata.get("campaign_name") or input_params.get("campaign_name", ""),
+                    "campaign_id": metadata.get("campaign_id", ""),
+                    "campaign_step": metadata.get("campaign_step", ""),
+                    "campaign_step_index": metadata.get("campaign_step_index", ""),
                     "created_at": metadata.get("created_at", ""),
                     "updated_at": metadata.get("updated_at", ""),
                     "success": result.get("success"),
@@ -156,3 +161,98 @@ def delete_job_run(task_group: str, run_id: str) -> Path:
         raise NotADirectoryError(f"Job run is not a directory: {run_dir}")
     shutil.rmtree(run_dir)
     return run_dir
+
+
+def _iter_payload_strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        strings: list[str] = []
+        for child in value.values():
+            strings.extend(_iter_payload_strings(child))
+        return strings
+    if isinstance(value, list):
+        strings: list[str] = []
+        for child in value:
+            strings.extend(_iter_payload_strings(child))
+        return strings
+    return []
+
+
+def _job_identity(row: dict) -> tuple[str, str]:
+    return str(row["task_group"]), str(row["run_id"])
+
+
+def _job_depends_on(run_dir: Path, upstream_run_dir: Path) -> bool:
+    upstream = upstream_run_dir.resolve()
+    for name in ("input.json", "pipeline.json", "result.json"):
+        payload_path = run_dir / name
+        if not payload_path.exists():
+            continue
+        payload = read_json(payload_path)
+        if name == "pipeline.json":
+            initial_source = payload.get("initial_source") or {}
+            source_run_dir = initial_source.get("run_dir")
+            if source_run_dir:
+                try:
+                    Path(str(source_run_dir)).resolve().relative_to(upstream)
+                    return True
+                except Exception:
+                    pass
+            continue
+        for text in _iter_payload_strings(payload):
+            if not text:
+                continue
+            try:
+                path = Path(text)
+                resolved = path.resolve() if path.is_absolute() else (run_dir / path).resolve()
+            except Exception:
+                resolved = None
+            if resolved is not None:
+                try:
+                    resolved.relative_to(upstream)
+                    return True
+                except ValueError:
+                    pass
+            if str(upstream) in text:
+                return True
+    return False
+
+
+def find_downstream_jobs(task_group: str, run_id: str) -> list[dict]:
+    root = runs_root().resolve()
+    upstream_run_dir = (root / task_group / run_id).resolve()
+    upstream_identity = (task_group, run_id)
+    downstream: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    frontier = [upstream_run_dir]
+    all_jobs = collect_jobs()
+    while frontier:
+        current = frontier.pop(0)
+        for row in all_jobs:
+            identity = _job_identity(row)
+            if identity == upstream_identity or identity in seen:
+                continue
+            run_dir = Path(str(row["run_dir"]))
+            if _job_depends_on(run_dir, current):
+                seen.add(identity)
+                downstream.append(row)
+                frontier.append(run_dir)
+    return downstream
+
+
+def deletion_plan(selections: list[tuple[str, str]], include_downstream: bool = False) -> list[dict]:
+    rows_by_identity = {_job_identity(row): row for row in collect_jobs()}
+    planned: dict[tuple[str, str], dict] = {}
+    for task_group, run_id in selections:
+        identity = (task_group, run_id)
+        if identity in rows_by_identity:
+            planned[identity] = rows_by_identity[identity]
+        if include_downstream:
+            for row in find_downstream_jobs(task_group, run_id):
+                planned[_job_identity(row)] = row
+    return sorted(
+        planned.values(),
+        key=lambda row: len(str(row.get("run_dir") or "")),
+        reverse=True,
+    )

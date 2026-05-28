@@ -64,6 +64,114 @@ def _sequence_params(tool: str) -> dict:
     }
 
 
+def _monomer_params() -> tuple[str, dict]:
+    tool = st.segmented_control(
+        "Monomer refolding tool",
+        ["af2_monomer", "boltz2_monomer", "esmfold"],
+        selection_mode="single",
+        default="af2_monomer",
+        format_func={
+            "af2_monomer": "AF2 monomer",
+            "boltz2_monomer": "Boltz2 monomer",
+            "esmfold": "ESMFold",
+        }.get,
+    )
+    min_plddt = st.number_input("Minimum monomer pLDDT", min_value=0.0, max_value=100.0, value=70.0, step=1.0)
+    return str(tool or "af2_monomer"), {"min_plddt": float(min_plddt)}
+
+
+def _complex_params() -> tuple[str, dict]:
+    tool = st.segmented_control(
+        "Complex refolding tool",
+        ["af2_initial_guess", "boltz2_initial_guess"],
+        selection_mode="single",
+        default="af2_initial_guess",
+        format_func={
+            "af2_initial_guess": "AF2 initial guess",
+            "boltz2_initial_guess": "Boltz2 initial guess",
+        }.get,
+    )
+    require_monomer = st.checkbox("Only run after monomer refolding step succeeds", value=True)
+    selected_tool = str(tool or "af2_initial_guess")
+    if selected_tool == "boltz2_initial_guess":
+        template_mode = st.segmented_control(
+            "Boltz2 template mode",
+            ["target_template", "no_template"],
+            selection_mode="single",
+            default="target_template",
+            format_func={
+                "target_template": "Target template",
+                "no_template": "No template",
+            }.get,
+        )
+        return selected_tool, {
+            "require_monomer_success": bool(require_monomer),
+            "template_mode": str(template_mode or "target_template"),
+            "multimer": True,
+            "num_recycles": 3,
+        }
+    else:
+        af2_options = {
+            "af2_model_1_ptm_tt_3rec": ("AF2 monomer model, target template", "target_template", False, 3),
+            "af2_model_1_ptm_tbt_3rec": ("AF2 monomer model, target + binder templates", "target_binder_template", False, 3),
+            "af2_model_1_ptm_ct_3rec": ("AF2 monomer model, complex template", "complex_template", False, 3),
+            "af2_model_1_multimer_tt_3rec": ("AF2 multimer, target template", "target_template", True, 3),
+            "af2_model_1_multimer_tbt_3rec": ("AF2 multimer, target + binder templates", "target_binder_template", True, 3),
+            "af2_model_1_multimer_ct_3rec": ("AF2 multimer, complex template", "complex_template", True, 3),
+        }
+        af2_choice = st.selectbox(
+            "AF2 complex refolding model",
+            list(af2_options),
+            format_func=lambda key: af2_options[key][0],
+            index=list(af2_options).index("af2_model_1_multimer_tt_3rec"),
+        )
+        _, template_mode, multimer, num_recycles = af2_options[af2_choice]
+    return selected_tool, {
+        "require_monomer_success": bool(require_monomer),
+        "template_mode": str(template_mode or "target_template"),
+        "multimer": bool(multimer),
+        "num_recycles": int(num_recycles),
+    }
+
+
+def _analysis_params() -> tuple[str, dict]:
+    tool = st.segmented_control(
+        "Analysis mode",
+        ["ranking", "filters", "reports"],
+        selection_mode="single",
+        default="ranking",
+        format_func={
+            "ranking": "Ranking",
+            "filters": "Filters",
+            "reports": "Reports",
+        }.get,
+    )
+    keep_top_n = st.number_input("Keep top candidates", min_value=1, max_value=10000, value=100, step=10)
+    cols = st.columns(3)
+    with cols[0]:
+        min_binder_plddt = st.number_input("Min binder pLDDT", min_value=0.0, max_value=100.0, value=70.0, step=1.0)
+        max_ipae = st.number_input("Max iPAE", min_value=0.0, max_value=100.0, value=10.0, step=1.0)
+    with cols[1]:
+        min_iptm = st.number_input("Min ipTM", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
+        max_ipde = st.number_input("Max iPDE", min_value=0.0, max_value=100.0, value=20.0, step=1.0)
+    with cols[2]:
+        min_ipsae = st.number_input("Min ipSAE", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
+        min_confidence = st.number_input("Min confidence", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
+    max_binder_rmsd = st.number_input("Max binder RMSD", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
+    return str(tool or "ranking"), {
+        "keep_top_n": int(keep_top_n),
+        "thresholds": {
+            "min_binder_plddt": float(min_binder_plddt),
+            "min_confidence": float(min_confidence),
+            "min_iptm": float(min_iptm),
+            "min_ipsae": float(min_ipsae),
+            "max_ipae": float(max_ipae),
+            "max_ipde": float(max_ipde),
+            "max_binder_rmsd": float(max_binder_rmsd),
+        },
+    }
+
+
 st.title("Campaigns")
 st.caption("String normalized design modules together. Each module writes candidates that the next module can consume.")
 
@@ -105,10 +213,14 @@ with new_tab:
         )
 
         st.subheader("Pipeline")
-        st.caption("First wired module: sequence design. Refolding and analysis will use the same normalized candidate contract next.")
+        st.caption("Default path: sequence design, monomer refolding, complex refolding, then analysis.")
         sequence_enabled = st.checkbox("Add sequence design step", value=True)
+        monomer_enabled = st.checkbox("Add monomer refolding step", value=True)
+        complex_enabled = st.checkbox("Add complex refolding step", value=True)
+        analysis_enabled = st.checkbox("Add analysis step", value=True)
         steps: list[dict] = []
         if sequence_enabled:
+            st.markdown("**Sequence Design**")
             default_tool = _default_sequence_tool(source)
             tool_options = ["ligandmpnn", "foundry_mpnn"]
             sequence_tool = st.segmented_control(
@@ -123,18 +235,23 @@ with new_tab:
             )
             params = _sequence_params(str(sequence_tool or default_tool))
             steps.append({"module": "sequence_design", "tool": str(sequence_tool or default_tool), "params": params})
+        if monomer_enabled:
+            st.markdown("**Monomer Refolding**")
+            tool, params = _monomer_params()
+            steps.append({"module": "monomer_refolding", "tool": tool, "params": params})
+        if complex_enabled:
+            st.markdown("**Complex Refolding**")
+            tool, params = _complex_params()
+            steps.append({"module": "complex_refolding", "tool": tool, "params": params})
+        if analysis_enabled:
+            st.markdown("**Analysis**")
+            tool, params = _analysis_params()
+            steps.append({"module": "analysis", "tool": tool, "params": params})
 
-        st.subheader("What Will Be Stored")
-        st.json(
-            {
-                "initial_source": {
-                    "job_code": source["job_code"],
-                    "run_id": source["run_id"],
-                    "candidates_jsonl": source["candidates_jsonl"],
-                    "stage_counts": source["stage_counts"],
-                },
-                "steps": steps,
-            }
+        st.info(
+            "ESMFold and Boltz2 monomer refolding are Docker-backed. AF2 monomer, complex refolding, "
+            "AF2 initial guess and Boltz2 complex refolding are Docker-backed. Analysis still creates "
+            "ranked tables and metric summaries from normalized outputs."
         )
 
         if st.button("Create campaign", type="primary", disabled=not steps):
@@ -175,9 +292,6 @@ with existing_tab:
                     f"Open {step.get('module')} result {job_ref.get('job_code') or job_ref.get('run_id')}",
                     result_link(str(job_ref["task_group"]), str(job_ref["run_id"])),
                 )
-
-        with st.expander("pipeline.json", expanded=False):
-            st.json(pipeline)
 
         done = all(step.get("status") == "completed" for step in pipeline.get("steps") or [])
         if st.button("Run next pending step", type="primary", disabled=done):

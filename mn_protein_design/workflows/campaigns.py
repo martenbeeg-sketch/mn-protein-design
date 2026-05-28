@@ -13,6 +13,11 @@ from mn_protein_design.core.pipeline import (
     step_source,
     write_pipeline,
 )
+from mn_protein_design.workflows.analysis import run_analysis_contract
+from mn_protein_design.workflows.refolding import (
+    run_complex_refolding_contract,
+    run_monomer_refolding_contract,
+)
 from mn_protein_design.workflows.sequence_design import (
     run_foundry_mpnn_sequence_design,
     run_ligandmpnn_sequence_design,
@@ -45,6 +50,103 @@ def _job_ref_from_run(run_dir: Path) -> dict[str, Any]:
         "candidate_count": len(candidates),
         "stage_counts": candidate_stage_counts(candidates),
     }
+
+
+def _tag_lineage_job(run_dir: Path, campaign_name: str, campaign_id: str, step: dict[str, Any], step_index: int, source: dict[str, Any]) -> None:
+    metadata = read_json(run_dir / "metadata.json")
+    metadata.update(
+        {
+            "campaign_name": campaign_name,
+            "campaign_id": campaign_id,
+            "campaign_step": str(step.get("module") or ""),
+            "campaign_step_index": step_index,
+            "upstream_task_group": source.get("task_group"),
+            "upstream_run_id": source.get("run_id"),
+            "upstream_job_code": source.get("job_code"),
+        }
+    )
+    write_json(run_dir / "metadata.json", metadata)
+
+
+def _run_module_step(source: dict[str, Any], step: dict[str, Any]) -> Path:
+    module = str(step.get("module"))
+    tool = str(step.get("tool"))
+    params = dict(step.get("params") or {})
+    if module == "sequence_design" and tool == "ligandmpnn":
+        return run_ligandmpnn_sequence_design(
+            source_run_dir=Path(str(source["run_dir"])),
+            candidates_jsonl=Path(str(source["candidates_jsonl"])),
+            model_type=str(params.get("model_type") or "protein_mpnn"),
+            design_chains=str(params.get("design_chains") or ""),
+            num_seq_per_target=int(params.get("num_seq_per_target") or 1),
+            sampling_temp=float(params.get("sampling_temp") or 0.0001),
+            omit_aas=str(params.get("omit_aas") or "CX"),
+            seed=int(params["seed"]) if params.get("seed") else None,
+            require_backbone_hotspot_filter_pass=bool(params.get("require_backbone_hotspot_filter_pass", False)),
+        )
+    if module == "sequence_design" and tool == "foundry_mpnn":
+        return run_foundry_mpnn_sequence_design(
+            source_run_dir=Path(str(source["run_dir"])),
+            candidates_jsonl=Path(str(source["candidates_jsonl"])),
+            number_of_batches=int(params.get("number_of_batches") or 1),
+            batch_size=int(params.get("batch_size") or 10),
+            model_type=str(params.get("model_type") or "ligand_mpnn"),
+            checkpoint_path=str(params.get("checkpoint_path") or "/weights/ligandmpnn_v_32_010_25.pt"),
+        )
+    if module == "monomer_refolding":
+        return run_monomer_refolding_contract(
+            source_run_dir=Path(str(source["run_dir"])),
+            candidates_jsonl=Path(str(source["candidates_jsonl"])),
+            tool=tool,
+            min_plddt=float(params.get("min_plddt") or 70.0),
+        )
+    if module == "complex_refolding":
+        return run_complex_refolding_contract(
+            source_run_dir=Path(str(source["run_dir"])),
+            candidates_jsonl=Path(str(source["candidates_jsonl"])),
+            tool=tool,
+            require_monomer_success=bool(params.get("require_monomer_success", True)),
+            template_mode=str(params.get("template_mode") or "target_template"),
+            num_recycles=int(params.get("num_recycles") or 3),
+            multimer=bool(params.get("multimer", True)),
+        )
+    if module == "analysis":
+        return run_analysis_contract(
+            source_run_dir=Path(str(source["run_dir"])),
+            candidates_jsonl=Path(str(source["candidates_jsonl"])),
+            tool=tool,
+            keep_top_n=int(params.get("keep_top_n") or 100),
+            thresholds=dict(params.get("thresholds") or {}),
+        )
+    raise NotImplementedError(f"{module}/{tool} is registered, but no runner is wired yet.")
+
+
+def run_lineage_steps(campaign_name: str, initial_source: dict[str, Any], steps: list[dict[str, Any]]) -> list[Path]:
+    child_runs: list[Path] = []
+    source = dict(initial_source)
+    campaign_label = campaign_name.strip() or f"Pipeline from {source.get('job_code') or source.get('run_id') or 'source'}"
+    campaign_id = str(source.get("run_id") or source.get("job_code") or "").strip() or utc_now()
+
+    source_run_dir = Path(str(source.get("run_dir") or ""))
+    if source_run_dir.exists():
+        _tag_lineage_job(
+            source_run_dir,
+            campaign_label,
+            campaign_id,
+            {"module": "backbone_generation"},
+            0,
+            {},
+        )
+
+    for index, step in enumerate(steps, start=1):
+        child_run_dir = _run_module_step(source, step)
+        _tag_lineage_job(child_run_dir, campaign_label, campaign_id, step, index, source)
+        child_runs.append(child_run_dir)
+        result = read_json(child_run_dir / "result.json")
+        if result.get("success") is not True:
+            break
+        source = _job_ref_from_run(child_run_dir)
+    return child_runs
 
 
 def _pipeline_result(payload: dict[str, Any]) -> dict[str, Any]:
@@ -112,9 +214,13 @@ def list_campaigns() -> list[dict[str, Any]]:
 def run_next_step(campaign_run_dir: Path) -> Path | None:
     campaign_run_dir = Path(campaign_run_dir)
     pipeline = read_pipeline(campaign_run_dir)
+    if pipeline.get("status") == "failed":
+        raise ValueError("Campaign is failed. Create a new campaign or reset the failed step before running more steps.")
     steps = list(pipeline.get("steps") or [])
     next_index = None
     for index, step in enumerate(steps):
+        if step.get("status") == "failed":
+            raise ValueError(f"Campaign step {step.get('step_id') or index + 1} is failed. Create a new campaign or reset it before retrying.")
         if step.get("status") != "completed":
             next_index = index
             break
@@ -151,6 +257,7 @@ def run_next_step(campaign_run_dir: Path) -> Path | None:
                 sampling_temp=float(params.get("sampling_temp") or 0.0001),
                 omit_aas=str(params.get("omit_aas") or "CX"),
                 seed=int(params["seed"]) if params.get("seed") else None,
+                require_backbone_hotspot_filter_pass=bool(params.get("require_backbone_hotspot_filter_pass", False)),
             )
         elif module == "sequence_design" and tool == "foundry_mpnn":
             child_run_dir = run_foundry_mpnn_sequence_design(
@@ -158,7 +265,33 @@ def run_next_step(campaign_run_dir: Path) -> Path | None:
                 candidates_jsonl=Path(str(source["candidates_jsonl"])),
                 number_of_batches=int(params.get("number_of_batches") or 1),
                 batch_size=int(params.get("batch_size") or 10),
+                model_type=str(params.get("model_type") or "ligand_mpnn"),
                 checkpoint_path=str(params.get("checkpoint_path") or "/weights/ligandmpnn_v_32_010_25.pt"),
+            )
+        elif module == "monomer_refolding":
+            child_run_dir = run_monomer_refolding_contract(
+                source_run_dir=Path(str(source["run_dir"])),
+                candidates_jsonl=Path(str(source["candidates_jsonl"])),
+                tool=tool,
+                min_plddt=float(params.get("min_plddt") or 70.0),
+            )
+        elif module == "complex_refolding":
+            child_run_dir = run_complex_refolding_contract(
+                source_run_dir=Path(str(source["run_dir"])),
+                candidates_jsonl=Path(str(source["candidates_jsonl"])),
+                tool=tool,
+                require_monomer_success=bool(params.get("require_monomer_success", True)),
+                template_mode=str(params.get("template_mode") or "target_template"),
+                num_recycles=int(params.get("num_recycles") or 3),
+                multimer=bool(params.get("multimer", True)),
+            )
+        elif module == "analysis":
+            child_run_dir = run_analysis_contract(
+                source_run_dir=Path(str(source["run_dir"])),
+                candidates_jsonl=Path(str(source["candidates_jsonl"])),
+                tool=tool,
+                keep_top_n=int(params.get("keep_top_n") or 100),
+                thresholds=dict(params.get("thresholds") or {}),
             )
         else:
             raise NotImplementedError(f"{module}/{tool} is registered in the campaign, but no runner is wired yet.")
