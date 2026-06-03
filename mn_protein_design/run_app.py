@@ -39,6 +39,7 @@ def main() -> None:
                 _page(package_root, "app/pages/sequence_design.py", "Sequence Design", "sequence-design"),
                 _page(package_root, "app/pages/refolding.py", "Refolding / Validation", "refolding-validation"),
                 _page(package_root, "app/pages/analysis.py", "Analysis", "analysis"),
+                _page(package_root, "app/pages/benchmark.py", "Binder Benchmark", "binder-benchmark"),
             ],
             "": [
                 _page(package_root, "app/pages/results.py", "Result Details", "results", hidden=True),

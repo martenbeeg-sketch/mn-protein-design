@@ -109,6 +109,11 @@ def _run_module_step(source: dict[str, Any], step: dict[str, Any]) -> Path:
             template_mode=str(params.get("template_mode") or "target_template"),
             num_recycles=int(params.get("num_recycles") or 3),
             multimer=bool(params.get("multimer", True)),
+            max_candidates=int(params.get("max_candidates") or 20),
+            num_sampling_steps=int(params.get("num_sampling_steps") or 32),
+            seed=int(params.get("seed") or 0),
+            device=str(params.get("device") or "auto"),
+            contact_cutoff=float(params.get("contact_cutoff") or 8.0),
         )
     if module == "analysis":
         return run_analysis_contract(

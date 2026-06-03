@@ -352,6 +352,7 @@ def _reset_editor_state(run_id: str) -> dict:
         "history": [],
         "viewer_key_nonce": 0,
         "debug_mapping": False,
+        "prepare_msa": True,
     }
 
 
@@ -427,6 +428,7 @@ for key, value in {
     "history": [],
     "viewer_key_nonce": 0,
     "debug_mapping": False,
+    "prepare_msa": True,
 }.items():
     state.setdefault(key, value)
 
@@ -836,6 +838,16 @@ with left:
     else:
         st.info("No confirmed draft yet.")
 
+    state["prepare_msa"] = st.checkbox(
+        "Prepare Boltz2 target MSA",
+        value=state.get("prepare_msa", True),
+        help=(
+            "Caches one A3M per cropped target chain in "
+            "/mnt/db/reference_files/boltz_models/msa_repository for downstream "
+            "Genie3/Boltz2 workflows."
+        ),
+    )
+
     can_create_job = bool(
         confirmed_draft
         and crop_stats.get("residue_count", 0) > 0
@@ -859,6 +871,7 @@ with left:
                 sphere_diameter_angstrom=0.0,
                 remove_waters=True,
                 remove_hetero=False,
+                prepare_msa=state.get("prepare_msa", True),
             )
 
         st.success(f"Cropping job finished: {run_dir.name}")

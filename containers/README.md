@@ -32,6 +32,37 @@ Recommended Docker mount convention:
 -v /mnt/db/reference_files:/ref:ro
 ```
 
+## ColabFold
+
+Container files live in `containers/colabfold/`. The image wraps the official
+CUDA 12 ColabFold image with a repo-local tag, cache conventions, and an
+explicit `jax[cuda12]<0.8` reinstall so the GPU runtime is not stuck on an old
+JAX CUDA wheel. This is intended to run on the local RTX 4090 and on RTX 5090
+hosts with a recent Blackwell-capable NVIDIA driver.
+
+```bash
+docker build -f containers/colabfold/Dockerfile -t mnprot-colabfold-cuda12:1.6.1 .
+docker run --rm --gpus all \
+  -v /mnt/db/reference_files/alphafold_models:/cache/params:rw \
+  -v "$PWD":/work:rw \
+  mnprot-colabfold-cuda12:1.6.1 colabfold_batch --help --data /cache
+```
+
+GPU smoke test:
+
+```bash
+docker run --rm --gpus all \
+  -v /mnt/db/reference_files/alphafold_models:/cache/params:rw \
+  mnprot-colabfold-cuda12:1.6.1 colabfold-gpu-smoke-test
+```
+
+Use `/mnt/db/reference_files/alphafold_models` as the persistent ColabFold
+weights mount at `/cache/params`, then pass `--data /cache`. This matches
+ColabFold's expected `<data_dir>/params/*.npz` layout while reusing the existing
+AlphaFold2 parameter files. Prepared `.a3m` folders from the benchmark workflow
+can be passed directly to `colabfold_batch`, so AlphaFast/AF3-generated MSAs can
+be used without calling the ColabFold MSA server.
+
 For tools that need writable model downloads, do a separate setup/download task
 with a narrower writable mount, for example:
 
@@ -50,6 +81,7 @@ Then run normal jobs with references mounted read-only.
 | Surf2Spot | `mnprot-surf2spot-cu128:latest` | Yes, CUDA 12.8 | Hotspot detection | Real HS pipeline smoke test passed |
 | PXDesign | `mnprot-pxdesign-cu128:latest` | Yes, CUDA 12.8 | Binder design / target preparation | Real target-parse and tiny inference smoke tests passed |
 | Protpardelle-1c | `mnprot-protpardelle-1c-cu128:latest` | Yes, CUDA 12.8 | Binder backbone design / motif scaffolding | PDL1 binder backbone smoke test |
+| Biohub ESM | `mnprot-biohub-esm-cu128:latest` | Yes, CUDA 12.8 | ESMFold2 complex folding / experimental binder screening | Docker image added; import smoke test passed |
 
 Build all images:
 
@@ -65,6 +97,8 @@ docker compose build scannet
 docker compose build surf2spot
 docker compose build pxdesign
 docker compose build protpardelle-1c
+docker compose build biohub-esm
+docker compose build colabfold
 ```
 
 ## ScanNet
@@ -219,19 +253,74 @@ docker run --rm \
   bash -lc 'set -euo pipefail; cd /ref/protpardelle-1c; /opt/protpardelle-1c/download_model_params.sh'
 ```
 
+## Biohub ESM
+
+Purpose in app:
+
+- local ESMFold2 target+binder complex folding
+- experimental ESMFold2 binder screening
+- ESMC / ESM3 utility scripts when the required references are mounted
+
+Image:
+
+```text
+mnprot-biohub-esm-cu128:latest
+```
+
+Runtime:
+
+- GPU recommended for useful ESMFold2 runs
+- CUDA 12.8 runtime for RTX 5090 / Blackwell
+- PyTorch 2.7.1 CUDA 12.8
+- Python 3.12 from Ubuntu 24.04
+- installs the vendored `tools_to_implement/esm` package and Biohub transformers fork
+- uses `/cache/huggingface` for writable Hugging Face cache metadata
+- disables Hugging Face Xet and loads local `/ref/biohub-esm/ESMC-6B` for ESMFold2
+- sets `TORCH_CUDA_ARCH_LIST` through `12.0` for RTX 5090 compatibility
+
+Reference files:
+
+```text
+/mnt/db/reference_files/biohub-esm/ESMFold2/
+/mnt/db/reference_files/biohub-esm/ESM3/
+/mnt/db/reference_files/biohub-esm/ESMC-6B/
+/mnt/db/reference_files/biohub-esm/ESMC-6B-sae-k64-codebook16384/
+```
+
+Build:
+
+```bash
+docker compose build biohub-esm
+```
+
+Light smoke test:
+
+```bash
+docker run --rm --gpus all \
+  -v biohub-esm-hf-cache:/cache/huggingface \
+  -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro \
+  mnprot-biohub-esm-cu128:latest
+```
+
+Heavier ESMFold2 weight-load smoke test:
+
+```bash
+docker run --rm --gpus all \
+  -v biohub-esm-hf-cache:/cache/huggingface \
+  -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro \
+  mnprot-biohub-esm-cu128:latest \
+  biohub-esm-smoke-test --load-esmfold2
+```
+
 Example app command:
 
 ```bash
 docker run --rm --gpus all \
-  -v /mnt/db/reference_files/protpardelle-1c:/ref/protpardelle-1c:ro \
+  -v biohub-esm-hf-cache:/cache/huggingface \
+  -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro \
   -v /tmp/mn-protein-design-jobs/<job_id>:/work \
-  mnprot-protpardelle-1c-cu128:latest \
-  python -m protpardelle.sample /work/config/protpardelle_pdl1.yaml \
-    --motif-dir /opt/protpardelle-1c/examples/motifs/bindcraft \
-    --num-samples 1 \
-    --num-mpnn-seqs 0 \
-    --batch-size 1 \
-    --seed 7
+  mnprot-biohub-esm-cu128:latest \
+  python /work/config/run_esmfold2_job.py
 ```
 
 Expected outputs:

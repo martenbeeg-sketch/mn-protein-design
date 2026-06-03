@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import csv
 import gzip
+import hashlib
 import json
 import re
 import shlex
@@ -15,12 +16,18 @@ from mn_protein_design.core.candidates import (
     STAGE_COMPLEX_REFOLDING,
     STAGE_GENERATION_BACKBONE,
     STAGE_GENERATION_BACKBONE_SEQUENCE,
+    candidate_stage_counts,
+    read_candidates,
     write_candidates,
 )
 from mn_protein_design.core.hotspot_metrics import calculate_hotspot_metrics, passes_hotspot_prefilter
 from mn_protein_design.core.jobs import collect_jobs, create_job, finish_job, read_json, update_status, write_json
 from mn_protein_design.core.manifests import load_manifest
 from mn_protein_design.core.structures import filter_pdb_text, pdb_summary
+from mn_protein_design.workflows.target_msa import (
+    ensure_boltz_msas_for_target as _shared_ensure_boltz_msas_for_target,
+    ensure_pxdesign_msa_dirs_for_target,
+)
 
 
 DESIGN_GROUP = "design"
@@ -97,6 +104,26 @@ def default_target_contig(target_pdb: Path, target_chains: list[str], binder_len
             start = end = residue
         segments.append(f"{chain_id}{start}-{end}")
     return "/".join(segments) + f"/0 {binder_length}" if segments else ""
+
+
+def _target_input_spec(target_pdb: Path, target_chains: list[str]) -> str:
+    summary = pdb_summary(target_pdb.read_text(errors="ignore"))
+    chain_rows = {row["chain_id"]: row for row in summary.get("chains", [])}
+    segments: list[str] = []
+    for chain_id in target_chains:
+        row = chain_rows.get(chain_id)
+        residues = sorted(row.get("residues") or []) if row else []
+        if not residues:
+            continue
+        start = end = residues[0]
+        for residue in residues[1:]:
+            if residue == end + 1:
+                end = residue
+                continue
+            segments.append(f"{chain_id}{start}-{end}")
+            start = end = residue
+        segments.append(f"{chain_id}{start}-{end}")
+    return ",".join(segments)
 
 
 def normalize_hotspots(text: str) -> str:
@@ -490,6 +517,15 @@ def _numeric_or_text(value: str) -> object:
     return number
 
 
+def _float_or_none(value: object) -> float | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_boltzgen_vanilla_candidates(run_dir: Path, params: dict, target_artifact: Path) -> list[dict]:
     budget = int(params.get("budget") or 1)
     rows = _boltzgen_metric_rows(run_dir, budget)
@@ -545,6 +581,594 @@ def _normalize_boltzgen_vanilla_candidates(run_dir: Path, params: dict, target_a
             }
         )
     return write_candidates(run_dir, "boltzgen", candidates)
+
+
+def _clean_key(text: str, fallback: str = "mn_app_target") -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text or "").strip()).strip("_")
+    return cleaned or fallback
+
+
+def _pdb_residue_records_by_chain(path: Path) -> dict[str, list[tuple[int, str, str]]]:
+    records: dict[str, list[tuple[int, str, str]]] = {}
+    seen: set[tuple[str, str, str]] = set()
+    for line in path.read_text(errors="ignore").splitlines():
+        if not line.startswith("ATOM  "):
+            continue
+        chain = line[21].strip() or "_"
+        residue_key = (chain, line[22:26].strip(), line[26].strip())
+        if residue_key in seen:
+            continue
+        seen.add(residue_key)
+        try:
+            residue_number = int(line[22:26])
+        except ValueError:
+            continue
+        records.setdefault(chain, []).append(
+            (residue_number, line[26].strip(), AA3_TO_1.get(line[17:20].strip().upper(), "X"))
+        )
+    return {
+        chain: sorted(chain_records, key=lambda item: (item[0], item[1]))
+        for chain, chain_records in records.items()
+    }
+
+
+_A3M_SEQUENCE_ALLOWED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-")
+_ALPHAFOLD_MODELS_DIR = Path("/mnt/db/reference_files/alphafold_models")
+_BOLTZ_CACHE_DIR = Path("/mnt/db/reference_files/boltz_models")
+_BOLTZ_MSA_REPOSITORY_DIR = _BOLTZ_CACHE_DIR / "msa_repository"
+
+
+def _target_chain_sequences(path: Path, target_chains: list[str]) -> dict[str, str]:
+    residue_records = _pdb_residue_records_by_chain(path)
+    chains = [chain for chain in target_chains if chain in residue_records] or list(residue_records)
+    return {chain: "".join(record[2] for record in residue_records.get(chain, [])) for chain in chains}
+
+
+def _boltz_msa_paths(sequence: str, msa_repository_dir: Path = _BOLTZ_MSA_REPOSITORY_DIR) -> tuple[Path, str]:
+    digest = hashlib.sha256(sequence.encode("utf-8")).hexdigest()
+    filename = f"{digest}.a3m"
+    return msa_repository_dir / filename, f"/msa_repository/{filename}"
+
+
+def _validate_a3m_file(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, "file does not exist"
+    try:
+        raw = path.read_bytes()
+    except Exception as exc:
+        return False, f"read failed: {exc}"
+    if not raw:
+        return False, "file is empty"
+    if b"\x00" in raw:
+        return False, "contains NUL byte(s)"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return False, f"invalid UTF-8: {exc}"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False, "contains no non-empty lines"
+    if not lines[0].startswith(">"):
+        return False, "first non-empty line is not a FASTA header"
+    saw_sequence = False
+    for line in lines:
+        if line.startswith(">"):
+            continue
+        saw_sequence = True
+        if any(char not in _A3M_SEQUENCE_ALLOWED for char in line):
+            return False, "contains invalid sequence characters"
+    if not saw_sequence:
+        return False, "contains headers only and no sequence"
+    return True, ""
+
+
+def _repair_a3m_file(path: Path) -> bool:
+    if not path.exists():
+        return False
+    cleaned = path.read_bytes().rstrip(b"\x00").replace(b"\r\n", b"\n")
+    valid, _reason = _validate_a3m_payload(cleaned)
+    if not valid:
+        return False
+    if cleaned != path.read_bytes():
+        path.write_bytes(cleaned)
+    return True
+
+
+def _validate_a3m_payload(raw: bytes) -> tuple[bool, str]:
+    temp = Path("/tmp") / f"mn_protein_design_a3m_check_{hashlib.sha256(raw).hexdigest()}.a3m"
+    try:
+        temp.write_bytes(raw)
+        return _validate_a3m_file(temp)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _first_valid_a3m(root: Path) -> Path | None:
+    for candidate in sorted(root.glob("**/*.a3m"), key=lambda path: ("processed" not in str(path), len(str(path)))):
+        valid, _reason = _validate_a3m_file(candidate)
+        if valid:
+            return candidate
+        if _repair_a3m_file(candidate):
+            return candidate
+    return None
+
+
+def _write_boltz_msa_probe_yaml(path: Path, sequence: str) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "sequences:",
+                "  - protein:",
+                "      id: A",
+                f"      sequence: {sequence}",
+                "",
+            ]
+        )
+    )
+
+
+def _ensure_boltz_msa_for_sequence(run_dir: Path, sequence: str, label: str) -> str:
+    host_path, container_path = _boltz_msa_paths(sequence)
+    host_path.parent.mkdir(parents=True, exist_ok=True)
+    valid, reason = _validate_a3m_file(host_path)
+    if not valid and host_path.exists():
+        if _repair_a3m_file(host_path):
+            valid, reason = _validate_a3m_file(host_path)
+    if valid:
+        return container_path
+
+    probe_dir = run_dir / "artifacts" / "raw" / "genie3" / "boltz_msa_cache" / _clean_key(label)
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    yaml_path = probe_dir / "input.yaml"
+    _write_boltz_msa_probe_yaml(yaml_path, sequence)
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--gpus",
+        "all",
+        "--shm-size=64G",
+        "-v",
+        f"{probe_dir}:/work",
+        "-v",
+        f"{_BOLTZ_CACHE_DIR}:/cache",
+        "-v",
+        f"{_BOLTZ_MSA_REPOSITORY_DIR}:/msa_repository",
+        "-e",
+        "BOLTZ_CACHE=/cache",
+        "--ipc=host",
+        "--shm-size=48G",
+        "ovoex-boltz2",
+        "predict",
+        "/work/input.yaml",
+        "--out_dir",
+        "/work",
+        "--sampling_steps",
+        "200",
+        "--recycling_steps",
+        "3",
+        "--diffusion_samples",
+        "1",
+        "--accelerator",
+        "gpu",
+        "--override",
+        "--use_msa_server",
+    ]
+    with (run_dir / "stdout.log").open("a") as stdout, (run_dir / "stderr.log").open("a") as stderr:
+        stdout.write(f"$ {' '.join(command)}\n")
+        stdout.write(f"MSA cache miss for {label}: {host_path} ({reason})\n")
+        stdout.flush()
+        completed = subprocess.run(command, stdout=stdout, stderr=stderr, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(f"Boltz2 MSA preflight failed for {label} with return code {completed.returncode}.")
+    generated = _first_valid_a3m(probe_dir)
+    if generated is None:
+        raise RuntimeError(f"Boltz2 MSA preflight did not produce a valid A3M for {label}.")
+    payload = generated.read_bytes().rstrip(b"\x00").replace(b"\r\n", b"\n")
+    valid_payload, payload_reason = _validate_a3m_payload(payload)
+    if not valid_payload:
+        raise RuntimeError(f"Boltz2 MSA preflight produced invalid A3M for {label}: {payload_reason}.")
+    host_path.write_bytes(payload)
+    valid, reason = _validate_a3m_file(host_path)
+    if not valid:
+        raise RuntimeError(f"Cached Boltz2 MSA is invalid for {label}: {reason}.")
+    with (run_dir / "stdout.log").open("a") as stdout:
+        stdout.write(f"MSA cached for {label}: {host_path}\n")
+    return container_path
+
+
+def _ensure_boltz_msas_for_target(run_dir: Path, target_artifact: Path, target_chains: list[str]) -> dict[str, str]:
+    return _shared_ensure_boltz_msas_for_target(run_dir, target_artifact, target_chains, raw_subdir="genie3/boltz_msa_cache")
+
+
+def _write_genie3_target_files(
+    *,
+    run_dir: Path,
+    target_artifact: Path,
+    target_chains: list[str],
+    binder_length: str,
+    hotspots: str,
+    campaign_name: str,
+    boltz_msa_by_source_chain: dict[str, str] | None = None,
+) -> tuple[Path, str, dict]:
+    lengths = parse_binder_lengths(binder_length)
+    min_length = lengths[0]
+    max_length = lengths[-1]
+    problem_key = _clean_key(campaign_name or target_artifact.stem)
+    dataset_dir = run_dir / "artifacts" / "raw" / "genie3" / "dataset" / "mn_app"
+    for subdir in ["problems", "targets/pdb", "targets/fasta", "targets/msa"]:
+        (dataset_dir / subdir).mkdir(parents=True, exist_ok=True)
+
+    residue_records = _pdb_residue_records_by_chain(target_artifact)
+    source_chains = [chain for chain in target_chains if chain in residue_records] or list(residue_records)
+    chain_map = {source_chain: chr(ord("B") + index) for index, source_chain in enumerate(source_chains)}
+    source_by_new_chain = {new_chain: source_chain for source_chain, new_chain in chain_map.items()}
+    residue_map: dict[str, str] = {}
+    chain_tags: list[str] = []
+    chain_sequences: dict[str, str] = {}
+    for source_chain in source_chains:
+        new_chain = chain_map[source_chain]
+        records = residue_records.get(source_chain, [])
+        sequence = "".join(record[2] for record in records)
+        chain_sequences[new_chain] = sequence
+        if records:
+            chain_tags.append(f"{new_chain}1-{len(records)}")
+        for new_index, (old_residue, _insertion, _aa) in enumerate(records, start=1):
+            residue_map[f"{source_chain}{old_residue}"] = f"{new_chain}{new_index}"
+
+    target_pdb = dataset_dir / "targets" / "pdb" / f"{problem_key}.pdb"
+    target_fasta = dataset_dir / "targets" / "fasta" / f"{problem_key}.fasta"
+    target_msa = dataset_dir / "targets" / "msa" / f"{problem_key}.a3m"
+    target_pdb_by_chain: list[str] = []
+    target_fasta_by_chain: list[str] = []
+    target_msa_by_chain: list[str] = []
+
+    rewritten_lines = [
+        f"REMARK 999 KEY    {problem_key}\n",
+        f"REMARK 999 NAME   {campaign_name or problem_key}\n",
+    ]
+    for tag in chain_tags:
+        rewritten_lines.append(f"REMARK 999 TARGET {tag[0]} {tag[1:].split('-')[0].rjust(4)} {tag[1:].split('-')[1].rjust(4)}\n")
+    source_text = target_artifact.read_text(errors="ignore")
+    for line in source_text.splitlines():
+        if not line.startswith("ATOM  "):
+            continue
+        source_chain = line[21].strip() or "_"
+        if source_chain not in chain_map:
+            continue
+        try:
+            old_residue = int(line[22:26])
+        except ValueError:
+            continue
+        mapped = residue_map.get(f"{source_chain}{old_residue}")
+        if not mapped:
+            continue
+        new_chain = mapped[0]
+        new_residue = int(mapped[1:])
+        # Genie3's problem preparation rejects altlocs/insertion codes, so the
+        # app writes a normalized target PDB for the generated problem set.
+        rewritten_lines.append(line[:16] + " " + line[17:21] + new_chain + str(new_residue).rjust(4) + " " + line[27:] + "\n")
+    target_pdb.write_text("".join(rewritten_lines))
+
+    merged_sequence = ":".join(chain_sequences[chain] for chain in sorted(chain_sequences))
+    target_fasta.write_text(f">{problem_key}\n{merged_sequence}\n")
+    target_msa.write_text(f">{problem_key}\n{merged_sequence}\n")
+    for new_chain, sequence in sorted(chain_sequences.items()):
+        chain_pdb = dataset_dir / "targets" / "pdb" / f"{problem_key}-chain_{new_chain}.pdb"
+        chain_fasta = dataset_dir / "targets" / "fasta" / f"{problem_key}-chain_{new_chain}.fasta"
+        chain_msa = dataset_dir / "targets" / "msa" / f"{problem_key}-chain_{new_chain}.a3m"
+        chain_pdb.write_text("".join(line for line in rewritten_lines if line.startswith("ATOM  ") and line[21] == new_chain))
+        chain_fasta.write_text(f">{problem_key}-chain_{new_chain}\n{sequence}\n")
+        chain_msa.write_text(f">{problem_key}-chain_{new_chain}\n{sequence}\n")
+        target_pdb_by_chain.append(_rel_path(run_dir, chain_pdb) or str(chain_pdb))
+        target_fasta_by_chain.append(_rel_path(run_dir, chain_fasta) or str(chain_fasta))
+        source_chain = source_by_new_chain.get(new_chain, "")
+        repository_msa = (boltz_msa_by_source_chain or {}).get(source_chain)
+        target_msa_by_chain.append(repository_msa or f"/work/{_rel_path(run_dir, chain_msa)}")
+
+    mapped_hotspots = [residue_map[token] for token in hotspots.split(",") if token and token in residue_map]
+    extended = sorted(
+        {
+            f"{token[0]}{neighbor}"
+            for token in mapped_hotspots
+            for neighbor in range(max(1, int(token[1:]) - 2), int(token[1:]) + 3)
+            if any(tag.startswith(token[0]) and neighbor <= int(tag.split("-")[-1]) for tag in chain_tags)
+        },
+        key=lambda value: (value[0], int(value[1:])),
+    )
+    interface_residues = {
+        "hotspot": mapped_hotspots,
+        "extended": extended or mapped_hotspots,
+        "common": mapped_hotspots,
+    }
+    problem = {
+        "key": problem_key,
+        "name": campaign_name or problem_key,
+        "target_pdb_filepath": f"/work/{_rel_path(run_dir, target_pdb)}",
+        "target_fasta_filepath": f"/work/{_rel_path(run_dir, target_fasta)}",
+        "target_msa_filepath": f"/work/{_rel_path(run_dir, target_msa)}",
+        "target_pdb_filepath_by_chain": [f"/work/{path}" for path in target_pdb_by_chain],
+        "target_fasta_filepath_by_chain": [f"/work/{path}" for path in target_fasta_by_chain],
+        "target_msa_filepath_by_chain": target_msa_by_chain,
+        "target_chain_and_residues": chain_tags,
+        "target_interface_residues": interface_residues,
+        "binder_min_length": min_length,
+        "binder_max_length": max_length,
+        "other": {
+            "source_target_chains": source_chains,
+            "genie3_chain_map": chain_map,
+            "genie3_residue_map": residue_map,
+        },
+    }
+    write_json(dataset_dir / "problems" / f"{problem_key}.json", problem)
+    write_json(
+        run_dir / "artifacts" / "raw" / "genie3" / "input_mapping.json",
+        {
+            "problem_key": problem_key,
+            "source_target_chains": source_chains,
+            "genie3_chain_map": chain_map,
+            "genie3_residue_map": residue_map,
+            "requested_hotspots": [token for token in hotspots.split(",") if token],
+            "mapped_hotspots": mapped_hotspots,
+        },
+    )
+    return dataset_dir, problem_key, problem
+
+
+def _yaml_scalar(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value)
+    if re.fullmatch(r"[A-Za-z0-9_./:-]+", text):
+        return text
+    return json.dumps(text)
+
+
+def _write_genie3_experiment_yaml(
+    path: Path,
+    *,
+    experiment_name: str,
+    rootdir: str,
+    dataset: str,
+    problem_key: str,
+    num_designs: int,
+    seed: int,
+    num_devices: int,
+    direction_scale: float,
+    inverse_folding_num_seq: int,
+    folding_mode: str,
+    folding_model_name: str,
+    folding_num_models: int,
+    folding_num_recycles: int,
+    compile_generation: bool,
+    run_mode: str,
+    cond_strategy: str,
+    enable_beam_search: bool,
+    beam_width: int,
+) -> None:
+    lines = [
+        "experiment:",
+        f"  name: {_yaml_scalar(experiment_name)}",
+        f"  seed: {seed}",
+        "",
+        "paths:",
+        f"  rootdir: {_yaml_scalar(rootdir)}",
+        f"  dataset: {_yaml_scalar(dataset)}",
+        "",
+        "runtime:",
+        f"  num_devices: {num_devices}",
+        "",
+        "generation:",
+        f"  compile: {_yaml_scalar(compile_generation)}",
+        "  dataset:",
+        "    source: target",
+        f"    selections: {_yaml_scalar(problem_key)}",
+        f"    n_sample: {num_designs}",
+        f"    cond_strategy: {_yaml_scalar(cond_strategy)}",
+    ]
+    if enable_beam_search:
+        lines.extend(
+            [
+                "  inference:",
+                "    sampler:",
+                "      sampler:",
+                f"        direction_scale: {direction_scale}",
+                "    search:",
+                "      name: beam",
+                "      search:",
+                f"        beam_width: {beam_width}",
+                "    reward:",
+                "      name: colabfold",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "  sampler:",
+                "    sampler:",
+                f"      direction_scale: {direction_scale}",
+            ]
+        )
+    if run_mode == "full_vanilla_pipeline":
+        lines.extend(
+            [
+                "",
+                "evaluation:",
+                "  version: binder",
+                "  inverse_folding:",
+                "    model_name: proteinmpnn",
+                f"    num_seq: {inverse_folding_num_seq}",
+                "  folding:",
+                f"    model_name: {_yaml_scalar(folding_model_name)}",
+                f"    mode: {_yaml_scalar(folding_mode)}",
+                f"    num_models: {folding_num_models}",
+                f"    num_recycles: {folding_num_recycles}",
+            ]
+        )
+    if cond_strategy in {"iter_common", "iter_common_prob"}:
+        lines.extend(["", "rounds:", "  - id: round_0", f"    cond_strategy: {cond_strategy}"])
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _genie3_results_dir(run_dir: Path, problem_key: str) -> Path:
+    return run_dir / "artifacts" / "raw" / "genie3" / "output" / problem_key / "results"
+
+
+def _genie3_results_dirs(run_dir: Path, problem_key: str) -> list[Path]:
+    output_root = run_dir / "artifacts" / "raw" / "genie3" / "output"
+    direct = output_root / problem_key / "results"
+    dirs = [direct]
+    dirs.extend(sorted(output_root.glob(f"round_*/{problem_key}/results")))
+    return dirs
+
+
+def _genie3_row_key(row: dict[str, str]) -> str:
+    return str(row.get("name") or row.get("domain") or row.get("sample") or row.get("id") or "").strip()
+
+
+def _genie3_structure_for_row(results_dir: Path, row: dict[str, str], successful_only: bool) -> Path | None:
+    row_key = _genie3_row_key(row)
+    candidates: list[Path] = []
+    if successful_only:
+        success_dir = results_dir / "v0_success" / "successful_complexes"
+        candidates.extend([success_dir / f"{row_key}.pdb", success_dir / f"{row_key}.cif"])
+    design_path = str(row.get("design_filepath") or "").strip()
+    if design_path:
+        path = Path(design_path)
+        candidates.append(path)
+        if path.is_absolute() and str(path).startswith("/work/"):
+            candidates.append(results_dir.parents[5] / path.relative_to("/work"))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    search_roots = [
+        results_dir / "v0_success" / "successful_complexes",
+        results_dir.parent / "structures" / row_key if row_key else results_dir.parent / "structures",
+        results_dir.parent / "structures",
+        results_dir.parent / "pdbs",
+        results_dir.parent,
+    ]
+    for root in search_roots:
+        if not root.exists():
+            continue
+        if row_key:
+            matches = sorted([*root.glob(f"*{row_key}*.pdb"), *root.glob(f"*{row_key}*.cif")])
+            if matches:
+                return matches[0]
+        matches = sorted([*root.glob("*.pdb"), *root.glob("*.cif")])
+        if matches:
+            return matches[0]
+    return None
+
+
+def _normalize_genie3_candidates(run_dir: Path, params: dict, target_artifact: Path) -> list[dict]:
+    problem_key = str(params.get("problem_key") or "mn_app_target")
+    run_mode = str(params.get("run_mode") or "generation_only")
+    output_root = run_dir / "artifacts" / "raw" / "genie3" / "output"
+    results_dirs = _genie3_results_dirs(run_dir, problem_key)
+    results_dir = results_dirs[0]
+    rows: list[dict[str, str]] = []
+    successful_only = False
+    if run_mode == "full_vanilla_pipeline":
+        for candidate_results_dir in results_dirs:
+            success_csv = candidate_results_dir / "v0_success" / "success_info.csv"
+            info_csv = candidate_results_dir / "info.csv"
+            if success_csv.exists():
+                success_rows = _read_csv_rows(success_csv)
+                if success_rows:
+                    rows = success_rows
+                    results_dir = candidate_results_dir
+                    successful_only = True
+                    break
+            if info_csv.exists():
+                rows = _read_csv_rows(info_csv)
+                results_dir = candidate_results_dir
+                break
+    if not rows:
+        generated_paths = sorted([*output_root.glob(f"{problem_key}/pdbs/*.pdb"), *output_root.glob("pdbs/*.pdb")])
+        candidates = []
+        for index, structure_path in enumerate(generated_paths, start=1):
+            binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
+                target_artifact,
+                structure_path,
+                params.get("target_chains", []),
+            )
+            candidates.append(
+                {
+                    "candidate_id": f"genie3_{index:05d}",
+                    "source_tool": "genie3",
+                    "stage": STAGE_GENERATION_BACKBONE_SEQUENCE,
+                    "target_pdb": _rel_path(run_dir, target_artifact),
+                    "complex_pdb": _rel_path(run_dir, structure_path),
+                    "binder_pdb": None,
+                    "binder_sequence": "".join(_pdb_sequences_by_chain(structure_path).get(chain, "") for chain in binder_chains) or None,
+                    "target_chains": target_chains,
+                    "binder_chains": binder_chains,
+                    "hotspots": [token for token in params.get("hotspots", "").split(",") if token],
+                    "binder_length": params.get("binder_length"),
+                    "contig": None,
+                    "metrics": {"result_kind": "generation_only", "target_chain_inference": chain_inference},
+                    "raw_metadata": {"result_kind": "generation_only", "problem_key": problem_key},
+                }
+            )
+        return write_candidates(run_dir, "genie3", candidates)
+
+    candidates: list[dict] = []
+    for index, row in enumerate(rows, start=1):
+        structure_path = _genie3_structure_for_row(results_dir, row, successful_only)
+        if structure_path is None:
+            continue
+        binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
+            target_artifact,
+            structure_path,
+            params.get("target_chains", []),
+        )
+        sequences = _sequences_by_chain(structure_path)
+        metrics = {key: _numeric_or_text(value) for key, value in row.items() if value not in {"", None}}
+        pass_filters = True if successful_only else None
+        metrics.update(
+            {
+                "complex_refolding_backend": "genie3_vanilla",
+                "result_kind": "native_pipeline",
+                "target_chain_inference": chain_inference,
+                "native_final_rank": index,
+                "native_pass_filters": pass_filters,
+                "pass_filters": pass_filters,
+                "binder_plddt": metrics.get("binder_plddt") or metrics.get("avg_binder_plddt") or metrics.get("avg_plddt"),
+                "iptm": metrics.get("iptm") or metrics.get("binder_ptm"),
+                "ipae": metrics.get("min_interaction_pae") or metrics.get("min_interface_pae"),
+                "binder_rmsd": metrics.get("complex_scrmsd") or metrics.get("binder_scrmsd"),
+            }
+        )
+        candidates.append(
+            {
+                "candidate_id": f"genie3_{index:05d}",
+                "source_tool": "genie3",
+                "stage": STAGE_COMPLEX_REFOLDING,
+                "target_pdb": _rel_path(run_dir, target_artifact),
+                "complex_pdb": _rel_path(run_dir, structure_path),
+                "binder_pdb": None,
+                "binder_sequence": row.get("binder_seq") or "".join(sequences.get(chain, "") for chain in binder_chains) or None,
+                "target_chains": target_chains,
+                "binder_chains": binder_chains,
+                "hotspots": [token for token in params.get("hotspots", "").split(",") if token],
+                "binder_length": params.get("binder_length"),
+                "contig": None,
+                "metrics": metrics,
+                "raw_metadata": {
+                    "result_kind": "native_pipeline",
+                    "problem_key": problem_key,
+                    "result_csv": _rel_path(run_dir, results_dir / ("v0_success/success_info.csv" if successful_only else "info.csv")),
+                    "input_target_chains": params.get("target_chains", []),
+                    "target_chain_inference": chain_inference,
+                    "output_kind": "genie3_v0_success" if successful_only else "genie3_info",
+                },
+            }
+        )
+    return write_candidates(run_dir, "genie3", candidates)
 
 
 def _pxdesign_summary_paths(run_dir: Path) -> list[Path]:
@@ -687,6 +1311,149 @@ def _normalize_pxdesign_generation_candidates(run_dir: Path, params: dict, targe
             }
         )
     return write_candidates(run_dir, "pxdesign", candidates)
+
+
+def _proteina_complexa_result_rows(run_dir: Path) -> tuple[Path | None, list[dict[str, str]]]:
+    eval_root = run_dir / "artifacts" / "raw" / "proteina_complexa" / "evaluation_results"
+    preferred = sorted(eval_root.glob("*/RAW_protein_binder_results_search_binder_local_pipeline_combined.csv"))
+    if preferred:
+        return preferred[0], _read_csv_rows(preferred[0])
+    fallback = sorted(eval_root.glob("*/binder_results_search_binder_local_pipeline_*.csv"))
+    if fallback:
+        return fallback[0], _read_csv_rows(fallback[0])
+    return None, []
+
+
+def _proteina_complexa_resolve_path(run_dir: Path, csv_path: Path | None, path_text: str) -> Path | None:
+    text = str(path_text or "").strip().strip("'\"")
+    if not text:
+        return None
+    path = Path(text)
+    if path.is_absolute():
+        return path if path.exists() else None
+    raw_root = run_dir / "artifacts" / "raw" / "proteina_complexa"
+    candidates = [raw_root / path]
+    if text.startswith("./"):
+        candidates.append(raw_root / text[2:])
+    if csv_path is not None:
+        candidates.extend([csv_path.parent / path, csv_path.parent / text.lstrip("./")])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _proteina_complexa_native_pass(row: dict[str, str]) -> bool | None:
+    ipae = _float_or_none(row.get("self_complex_i_pAE"))
+    plddt = _float_or_none(row.get("self_complex_pLDDT"))
+    rmsd = _float_or_none(row.get("self_binder_scRMSD_ca") or row.get("self_binder_scRMSD"))
+    if ipae is None or plddt is None or rmsd is None:
+        return None
+    return ipae * 31.0 <= 7.0 and plddt >= 0.9 and rmsd < 1.5
+
+
+def _proteina_complexa_ranked_rows(rows: list[dict[str, str]]) -> list[tuple[int, dict[str, str], str | None, float | None]]:
+    if any(_float_or_none(row.get("self_complex_i_pAE")) is not None for row in rows):
+        ranked = sorted(
+            enumerate(rows),
+            key=lambda item: (
+                _float_or_none(item[1].get("self_complex_i_pAE")) is None,
+                _float_or_none(item[1].get("self_complex_i_pAE")) or 0.0,
+                item[0],
+            ),
+        )
+        return [
+            (rank, row, "self_complex_i_pAE", _float_or_none(row.get("self_complex_i_pAE")))
+            for rank, (_original_index, row) in enumerate(ranked, start=1)
+        ]
+    if any(_float_or_none(row.get("self_complex_i_pTM")) is not None for row in rows):
+        ranked = sorted(
+            enumerate(rows),
+            key=lambda item: (
+                _float_or_none(item[1].get("self_complex_i_pTM")) is None,
+                -(_float_or_none(item[1].get("self_complex_i_pTM")) or 0.0),
+                item[0],
+            ),
+        )
+        return [
+            (rank, row, "self_complex_i_pTM", _float_or_none(row.get("self_complex_i_pTM")))
+            for rank, (_original_index, row) in enumerate(ranked, start=1)
+        ]
+    return [(rank, row, None, None) for rank, row in enumerate(rows, start=1)]
+
+
+def _normalize_proteina_complexa_candidates(run_dir: Path, params: dict, target_artifact: Path) -> list[dict]:
+    csv_path, rows = _proteina_complexa_result_rows(run_dir)
+    candidates: list[dict] = []
+    for index, row, rank_metric, rank_value in _proteina_complexa_ranked_rows(rows):
+        structure_path = (
+            _proteina_complexa_resolve_path(run_dir, csv_path, row.get("self_complex_pdb_path", ""))
+            or _proteina_complexa_resolve_path(run_dir, csv_path, row.get("complex_pdb_path", ""))
+            or _proteina_complexa_resolve_path(run_dir, csv_path, row.get("pdb_path", ""))
+        )
+        if structure_path is None:
+            continue
+        binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
+            target_artifact,
+            structure_path,
+            params.get("target_chains", []),
+        )
+        sequences = _sequences_by_chain(structure_path)
+        binder_sequence = row.get("binder_sequence") or row.get("_res_mpnn_best_sequence") or "".join(
+            sequences.get(chain, "") for chain in binder_chains
+        ) or None
+        metrics = {key: _numeric_or_text(value) for key, value in row.items() if value not in {"", None}}
+        native_pass = _proteina_complexa_native_pass(row)
+        native_ipae = _float_or_none(row.get("self_complex_i_pAE"))
+        metrics.update(
+            {
+                "complex_refolding_backend": "proteina_complexa_native",
+                "result_kind": "native_pipeline",
+                "target_chain_inference": chain_inference,
+                "binder_plddt": metrics.get("self_complex_pLDDT"),
+                "iptm": metrics.get("self_complex_i_pTM"),
+                "ipae": metrics.get("self_complex_i_pAE"),
+                "ipsae": metrics.get("self_complex_min_ipSAE"),
+                "ipsae_min": metrics.get("self_complex_min_ipSAE"),
+                "ipsae_max": metrics.get("self_complex_max_ipSAE"),
+                "ipsae_avg": metrics.get("self_complex_avg_ipSAE"),
+                "binder_rmsd": metrics.get("self_binder_scRMSD_ca") or metrics.get("self_binder_scRMSD"),
+                "native_final_rank": index,
+                "native_rank_metric": rank_metric,
+                "native_rank_value": rank_value,
+                "native_ipae_scaled": native_ipae * 31.0 if native_ipae is not None else None,
+                "native_pass_filters": native_pass,
+                "pass_filters": native_pass,
+                "proteina_complexa_success_criteria": "self_complex_i_pAE*31<=7.0; self_complex_pLDDT>=0.9; self_binder_scRMSD_ca<1.5",
+            }
+        )
+        candidates.append(
+            {
+                "candidate_id": f"proteina_complexa_{index:05d}",
+                "source_tool": "proteina_complexa",
+                "stage": STAGE_COMPLEX_REFOLDING,
+                "target_pdb": _rel_path(run_dir, target_artifact),
+                "complex_pdb": _rel_path(run_dir, structure_path),
+                "binder_pdb": None,
+                "binder_sequence": binder_sequence,
+                "target_chains": target_chains,
+                "binder_chains": binder_chains,
+                "hotspots": [token for token in params.get("hotspots", "").split(",") if token],
+                "binder_length": params.get("binder_length"),
+                "contig": None,
+                "metrics": metrics,
+                "raw_metadata": {
+                    "result_kind": "native_pipeline",
+                    "result_csv": _rel_path(run_dir, csv_path),
+                    "complex_pdb_path": row.get("complex_pdb_path"),
+                    "self_complex_pdb_path": row.get("self_complex_pdb_path"),
+                    "input_target_chains": params.get("target_chains", []),
+                    "target_chain_inference": chain_inference,
+                    "output_kind": "proteina_complexa_native",
+                },
+            }
+        )
+    return write_candidates(run_dir, "proteina_complexa", candidates)
 
 
 def _normalize_rfdiffusion3_contig(contig: str) -> str:
@@ -912,6 +1679,127 @@ def _normalize_rfdiffusion3_candidates(run_dir: Path, params: dict, target_artif
     return candidates
 
 
+def _rf3_summary_metrics(summary_path: Path | None) -> dict:
+    if summary_path is None or not summary_path.exists():
+        return {}
+    payload = read_json(summary_path)
+    metrics: dict = {}
+    for key in [
+        "ranking_score",
+        "confidence",
+        "ptm",
+        "iptm",
+        "has_clash",
+        "fraction_disordered",
+    ]:
+        if key in payload:
+            metrics[key] = payload[key]
+    pae = payload.get("pae") or payload.get("predicted_aligned_error")
+    if isinstance(pae, list):
+        metrics["rf3_pae_available"] = True
+    return metrics
+
+
+def _write_foundry_cif_with_target_msas(
+    source_cif: Path,
+    staged_cif: Path,
+    target_artifact: Path,
+    output_target_chains: list[str],
+    source_target_chains: list[str],
+    msa_by_source_chain: dict[str, str],
+) -> dict[str, str]:
+    text = gzip.open(source_cif, "rt", errors="ignore").read() if source_cif.name.endswith(".gz") else source_cif.read_text(errors="ignore")
+    generated_sequences = _sequences_by_chain(source_cif)
+    target_sequences = _pdb_sequences_by_chain(target_artifact)
+    msa_by_output_chain: dict[str, str] = {}
+    for output_chain in output_target_chains:
+        output_sequence = generated_sequences.get(output_chain, "")
+        matched_source_chain = ""
+        for source_chain in source_target_chains:
+            if output_sequence and output_sequence == target_sequences.get(source_chain, ""):
+                matched_source_chain = source_chain
+                break
+        if not matched_source_chain and output_chain in msa_by_source_chain:
+            matched_source_chain = output_chain
+        msa_path = msa_by_source_chain.get(matched_source_chain)
+        if msa_path:
+            msa_by_output_chain[output_chain] = msa_path
+
+    header_lines = ["#"]
+    for chain_id, msa_path in sorted(msa_by_output_chain.items()):
+        header_lines.append(f"_msa_paths_by_chain_id.{chain_id}   {msa_path}")
+    header_lines.append("#")
+    staged_cif.parent.mkdir(parents=True, exist_ok=True)
+    staged_cif.write_text("\n".join(header_lines) + "\n" + text)
+    return msa_by_output_chain
+
+
+def _normalize_rfdiffusion3_foundry_native_candidates(run_dir: Path, params: dict, target_artifact: Path) -> list[dict]:
+    raw_root = run_dir / "artifacts" / "raw" / "rfdiffusion3_foundry"
+    rf3_root = raw_root / "rf3"
+    mapping_rows = _read_csv_rows(raw_root / "foundry_native_mapping.tsv")
+    candidates: list[dict] = []
+    for index, row in enumerate(mapping_rows, start=1):
+        source_id = row.get("rfd3_id") or f"rfd3_{index:05d}"
+        mpnn_id = row.get("mpnn_id") or f"mpnn_{index:05d}"
+        rf3_out_dir = Path(row.get("rf3_out_dir") or "")
+        if not rf3_out_dir.is_absolute():
+            rf3_out_dir = run_dir / rf3_out_dir
+        model_paths = sorted(rf3_out_dir.glob("*_model.cif"))
+        if not model_paths:
+            model_paths = sorted(rf3_out_dir.glob("**/*_model.cif"))
+        if not model_paths:
+            continue
+        structure_path = model_paths[0]
+        summary_paths = sorted(rf3_out_dir.glob("*_summary_confidences.json"))
+        summary_path = summary_paths[0] if summary_paths else None
+        rfd3_path = run_dir / row.get("rfd3_cif", "")
+        mpnn_path = run_dir / row.get("mpnn_cif", "")
+        binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
+            target_artifact,
+            structure_path,
+            params.get("target_chains", []),
+        )
+        sequences = _sequences_by_chain(structure_path)
+        binder_sequence = "".join(sequences.get(chain, "") for chain in binder_chains) or None
+        metrics = {
+            **_rf3_summary_metrics(summary_path),
+            "complex_refolding_backend": "rf3",
+            "sequence_design_backend": "foundry_mpnn",
+            "generation_backend": "rfdiffusion3",
+            "result_kind": "native_pipeline",
+            "native_final_rank": index,
+        }
+        candidates.append(
+            {
+                "candidate_id": f"rfdiffusion3_foundry_{index:05d}_rf3",
+                "source_tool": "rfdiffusion3_foundry",
+                "stage": STAGE_COMPLEX_REFOLDING,
+                "target_pdb": _rel_path(run_dir, target_artifact),
+                "complex_pdb": _rel_path(run_dir, structure_path),
+                "binder_pdb": None,
+                "binder_sequence": binder_sequence,
+                "target_chains": target_chains,
+                "binder_chains": binder_chains,
+                "hotspots": [token for token in params.get("hotspots", "").split(",") if token],
+                "binder_length": params.get("binder_length"),
+                "contig": params.get("contig"),
+                "metrics": metrics,
+                "raw_metadata": {
+                    "result_kind": "native_pipeline",
+                    "rfd3_cif": _rel_path(run_dir, rfd3_path) if rfd3_path.exists() else row.get("rfd3_cif"),
+                    "mpnn_cif": _rel_path(run_dir, mpnn_path) if mpnn_path.exists() else row.get("mpnn_cif"),
+                    "rf3_summary": _rel_path(run_dir, summary_path),
+                    "input_target_chains": params.get("target_chains", []),
+                    "target_chain_inference": chain_inference,
+                    "target_msa_by_rf3_chain": row.get("target_msa_by_rf3_chain", ""),
+                },
+            }
+        )
+    _write_candidates(run_dir, "rfdiffusion3_foundry", candidates)
+    return candidates
+
+
 def _finish_design_job(run_dir: Path, success: bool, rc: int, candidates: list[dict], artifact_patterns: list[tuple[str, str]]) -> None:
     artifacts = _collect_artifacts(
         run_dir,
@@ -945,7 +1833,7 @@ def _copy_target_for_design(job_run_dir: Path, target_pdb: Path, target_chains: 
 def _run_shell_steps(run_dir: Path, steps: list[dict]) -> int:
     write_json(run_dir / "command.json", {"mode": "docker", "steps": steps})
     update_status(run_dir, "running")
-    with (run_dir / "stdout.log").open("w") as stdout, (run_dir / "stderr.log").open("w") as stderr:
+    with (run_dir / "stdout.log").open("a") as stdout, (run_dir / "stderr.log").open("a") as stderr:
         for step in steps:
             stdout.write(f"$ {' '.join(step['command'])}\n")
             stdout.flush()
@@ -1053,6 +1941,119 @@ def _normalize_rfdiffusion_candidates(run_dir: Path, params: dict, target_artifa
     return write_candidates(run_dir, "rfdiffusion_classic", candidates)
 
 
+def _job_source_for_run(run_dir: Path) -> dict:
+    metadata = read_json(run_dir / "metadata.json")
+    candidates = read_candidates(run_dir)
+    return {
+        "task_group": metadata.get("task_group") or run_dir.parent.name,
+        "run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "job_code": metadata.get("job_code") or "",
+        "tool": metadata.get("tool") or "",
+        "candidates_jsonl": str(run_dir / "artifacts" / "normalized_candidates" / "candidates.jsonl"),
+        "candidate_count": len(candidates),
+        "stage_counts": candidate_stage_counts(candidates),
+    }
+
+
+def _mark_internal_child_run(child_run_dir: Path, parent_run_dir: Path, step_index: int) -> None:
+    metadata = read_json(child_run_dir / "metadata.json")
+    metadata.update(
+        {
+            "hidden": True,
+            "internal_parent_run_id": parent_run_dir.name,
+            "internal_parent_run_dir": str(parent_run_dir),
+            "internal_step_index": step_index,
+        }
+    )
+    write_json(child_run_dir / "metadata.json", metadata)
+
+
+def _append_internal_child_logs(parent_run_dir: Path, child_run_dir: Path, label: str) -> None:
+    for log_name in ("stdout.log", "stderr.log"):
+        source_log = child_run_dir / log_name
+        if not source_log.exists():
+            continue
+        with (parent_run_dir / log_name).open("a") as target:
+            target.write(f"\n\n===== internal step: {label} ({child_run_dir.name}) =====\n")
+            target.write(source_log.read_text(errors="ignore"))
+
+
+def _copy_pipeline_file(parent_run_dir: Path, source_run_dir: Path, path_text: str | None, folder: Path) -> str | None:
+    if not path_text:
+        return None
+    path = Path(path_text)
+    source_path = path if path.is_absolute() else source_run_dir / path
+    if not source_path.exists() or not source_path.is_file():
+        return path_text
+    folder.mkdir(parents=True, exist_ok=True)
+    target_path = folder / source_path.name
+    if source_path.resolve() != target_path.resolve():
+        shutil.copy2(source_path, target_path)
+    return _rel_path(parent_run_dir, target_path)
+
+
+def _adopt_rfdiffusion_native_candidates(
+    parent_run_dir: Path,
+    complex_run_dir: Path,
+    params: dict,
+    target_artifact: Path,
+) -> list[dict]:
+    adopted: list[dict] = []
+    source_candidates = [
+        candidate
+        for candidate in read_candidates(complex_run_dir)
+        if candidate.get("stage") == STAGE_COMPLEX_REFOLDING
+    ]
+    native_dir = parent_run_dir / "artifacts" / "raw" / "rfdiffusion" / "native_pipeline"
+    target_rel = _rel_path(parent_run_dir, target_artifact)
+    for index, source in enumerate(source_candidates, start=1):
+        candidate_id = f"rfdiffusion_classic_{index:05d}_native"
+        candidate_dir = native_dir / candidate_id
+        raw_metadata = dict(source.get("raw_metadata") or {})
+        complex_rel = _copy_pipeline_file(parent_run_dir, complex_run_dir, source.get("complex_pdb"), candidate_dir)
+        binder_rel = _copy_pipeline_file(parent_run_dir, complex_run_dir, source.get("binder_pdb"), candidate_dir)
+        pae_rel = _copy_pipeline_file(parent_run_dir, complex_run_dir, raw_metadata.get("pae_path"), candidate_dir)
+        if pae_rel:
+            raw_metadata["pae_path"] = pae_rel
+        raw_metadata.update(
+            {
+                "source_candidate": source,
+                "source_complex_run_dir": str(complex_run_dir),
+                "result_kind": "native_pipeline",
+                "native_pipeline": "rfdiffusion_classic_ligandmpnn_monomer_complex_refolding",
+            }
+        )
+        metrics = dict(source.get("metrics") or {})
+        metrics.update(
+            {
+                "result_kind": "native_pipeline",
+                "generation_backend": "rfdiffusion_classic",
+                "sequence_design_backend": params.get("sequence_design_method") or "ligandmpnn",
+            }
+        )
+        adopted.append(
+            {
+                **source,
+                "candidate_id": candidate_id,
+                "stage": STAGE_COMPLEX_REFOLDING,
+                "source_tool": "rfdiffusion_classic",
+                "tool": "rfdiffusion_classic",
+                "target_pdb": target_rel,
+                "complex_pdb": complex_rel or source.get("complex_pdb"),
+                "binder_pdb": binder_rel,
+                "target_chains": source.get("target_chains") or params.get("target_chains", []),
+                "hotspots": [token for token in str(params.get("hotspots") or "").split(",") if token],
+                "binder_length": params.get("binder_length"),
+                "contig": params.get("contig"),
+                "metrics": metrics,
+                "parents": [str(source.get("candidate_id") or "")],
+                "raw_metadata": raw_metadata,
+            }
+        )
+    return write_candidates(parent_run_dir, "rfdiffusion_classic", adopted) if adopted else []
+
+
 def _rfdiffusion_pipeline_payload(
     *,
     target_pdb_path: str,
@@ -1125,6 +2126,7 @@ def run_rfdiffusion_classic(
     contig: str,
     binder_length: str,
     hotspots: str = "",
+    campaign_name: str = "",
     num_designs: int = 1,
     timesteps: int = 50,
     model_weights: str = "Complex_base",
@@ -1152,6 +2154,14 @@ def run_rfdiffusion_classic(
     mpnn_fastrelax_cycles: int = 0,
     refolding_test: str = "af2_model_1_multimer_tt_3rec",
     execution_backend: str = "docker",
+    run_vanilla_pipeline: bool = True,
+    monomer_refolding_tool: str = "boltz2_monomer",
+    complex_refolding_tool: str = "af2_initial_guess",
+    complex_template_mode: str = "target_template",
+    complex_multimer: bool = True,
+    complex_num_recycles: int = 3,
+    analysis_keep_top_n: int = 100,
+    analysis_thresholds: dict[str, float] | None = None,
 ) -> Path:
     hotspots = normalize_hotspots(hotspots) if hotspots else ""
     validate_rfdiffusion_inputs(contig, hotspots, binder_length, num_designs, timesteps)
@@ -1170,6 +2180,7 @@ def run_rfdiffusion_classic(
     )
     params = {
         "target_chains": target_chains,
+        "campaign_name": campaign_name.strip(),
         "contig": contig,
         "binder_length": binder_length,
         "hotspots": hotspots,
@@ -1200,6 +2211,14 @@ def run_rfdiffusion_classic(
         "mpnn_fastrelax_cycles": mpnn_fastrelax_cycles,
         "refolding_test": refolding_test,
         "execution_backend": execution_backend,
+        "run_vanilla_pipeline": run_vanilla_pipeline,
+        "monomer_refolding_tool": monomer_refolding_tool,
+        "complex_refolding_tool": complex_refolding_tool,
+        "complex_template_mode": complex_template_mode,
+        "complex_multimer": complex_multimer,
+        "complex_num_recycles": complex_num_recycles,
+        "analysis_keep_top_n": analysis_keep_top_n,
+        "analysis_thresholds": analysis_thresholds or {},
         "pipeline_mode": "mn_protein_design_rfdiffusion",
     }
     job = create_job(
@@ -1209,6 +2228,8 @@ def run_rfdiffusion_classic(
         inputs={"target_pdb": str(target_pdb), "target_chains": target_chains},
         params=params,
     )
+    if campaign_name.strip():
+        update_status(job.run_dir, "queued", campaign_name=campaign_name.strip())
 
     target_artifact = artifact_path(job.run_dir, "input", "target.pdb")
     target_text = edited_target_pdb_text if edited_target_pdb_text is not None else target_pdb.read_text(errors="ignore")
@@ -1332,12 +2353,68 @@ def run_rfdiffusion_classic(
     rc = _run_shell_steps(job.run_dir, steps)
 
     candidates = _normalize_rfdiffusion_candidates(job.run_dir, params, target_artifact) if rc == 0 else []
+    child_runs: list[Path] = []
+    if rc == 0 and run_vanilla_pipeline and candidates:
+        from mn_protein_design.workflows.campaigns import run_lineage_steps
+
+        thresholds = analysis_thresholds or {}
+        steps = [
+            {
+                "module": "sequence_design",
+                "tool": "ligandmpnn",
+                "params": {
+                    "model_type": sequence_design_method if sequence_design_method in {"protein_mpnn", "ligand_mpnn", "soluble_mpnn"} else "protein_mpnn",
+                    "design_chains": "",
+                    "num_seq_per_target": int(mpnn_num_sequences),
+                    "sampling_temp": float(mpnn_sampling_temp),
+                    "omit_aas": str(mpnn_omit_aa or "CX"),
+                    "seed": None,
+                    "require_backbone_hotspot_filter_pass": bool(apply_backbone_hotspot_prefilter),
+                },
+            },
+            {
+                "module": "monomer_refolding",
+                "tool": monomer_refolding_tool,
+                "params": {"min_plddt": float(thresholds.get("min_binder_plddt", 70.0))},
+            },
+            {
+                "module": "complex_refolding",
+                "tool": complex_refolding_tool,
+                "params": {
+                    "require_monomer_success": True,
+                    "template_mode": complex_template_mode,
+                    "multimer": complex_multimer,
+                    "num_recycles": complex_num_recycles,
+                },
+            },
+            {
+                "module": "analysis",
+                "tool": "ranking",
+                "params": {
+                    "keep_top_n": int(analysis_keep_top_n),
+                    "thresholds": thresholds,
+                },
+            },
+        ]
+        child_runs = run_lineage_steps(
+            campaign_name.strip() or f"RFdiffusion classic vanilla from {job.run_dir.name}",
+            _job_source_for_run(job.run_dir),
+            steps,
+        )
+        for step_index, child_run in enumerate(child_runs, start=1):
+            _mark_internal_child_run(child_run, job.run_dir, step_index)
+            _append_internal_child_logs(job.run_dir, child_run, f"vanilla-{step_index}")
+        if len(child_runs) >= 3 and read_json(child_runs[2] / "result.json").get("success") is True:
+            candidates = _adopt_rfdiffusion_native_candidates(job.run_dir, child_runs[2], params, target_artifact)
+        if not child_runs or read_json(child_runs[-1] / "result.json").get("success") is not True:
+            rc = 1
     artifacts = _collect_artifacts(
         job.run_dir,
         job.run_dir / "artifacts",
         [
             ("raw/rfdiffusion/output/*.pdb", "designed_complex_pdb"),
             ("raw/rfdiffusion/output/*.trb", "rfdiffusion_trb"),
+            ("raw/rfdiffusion/native_pipeline/**/*", "rfdiffusion_native_pipeline"),
             ("raw/rfdiffusion/pipeline_inputs/*", "rfdiffusion_pipeline_input"),
             ("raw/rfdiffusion/nextflow/*.txt", "nextflow_trace"),
             ("raw/rfdiffusion/nextflow/*.html", "nextflow_report"),
@@ -1350,7 +2427,12 @@ def run_rfdiffusion_classic(
         rc == 0 and bool(candidates),
         {
             "outputs": {"artifacts": artifacts, "candidates": candidates},
-            "metrics": {"return_code": rc, "artifact_count": len(artifacts), "candidate_count": len(candidates)},
+            "metrics": {
+                "return_code": rc,
+                "artifact_count": len(artifacts),
+                "candidate_count": len(candidates),
+                "internal_pipeline_steps": len(child_runs),
+            },
             "downstream_artifacts": {
                 "target_pdb": str(target_artifact.relative_to(job.run_dir)),
                 "pipeline_inputs": "artifacts/raw/rfdiffusion/pipeline_inputs",
@@ -1443,6 +2525,7 @@ def run_bindcraft(
         "--rm",
         "--gpus",
         "all",
+        "--shm-size=64G",
         "-v",
         f"{job.run_dir}:/work",
         "-v",
@@ -1488,26 +2571,44 @@ def run_rfdiffusion3_foundry(
     target_chains: list[str],
     binder_length: str,
     hotspots: str = "",
+    campaign_name: str = "",
     num_designs: int = 1,
     timesteps: int = 50,
     contig: str | None = None,
     is_non_loopy: bool = True,
     infer_ori_strategy: str = "",
+    run_vanilla_pipeline: bool = True,
+    mpnn_sequences_per_backbone: int = 1,
+    mpnn_model_type: str = "protein_mpnn",
+    mpnn_checkpoint_path: str = "/weights/proteinmpnn_v_48_020.pt",
+    rf3_checkpoint_path: str = "/weights/rf3_foundry_01_24_latest_remapped.ckpt",
+    prepare_target_msa: bool = True,
 ) -> Path:
     hotspots = normalize_hotspots(hotspots) if hotspots else ""
     manifest = load_manifest("rfdiffusion3_foundry")
     final_contig = _normalize_rfdiffusion3_contig(contig) if contig and contig.strip() else ""
+    if mpnn_sequences_per_backbone < 1:
+        raise ValueError("MPNN sequences per backbone must be at least 1.")
     params = {
         "target_chains": target_chains,
         "binder_length": binder_length,
         "hotspots": hotspots,
+        "campaign_name": campaign_name.strip(),
         "num_designs": num_designs,
         "timesteps": timesteps,
         "contig": final_contig,
         "is_non_loopy": is_non_loopy,
         "infer_ori_strategy": infer_ori_strategy.strip() or ("hotspots" if hotspots else "default"),
+        "run_vanilla_pipeline": run_vanilla_pipeline,
+        "mpnn_sequences_per_backbone": mpnn_sequences_per_backbone,
+        "mpnn_model_type": mpnn_model_type,
+        "mpnn_checkpoint_path": mpnn_checkpoint_path,
+        "rf3_checkpoint_path": rf3_checkpoint_path,
+        "prepare_target_msa": prepare_target_msa,
     }
     job = create_job(DESIGN_GROUP, "design_campaign", "rfdiffusion3_foundry", {"target_pdb": str(target_pdb), "target_chains": target_chains}, params)
+    if campaign_name.strip():
+        update_status(job.run_dir, "queued", campaign_name=campaign_name.strip())
     target_artifact = _copy_target_for_design(job.run_dir, target_pdb, target_chains, "raw/rfdiffusion3_foundry")
     if not final_contig:
         final_contig = _normalize_rfdiffusion3_contig(default_target_contig(target_artifact, target_chains, binder_length))
@@ -1521,6 +2622,36 @@ def run_rfdiffusion3_foundry(
                 "params": params,
             },
         )
+    msa_by_source_chain: dict[str, str] = {}
+    if run_vanilla_pipeline and prepare_target_msa:
+        try:
+            msa_by_source_chain = _shared_ensure_boltz_msas_for_target(
+                job.run_dir,
+                target_artifact,
+                target_chains,
+                raw_subdir="rfdiffusion3_foundry/rf3_msa_cache",
+            )
+            params["target_msa_by_chain"] = msa_by_source_chain
+            write_json(
+                job.run_dir / "input.json",
+                {
+                    "job_type": "design_campaign",
+                    "tool": "rfdiffusion3_foundry",
+                    "inputs": {"target_pdb": str(target_pdb), "target_chains": target_chains},
+                    "params": params,
+                },
+            )
+        except Exception as exc:
+            params["target_msa_error"] = str(exc)
+            write_json(
+                job.run_dir / "input.json",
+                {
+                    "job_type": "design_campaign",
+                    "tool": "rfdiffusion3_foundry",
+                    "inputs": {"target_pdb": str(target_pdb), "target_chains": target_chains},
+                    "params": params,
+                },
+            )
     design_input = {
         "design_1": {
             "dialect": 2,
@@ -1533,17 +2664,165 @@ def run_rfdiffusion3_foundry(
     if hotspots:
         design_input["design_1"]["select_hotspots"] = {token: "CA" for token in hotspots.split(",") if token}
     write_json(job.run_dir / "artifacts" / "raw" / "rfdiffusion3_foundry" / "rfd3_inputs_staged.json", design_input)
-    script = (
-        "set -euxo pipefail; cd /work/artifacts/raw/rfdiffusion3_foundry; rm -rf rfd3; "
-        f"rfd3 design out_dir=rfd3 inputs=rfd3_inputs_staged.json ckpt_path=/weights/rfd3_latest.ckpt "
-        f"diffusion_batch_size=1 n_batches={num_designs} inference_sampler.num_timesteps={timesteps} "
-        "skip_existing=False prevalidate_inputs=True; "
-        'test -n "$(find rfd3 -type f \\( -name \"*.cif\" -o -name \"*.cif.gz\" \\) -print -quit)"'
-    )
-    command = ["docker", "run", "--rm", "--gpus", "all", "-v", f"{job.run_dir}:/work", "-v", "/mnt/db/reference_files/foundry:/weights:ro", "-w", "/work", manifest["image"], "bash", "-lc", script]
+    if run_vanilla_pipeline:
+        script = (
+            "set -euxo pipefail; cd /work/artifacts/raw/rfdiffusion3_foundry; "
+            "rm -rf rfd3 mpnn rf3 tmp foundry_native_mapping.tsv; mkdir -p rfd3 mpnn rf3 tmp; "
+            f"rfd3 design out_dir=rfd3 inputs=rfd3_inputs_staged.json ckpt_path=/weights/rfd3_latest.ckpt "
+            f"diffusion_batch_size=1 n_batches={num_designs} inference_sampler.num_timesteps={timesteps} "
+            "skip_existing=False prevalidate_inputs=True; "
+            'test -n "$(find rfd3 -maxdepth 1 -type f \\( -name \"*.cif\" -o -name \"*.cif.gz\" \\) -print -quit)"'
+        )
+    else:
+        script = (
+            "set -euxo pipefail; cd /work/artifacts/raw/rfdiffusion3_foundry; rm -rf rfd3; "
+            f"rfd3 design out_dir=rfd3 inputs=rfd3_inputs_staged.json ckpt_path=/weights/rfd3_latest.ckpt "
+            f"diffusion_batch_size=1 n_batches={num_designs} inference_sampler.num_timesteps={timesteps} "
+            "skip_existing=False prevalidate_inputs=True; "
+            'test -n "$(find rfd3 -type f \\( -name \"*.cif\" -o -name \"*.cif.gz\" \\) -print -quit)"'
+        )
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--gpus",
+        "all",
+        "-v",
+        f"{job.run_dir}:/work",
+        "-v",
+        "/mnt/db/reference_files/foundry:/weights:ro",
+        "-v",
+        "/mnt/db/reference_files/boltz_models/msa_repository:/msa_repository:ro",
+        "-w",
+        "/work",
+        manifest["image"],
+        "bash",
+        "-lc",
+        script,
+    ]
     rc = _run_shell_steps(job.run_dir, [{"name": "rfdiffusion3-foundry", "command": command}])
-    candidates = _normalize_rfdiffusion3_candidates(job.run_dir, params, target_artifact) if rc == 0 else []
-    _finish_design_job(job.run_dir, rc == 0, rc, candidates, [("raw/rfdiffusion3_foundry/rfd3/**/*", "rfdiffusion3_output"), ("raw/rfdiffusion3_foundry/*.json", "rfdiffusion3_input")])
+    if rc == 0 and run_vanilla_pipeline:
+        raw_root = job.run_dir / "artifacts" / "raw" / "rfdiffusion3_foundry"
+        mapping_path = raw_root / "foundry_native_mapping.tsv"
+        with mapping_path.open("w", newline="") as handle:
+            fieldnames = ["rfd3_cif", "rfd3_id", "mpnn_cif", "mpnn_id", "rf3_out_dir", "target_msa_by_rf3_chain"]
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for rfd3_index, rfd3_path in enumerate(sorted([*raw_root.glob("rfd3/*.cif"), *raw_root.glob("rfd3/*.cif.gz")]), start=1):
+                rfd3_id = rfd3_path.name.removesuffix(".cif.gz").removesuffix(".cif")
+                staged_cif = raw_root / "tmp" / f"{rfd3_id}.cif"
+                if rfd3_path.name.endswith(".gz"):
+                    with gzip.open(rfd3_path, "rt", errors="ignore") as src:
+                        staged_cif.write_text(src.read())
+                else:
+                    shutil.copy2(rfd3_path, staged_cif)
+                mpnn_out_dir = raw_root / "mpnn" / rfd3_id
+                mpnn_out_dir.mkdir(parents=True, exist_ok=True)
+                mpnn_command = [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--gpus",
+                    "all",
+                    "-v",
+                    f"{job.run_dir}:/work",
+                    "-v",
+                    "/mnt/db/reference_files/foundry:/weights:ro",
+                    "-w",
+                    "/work",
+                    manifest["image"],
+                    "mpnn",
+                    "--structure_path",
+                    f"/work/artifacts/raw/rfdiffusion3_foundry/tmp/{rfd3_id}.cif",
+                    "--checkpoint_path",
+                    mpnn_checkpoint_path,
+                    "--is_legacy_weights",
+                    "True",
+                    "--model_type",
+                    mpnn_model_type,
+                    "--batch_size",
+                    str(mpnn_sequences_per_backbone),
+                    "--number_of_batches",
+                    "1",
+                    "--remove_waters",
+                    "True",
+                    "--out_directory",
+                    f"/work/artifacts/raw/rfdiffusion3_foundry/mpnn/{rfd3_id}",
+                ]
+                rc = _run_shell_steps(job.run_dir, [{"name": f"foundry-mpnn-{rfd3_id}", "command": mpnn_command}])
+                if rc != 0:
+                    break
+                for mpnn_path in sorted(mpnn_out_dir.glob("*.cif")):
+                    mpnn_id = mpnn_path.stem
+                    binder_chains, output_target_chains, _inference = _infer_generated_chain_roles(
+                        target_artifact,
+                        mpnn_path,
+                        target_chains,
+                    )
+                    rf3_input = raw_root / "rf3_inputs" / rfd3_id / f"{mpnn_id}.cif"
+                    target_msa_by_rf3_chain = _write_foundry_cif_with_target_msas(
+                        mpnn_path,
+                        rf3_input,
+                        target_artifact,
+                        output_target_chains,
+                        target_chains,
+                        msa_by_source_chain,
+                    )
+                    rf3_out_dir = raw_root / "rf3" / rfd3_id / mpnn_id
+                    rf3_command = [
+                        "docker",
+                        "run",
+                        "--rm",
+                        "--gpus",
+                        "all",
+                        "-v",
+                        f"{job.run_dir}:/work",
+                        "-v",
+                        "/mnt/db/reference_files/foundry:/weights:ro",
+                        "-v",
+                        "/mnt/db/reference_files/boltz_models/msa_repository:/msa_repository:ro",
+                        "-w",
+                        "/work",
+                        manifest["image"],
+                        "rf3",
+                        "fold",
+                        f"inputs=/work/artifacts/raw/rfdiffusion3_foundry/rf3_inputs/{rfd3_id}/{mpnn_id}.cif",
+                        f"ckpt_path={rf3_checkpoint_path}",
+                        f"out_dir=/work/artifacts/raw/rfdiffusion3_foundry/rf3/{rfd3_id}/{mpnn_id}",
+                        "raise_if_missing_msa_for_protein_of_length_n=10000",
+                    ]
+                    rc = _run_shell_steps(job.run_dir, [{"name": f"rf3-fold-{rfd3_id}-{mpnn_id}", "command": rf3_command}])
+                    if rc != 0:
+                        break
+                    writer.writerow(
+                        {
+                            "rfd3_cif": _rel_path(job.run_dir, rfd3_path),
+                            "rfd3_id": rfd3_id,
+                            "mpnn_cif": _rel_path(job.run_dir, mpnn_path),
+                            "mpnn_id": mpnn_id,
+                            "rf3_out_dir": _rel_path(job.run_dir, rf3_out_dir),
+                            "target_msa_by_rf3_chain": json.dumps(target_msa_by_rf3_chain, sort_keys=True),
+                        }
+                    )
+                if rc != 0:
+                    break
+        candidates = _normalize_rfdiffusion3_foundry_native_candidates(job.run_dir, params, target_artifact) if rc == 0 else []
+    else:
+        candidates = _normalize_rfdiffusion3_candidates(job.run_dir, params, target_artifact) if rc == 0 else []
+    _finish_design_job(
+        job.run_dir,
+        rc == 0,
+        rc,
+        candidates,
+        [
+            ("raw/rfdiffusion3_foundry/rfd3/**/*", "rfdiffusion3_output"),
+            ("raw/rfdiffusion3_foundry/mpnn/**/*", "foundry_mpnn_output"),
+            ("raw/rfdiffusion3_foundry/rf3/**/*", "rf3_output"),
+            ("raw/rfdiffusion3_foundry/rf3_inputs/**/*", "rf3_input"),
+            ("raw/rfdiffusion3_foundry/*.json", "rfdiffusion3_input"),
+            ("raw/rfdiffusion3_foundry/*.tsv", "foundry_native_mapping"),
+        ],
+    )
     return job.run_dir
 
 
@@ -1636,7 +2915,7 @@ def run_boltzgen(
         f"{run_args}; "
         f"{output_check}"
     )
-    command = ["docker", "run", "--rm", "--gpus", "all", "--entrypoint", "/bin/bash", "-v", "/mnt/db/reference_files/boltzgen-cache:/cache", "-v", f"{job.run_dir}:/work", "-w", "/work", manifest["image"], "-lc", script]
+    command = ["docker", "run", "--rm", "--gpus", "all", "--shm-size=64G", "--entrypoint", "/bin/bash", "-v", "/mnt/db/reference_files/boltzgen-cache:/cache", "-v", f"{job.run_dir}:/work", "-w", "/work", manifest["image"], "-lc", script]
     rc = _run_shell_steps(job.run_dir, [{"name": "boltzgen", "command": command}])
     if rc == 0 and run_vanilla_pipeline:
         candidates = _normalize_boltzgen_vanilla_candidates(job.run_dir, params, target_artifact)
@@ -1660,16 +2939,199 @@ def run_boltzgen(
     return job.run_dir
 
 
-def run_genie3(num_designs: int = 1, config_name: str = "genie3_pdl1_binder_smoke.yaml") -> Path:
+def run_genie3(
+    target_pdb: Path,
+    target_chains: list[str],
+    binder_length: str,
+    hotspots: str = "",
+    campaign_name: str = "",
+    num_designs: int = 1,
+    seed: int = 7,
+    num_devices: int = 1,
+    direction_scale: float = 0.0,
+    cond_strategy: str = "extended",
+    inverse_folding_num_seq: int = 1,
+    folding_model_name: str = "colabfold",
+    folding_mode: str = "template",
+    folding_num_models: int = 5,
+    folding_num_recycles: int = 20,
+    compile_generation: bool = False,
+    run_mode: str = "full_vanilla_pipeline",
+    enable_beam_search: bool = False,
+    beam_width: int = 4,
+) -> Path:
+    if not target_chains:
+        raise ValueError("At least one target chain is required.")
+    hotspots = normalize_hotspots(hotspots) if hotspots else ""
+    parse_binder_lengths(binder_length)
+    if num_designs < 1:
+        raise ValueError("Design attempts must be at least 1.")
+    if num_devices < 1:
+        raise ValueError("Number of devices must be at least 1.")
+    if inverse_folding_num_seq < 1:
+        raise ValueError("inverse_folding.num_seq must be at least 1.")
+    if cond_strategy not in {"hotspot", "extended", "common", "iter_common", "iter_common_prob"}:
+        raise ValueError("Unknown Genie3 conditioning strategy.")
+    if folding_model_name not in {"colabfold", "boltz2"}:
+        raise ValueError("Genie3 folding model must be colabfold or boltz2.")
+    if folding_mode not in {"template", "msa"}:
+        raise ValueError("Genie3 folding mode must be template or msa.")
+    if folding_model_name == "boltz2" and folding_mode != "msa":
+        raise ValueError("Genie3 Boltz2 binder evaluation requires folding.mode=msa.")
+    if run_mode not in {"generation_only", "full_vanilla_pipeline"}:
+        raise ValueError("Unknown Genie3 run mode.")
     manifest = load_manifest("genie3")
-    params = {"num_designs": num_designs, "config_name": config_name, "contract": "BinderBench PDL1"}
-    job = create_job(DESIGN_GROUP, "design_campaign", "genie3", {"target_pdb": "bundled:04_pdl1"}, params)
-    out_root = job.run_dir / "artifacts" / "raw" / "genie3"
-    out_root.mkdir(parents=True, exist_ok=True)
-    command = ["docker", "run", "--rm", "--gpus", "all", "-v", "/mnt/db/reference_files/genie3/pretrained:/opt/genie3/pretrained:ro", "-v", f"{Path.cwd() / 'smoke_tests'}:/work/config:ro", "-v", f"{out_root}:/work/output", manifest["image"], "genie3", "generate", "-c", f"/work/config/{config_name}", "--num-devices", "1", "--verbose"]
+    params = {
+        "target_chains": target_chains,
+        "binder_length": binder_length,
+        "hotspots": hotspots,
+        "campaign_name": campaign_name.strip(),
+        "num_designs": num_designs,
+        "seed": seed,
+        "num_devices": num_devices,
+        "direction_scale": direction_scale,
+        "cond_strategy": cond_strategy,
+        "inverse_folding_num_seq": inverse_folding_num_seq,
+        "folding_model_name": folding_model_name,
+        "folding_mode": folding_mode,
+        "folding_num_models": folding_num_models,
+        "folding_num_recycles": folding_num_recycles,
+        "compile_generation": compile_generation,
+        "run_mode": run_mode,
+        "enable_beam_search": enable_beam_search,
+        "beam_width": beam_width,
+        "pipeline_mode": "genie3_vanilla_binder",
+    }
+    job = create_job(
+        DESIGN_GROUP,
+        "design_campaign",
+        "genie3",
+        {"target_pdb": str(target_pdb), "target_chains": target_chains},
+        params,
+    )
+    if campaign_name.strip():
+        update_status(job.run_dir, "queued", campaign_name=campaign_name.strip())
+    target_artifact = _copy_target_for_design(job.run_dir, target_pdb, target_chains, "raw/genie3/input")
+    raw_dir = job.run_dir / "artifacts" / "raw" / "genie3"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    boltz_msa_by_source_chain: dict[str, str] = {}
+    if folding_model_name == "boltz2":
+        try:
+            update_status(job.run_dir, "running")
+            boltz_msa_by_source_chain = _ensure_boltz_msas_for_target(job.run_dir, target_artifact, target_chains)
+        except Exception as exc:
+            with (job.run_dir / "stderr.log").open("a") as stderr:
+                stderr.write(f"Boltz2 MSA cache preparation failed: {exc}\n")
+            _finish_design_job(
+                job.run_dir,
+                False,
+                1,
+                [],
+                [
+                    ("raw/genie3/**/*.pdb", "pdb"),
+                    ("raw/genie3/**/*.json", "json"),
+                    ("raw/genie3/**/*.yaml", "yaml"),
+                    ("raw/genie3/**/*.a3m", "a3m"),
+                    ("raw/genie3/**/*.fasta", "fasta"),
+                ],
+            )
+            return job.run_dir
+    dataset_dir, problem_key, problem = _write_genie3_target_files(
+        run_dir=job.run_dir,
+        target_artifact=target_artifact,
+        target_chains=target_chains,
+        binder_length=binder_length,
+        hotspots=hotspots,
+        campaign_name=campaign_name,
+        boltz_msa_by_source_chain=boltz_msa_by_source_chain,
+    )
+    params["problem_key"] = problem_key
+    write_json(job.run_dir / "input.json", {"inputs": {"target_pdb": str(target_pdb), "target_chains": target_chains}, "params": params})
+    config_path = raw_dir / "experiment.yaml"
+    experiment_name = _clean_key(campaign_name or f"genie3_{job.run_dir.name}")
+    _write_genie3_experiment_yaml(
+        config_path,
+        experiment_name=experiment_name,
+        rootdir="/work/artifacts/raw/genie3/output",
+        dataset=f"/work/{_rel_path(job.run_dir, dataset_dir)}",
+        problem_key=problem_key,
+        num_designs=num_designs,
+        seed=seed,
+        num_devices=num_devices,
+        direction_scale=direction_scale,
+        inverse_folding_num_seq=inverse_folding_num_seq,
+        folding_model_name=folding_model_name,
+        folding_mode=folding_mode,
+        folding_num_models=folding_num_models,
+        folding_num_recycles=folding_num_recycles,
+        compile_generation=compile_generation,
+        run_mode=run_mode,
+        cond_strategy=cond_strategy,
+        enable_beam_search=enable_beam_search,
+        beam_width=beam_width,
+    )
+    write_json(raw_dir / "problem.json", problem)
+    if run_mode == "full_vanilla_pipeline":
+        genie3_args = (
+            "genie3 generate -c /work/artifacts/raw/genie3/experiment.yaml "
+            f"--num-devices {num_devices} --verbose && "
+            "genie3 evaluate -c /work/artifacts/raw/genie3/experiment.yaml "
+            f"--num-devices {num_devices} --verbose"
+        )
+        entrypoint_args = ["bash", "-lc", genie3_args]
+    else:
+        entrypoint_args = [
+            "genie3",
+            "generate",
+            "-c",
+            "/work/artifacts/raw/genie3/experiment.yaml",
+            "--num-devices",
+            str(num_devices),
+            "--verbose",
+        ]
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--gpus",
+        "all",
+        "--shm-size=64G",
+        "-v",
+        "/mnt/db/reference_files/genie3/pretrained:/opt/genie3/pretrained:ro",
+        "-v",
+        f"{job.run_dir}:/work",
+        "-v",
+        f"{_ALPHAFOLD_MODELS_DIR}:/alphafold_models:ro",
+        "-v",
+        f"{_BOLTZ_CACHE_DIR}:/cache",
+        "-v",
+        f"{_BOLTZ_MSA_REPOSITORY_DIR}:/msa_repository:ro",
+        "-e",
+        "GENIE3_COLABFOLD_DATA_DIR=/alphafold_models",
+        "-e",
+        "BOLTZ_CACHE=/cache",
+        "-w",
+        "/opt/genie3",
+        manifest["image"],
+        *entrypoint_args,
+    ]
     rc = _run_shell_steps(job.run_dir, [{"name": "genie3", "command": command}])
-    candidates = _generic_candidate_records(job.run_dir, "genie3", "backbone", params, None, ["raw/genie3/**/*.pdb"], ["raw/genie3/**/*.json"]) if rc == 0 else []
-    _finish_design_job(job.run_dir, rc == 0, rc, candidates, [("raw/genie3/**/*.pdb", "pdb"), ("raw/genie3/**/*.json", "json")])
+    candidates = _normalize_genie3_candidates(job.run_dir, params, target_artifact) if rc == 0 else []
+    _finish_design_job(
+        job.run_dir,
+        rc == 0 and bool(candidates),
+        rc,
+        candidates,
+        [
+            ("raw/genie3/**/*.pdb", "pdb"),
+            ("raw/genie3/**/*.cif", "cif"),
+            ("raw/genie3/**/*.csv", "csv"),
+            ("raw/genie3/**/*.json", "json"),
+            ("raw/genie3/**/*.yaml", "yaml"),
+            ("raw/genie3/**/*.a3m", "a3m"),
+            ("raw/genie3/**/*.fasta", "fasta"),
+        ],
+    )
     return job.run_dir
 
 
@@ -1687,6 +3149,7 @@ def run_pxdesign(
     n_max_runs: int = 1,
     use_fast_ln: bool = True,
     use_deepspeed_evo_attention: bool = False,
+    prepare_target_msa: bool = True,
 ) -> Path:
     hotspots = normalize_hotspots(hotspots) if hotspots else ""
     lengths = parse_binder_lengths(binder_length)
@@ -1706,6 +3169,7 @@ def run_pxdesign(
         "n_max_runs": n_max_runs,
         "use_fast_ln": use_fast_ln,
         "use_deepspeed_evo_attention": use_deepspeed_evo_attention,
+        "prepare_target_msa": prepare_target_msa,
     }
     job = create_job(DESIGN_GROUP, "design_campaign", "pxdesign", {"target_pdb": str(target_pdb), "target_chains": target_chains}, params)
     if campaign_name.strip():
@@ -1714,6 +3178,23 @@ def run_pxdesign(
     input_dir = raw_dir / "input"
     input_dir.mkdir(parents=True, exist_ok=True)
     target_artifact = _copy_target_for_design(job.run_dir, target_pdb, target_chains, "raw/pxdesign/input")
+    pxdesign_msa_dirs: dict[str, str] = {}
+    target_msa_error = ""
+    if prepare_target_msa and run_mode != "generation_only":
+        try:
+            pxdesign_msa_dirs = ensure_pxdesign_msa_dirs_for_target(
+                job.run_dir,
+                target_artifact,
+                target_chains,
+                raw_subdir="pxdesign/input/msa",
+                yaml_base_dir=raw_dir,
+            )
+            params["pxdesign_msa_dirs"] = pxdesign_msa_dirs
+        except Exception as exc:
+            target_msa_error = str(exc)
+            params["target_msa_error"] = target_msa_error
+            with (job.run_dir / "stderr.log").open("a") as stderr:
+                stderr.write(f"PXDesign target MSA preparation failed: {type(exc).__name__}: {exc}\n")
     hotspots_by_chain: dict[str, list[int]] = {}
     for token in hotspots.split(",") if hotspots else []:
         if not token:
@@ -1729,13 +3210,17 @@ def run_pxdesign(
     ]
     for chain_id in target_chains or ["A"]:
         chain_hotspots = hotspots_by_chain.get(chain_id, [])
-        if chain_hotspots:
+        chain_msa = pxdesign_msa_dirs.get(chain_id)
+        if chain_hotspots or chain_msa:
             yaml_lines.extend(
                 [
                     f"    {chain_id}:",
-                    f"      hotspots: [{', '.join(str(item) for item in chain_hotspots)}]",
                 ]
             )
+            if chain_hotspots:
+                yaml_lines.append(f"      hotspots: [{', '.join(str(item) for item in chain_hotspots)}]")
+            if chain_msa:
+                yaml_lines.append(f"      msa: {chain_msa}")
         else:
             yaml_lines.append(f"    {chain_id}: all")
     yaml_lines.extend(["", f"binder_length: {px_binder_length}"])
@@ -1811,48 +3296,563 @@ def run_pxdesign(
             ("raw/pxdesign/**/*.csv", "csv"),
             ("raw/pxdesign/**/*.json", "json"),
             ("raw/pxdesign/**/*.yaml", "yaml"),
+            ("raw/pxdesign/**/*.a3m", "a3m"),
             ("raw/pxdesign/**/*.png", "plot"),
         ],
     )
     return job.run_dir
 
 
-def run_protpardelle_1c(num_designs: int = 1, seed: int = 7) -> Path:
+def _write_protpardelle_target_motif(
+    source_pdb: Path,
+    target_chains: list[str],
+    motif_path: Path,
+) -> tuple[dict[str, int], dict[str, str], dict[tuple[str, int], tuple[str, int]]]:
+    """Write a Protpardelle motif PDB with compact chain IDs and 1-based residues."""
+    chain_ids = [chain for chain in target_chains if chain]
+    chain_map = {old_chain: chr(ord("A") + index) for index, old_chain in enumerate(chain_ids)}
+    residue_map: dict[tuple[str, int], tuple[str, int]] = {}
+    next_residue: dict[str, int] = {old_chain: 0 for old_chain in chain_ids}
+    seen_residues: set[tuple[str, str, str]] = set()
+    lengths: dict[str, int] = {}
+    output_lines: list[str] = []
+
+    for line in source_pdb.read_text(errors="ignore").splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        old_chain = line[21].strip() or "_"
+        if old_chain not in chain_map:
+            continue
+        try:
+            old_residue = int(line[22:26])
+        except ValueError:
+            continue
+        residue_key = (old_chain, line[22:26], line[26])
+        if residue_key not in seen_residues:
+            seen_residues.add(residue_key)
+            next_residue[old_chain] += 1
+            residue_map[(old_chain, old_residue)] = (chain_map[old_chain], next_residue[old_chain])
+            lengths[chain_map[old_chain]] = next_residue[old_chain]
+        new_chain, new_residue = residue_map[(old_chain, old_residue)]
+        output_lines.append(f"{line[:21]}{new_chain}{new_residue:4d} {line[27:]}")
+
+    if not output_lines:
+        raise ValueError("Could not write a Protpardelle motif PDB from the selected target chains.")
+    motif_path.parent.mkdir(parents=True, exist_ok=True)
+    motif_path.write_text("\n".join(output_lines) + "\nEND\n")
+    return lengths, chain_map, residue_map
+
+
+def _map_protpardelle_hotspots(hotspots: str, residue_map: dict[tuple[str, int], tuple[str, int]]) -> str:
+    mapped: list[str] = []
+    for token in hotspots.split(",") if hotspots else []:
+        if not token:
+            continue
+        try:
+            chain = token[0]
+            residue = int(token[1:])
+        except ValueError:
+            continue
+        mapped_residue = residue_map.get((chain, residue))
+        if mapped_residue:
+            mapped.append(f"{mapped_residue[0]}{mapped_residue[1]}")
+    return ",".join(mapped)
+
+
+def _write_protpardelle_sampling_yaml(
+    path: Path,
+    motif_name: str,
+    chain_lengths: dict[str, int],
+    binder_length: str,
+    hotspots: str,
+    model_name: str,
+    model_epoch: str,
+    sampling_config: str,
+    step_scale: float,
+    schurn: int,
+    crop_cond_start: float,
+    translation: tuple[float, float, float],
+) -> dict:
+    lengths = parse_binder_lengths(binder_length)
+    binder_range = [lengths[0], lengths[0]] if len(lengths) == 1 else [lengths[0], lengths[1]]
+    target_contig = ";/;".join(f"{chain}1-{length}" for chain, length in chain_lengths.items())
+    target_lengths = [[length, length] for length in chain_lengths.values()]
+    motif_contig = f"{target_contig};/;{binder_range[0]}-{binder_range[1]}"
+    total_lengths = [*target_lengths, binder_range]
+    payload = {
+        "search_space": {
+            "models": [[model_name, model_epoch, sampling_config]],
+            "step_scales": [float(step_scale)],
+            "schurns": [int(schurn)],
+            "crop_cond_starts": [float(crop_cond_start)],
+            "translations": [[float(translation[0]), float(translation[1]), float(translation[2])]],
+        },
+        "motifs": [motif_name],
+        "motif_contigs": [motif_contig],
+        "total_lengths": [total_lengths],
+        "hotspots": [hotspots],
+        "ssadj": [None],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "search_space:",
+                "  models:",
+                f"    - {json.dumps([model_name, model_epoch, sampling_config])}",
+                f"  step_scales: {json.dumps([float(step_scale)])}",
+                f"  schurns: {json.dumps([int(schurn)])}",
+                f"  crop_cond_starts: {json.dumps([float(crop_cond_start)])}",
+                f"  translations: {json.dumps([[float(translation[0]), float(translation[1]), float(translation[2])]])}",
+                "",
+                "motifs:",
+                f"  - {motif_name}",
+                "",
+                "motif_contigs:",
+                f"  - {motif_contig}",
+                "",
+                "total_lengths:",
+                f"  - {json.dumps(total_lengths)}",
+                "",
+                "hotspots:",
+                f'  - "{hotspots}"',
+                "",
+                "ssadj:",
+                "  - null",
+                "",
+            ]
+        )
+    )
+    return payload
+
+
+def _protpardelle_native_pass(metrics: dict) -> bool | None:
+    sample_rmsd = _float_or_none(metrics.get("ca_motif_sample_rmsd"))
+    pred_rmsd = _float_or_none(metrics.get("allatom_motif_pred_rmsd"))
+    scaffold_rmsd = _float_or_none(metrics.get("ca_scaffold_scrmsd"))
+    if sample_rmsd is None or pred_rmsd is None or scaffold_rmsd is None:
+        return None
+    return sample_rmsd < 1.0 and pred_rmsd < 1.0 and scaffold_rmsd < 2.0
+
+
+def _resolve_protpardelle_structure(run_dir: Path, row: dict[str, str]) -> Path | None:
+    save_name = str(row.get("save_name") or "").strip()
+    candidates: list[Path] = []
+    if save_name:
+        save_path = Path(save_name)
+        candidates.append(save_path)
+        if save_path.is_absolute() and str(save_path).startswith("/work/"):
+            candidates.append(run_dir / save_path.relative_to("/work"))
+        if save_path.suffix != ".pdb":
+            candidates.append(save_path.with_suffix(".pdb"))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    output_dir = run_dir / "artifacts" / "raw" / "protpardelle_1c" / "output"
+    for path in sorted(output_dir.glob("**/esmfold/*.pdb")):
+        if save_name and Path(save_name).stem not in path.stem:
+            continue
+        return path
+    for path in sorted(output_dir.glob("**/*.pdb")):
+        if "sample_" in path.name:
+            continue
+        return path
+    return None
+
+
+def _normalize_protpardelle_1c_candidates(run_dir: Path, params: dict, target_artifact: Path) -> list[dict]:
+    output_dir = run_dir / "artifacts" / "raw" / "protpardelle_1c" / "output"
+    metric_paths = sorted(output_dir.glob("**/esm_metrics.csv"))
+    candidates: list[dict] = []
+    seq_counts_by_structure: dict[str, int] = {}
+    for metric_path in metric_paths:
+        for row in _read_csv_rows(metric_path):
+            structure_path = _resolve_protpardelle_structure(run_dir, row)
+            if structure_path is None:
+                continue
+            structure_index = str(row.get("structure_index") or len(candidates) + 1)
+            seq_counts_by_structure[structure_index] = seq_counts_by_structure.get(structure_index, 0) + 1
+            design_number = int(float(structure_index)) + 1 if re.fullmatch(r"\d+(\.0)?", structure_index) else len(seq_counts_by_structure)
+            seq_number = seq_counts_by_structure[structure_index]
+            binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
+                target_artifact,
+                structure_path,
+                params.get("target_chains", []),
+            )
+            sequences = _sequences_by_chain(structure_path)
+            metrics = {key: _numeric_or_text(value) for key, value in row.items() if value not in {"", None}}
+            native_pass = _protpardelle_native_pass(metrics)
+            plddt = metrics.get("plddt")
+            if isinstance(plddt, (int, float)) and plddt <= 1.0:
+                plddt = plddt * 100.0
+            metrics.update(
+                {
+                    "complex_refolding_backend": "protpardelle_1c_esmfold",
+                    "result_kind": "native_pipeline",
+                    "target_chain_inference": chain_inference,
+                    "native_final_rank": len(candidates) + 1,
+                    "native_design_index": design_number,
+                    "native_sequence_index": seq_number,
+                    "native_pass_filters": native_pass,
+                    "pass_filters": native_pass,
+                    "binder_plddt": plddt,
+                    "ipae": metrics.get("pae"),
+                    "binder_rmsd": metrics.get("ca_scaffold_scrmsd"),
+                    "monomer_rmsd": metrics.get("ca_scaffold_scrmsd"),
+                    "protpardelle_success_criteria": "ca_motif_sample_rmsd<1.0; allatom_motif_pred_rmsd<1.0; ca_scaffold_scrmsd<2.0",
+                }
+            )
+            candidates.append(
+                {
+                    "candidate_id": f"protpardelle_1c_{design_number:05d}_mpnn_{seq_number:03d}",
+                    "source_tool": "protpardelle_1c",
+                    "stage": STAGE_COMPLEX_REFOLDING,
+                    "target_pdb": _rel_path(run_dir, target_artifact),
+                    "complex_pdb": _rel_path(run_dir, structure_path),
+                    "binder_pdb": None,
+                    "binder_sequence": "".join(sequences.get(chain, "") for chain in binder_chains) or None,
+                    "target_chains": target_chains,
+                    "binder_chains": binder_chains,
+                    "hotspots": [token for token in params.get("hotspots", "").split(",") if token],
+                    "binder_length": params.get("binder_length"),
+                    "contig": params.get("motif_contig"),
+                    "metrics": metrics,
+                    "raw_metadata": {
+                        "result_kind": "native_pipeline",
+                        "metric_csv": _rel_path(run_dir, metric_path),
+                        "input_target_chains": params.get("target_chains", []),
+                        "target_chain_inference": chain_inference,
+                        "output_kind": "protpardelle_1c_native",
+                    },
+                }
+            )
+    if candidates:
+        def _rank_value(candidate: dict, key: str, default: float, invert: bool = False) -> float:
+            value = (candidate.get("metrics") or {}).get(key)
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                number = default
+            return -number if invert else number
+
+        candidates.sort(
+            key=lambda candidate: (
+                0 if (candidate.get("metrics") or {}).get("native_pass_filters") is True else 1,
+                _rank_value(candidate, "ca_scaffold_scrmsd", float("inf")),
+                _rank_value(candidate, "pae", float("inf")),
+                _rank_value(candidate, "binder_plddt", float("-inf"), invert=True),
+                _rank_value(candidate, "allatom_motif_pred_rmsd", float("inf")),
+            )
+        )
+        for rank, candidate in enumerate(candidates, start=1):
+            metrics = candidate.setdefault("metrics", {})
+            metrics["native_final_rank"] = rank
+    if not candidates:
+        sample_paths = sorted(output_dir.glob("**/sample_*.pdb"))
+        for index, structure_path in enumerate(sample_paths, start=1):
+            binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
+                target_artifact,
+                structure_path,
+                params.get("target_chains", []),
+            )
+            candidates.append(
+                {
+                    "candidate_id": f"protpardelle_1c_{index:05d}",
+                    "source_tool": "protpardelle_1c",
+                    "stage": STAGE_GENERATION_BACKBONE,
+                    "target_pdb": _rel_path(run_dir, target_artifact),
+                    "complex_pdb": _rel_path(run_dir, structure_path),
+                    "binder_pdb": None,
+                    "binder_sequence": None,
+                    "target_chains": target_chains,
+                    "binder_chains": binder_chains,
+                    "hotspots": [token for token in params.get("hotspots", "").split(",") if token],
+                    "binder_length": params.get("binder_length"),
+                    "contig": params.get("motif_contig"),
+                    "metrics": {"result_kind": "generation_only", "target_chain_inference": chain_inference},
+                    "raw_metadata": {"result_kind": "generation_only", "target_chain_inference": chain_inference},
+                }
+            )
+    return write_candidates(run_dir, "protpardelle_1c", candidates)
+
+
+def run_protpardelle_1c(
+    target_pdb: Path,
+    target_chains: list[str],
+    binder_length: str,
+    hotspots: str = "",
+    campaign_name: str = "",
+    num_designs: int = 10,
+    num_mpnn_seqs: int = 10,
+    model_name: str = "cc83",
+    model_epoch: str = "2616",
+    sampling_config: str = "sampling_sidechain_conditional",
+    step_scale: float = 1.2,
+    schurn: int = 200,
+    crop_cond_start: float = 0.0,
+    batch_size: int = 1,
+    seed: int = 7,
+) -> Path:
+    if not target_chains:
+        raise ValueError("At least one target chain is required.")
+    if num_designs < 1:
+        raise ValueError("Design attempts must be at least 1.")
+    if num_mpnn_seqs < 0:
+        raise ValueError("MPNN sequences per design must not be negative.")
+    if batch_size < 1:
+        raise ValueError("Batch size must be at least 1.")
+    hotspots = normalize_hotspots(hotspots) if hotspots else ""
+    parse_binder_lengths(binder_length)
     manifest = load_manifest("protpardelle_1c")
-    params = {"num_designs": num_designs, "seed": seed, "contract": "protpardelle_pdl1_smoke"}
-    job = create_job(DESIGN_GROUP, "design_campaign", "protpardelle_1c", {"target_pdb": "bundled:17_PDL1(AAV)"}, params)
-    out_root = job.run_dir / "artifacts" / "raw" / "protpardelle_1c"
-    out_root.mkdir(parents=True, exist_ok=True)
-    command = ["docker", "run", "--rm", "--gpus", "all", "-v", "/mnt/db/reference_files/protpardelle-1c:/ref/protpardelle-1c:ro", "-v", f"{Path.cwd() / 'smoke_tests'}:/work/config:ro", "-v", f"{out_root}:/work/output", manifest["image"], "python", "-m", "protpardelle.sample", "/work/config/protpardelle_pdl1_smoke.yaml", "--motif-dir", "/opt/protpardelle-1c/examples/motifs/bindcraft", "--num-samples", str(num_designs), "--num-mpnn-seqs", "0", "--batch-size", "1", "--seed", str(seed)]
+    params = {
+        "target_chains": target_chains,
+        "binder_length": binder_length,
+        "hotspots": hotspots,
+        "campaign_name": campaign_name.strip(),
+        "num_designs": num_designs,
+        "num_mpnn_seqs": num_mpnn_seqs,
+        "model_name": model_name,
+        "model_epoch": model_epoch,
+        "sampling_config": sampling_config,
+        "step_scale": step_scale,
+        "schurn": schurn,
+        "crop_cond_start": crop_cond_start,
+        "batch_size": batch_size,
+        "seed": seed,
+        "contract": "protpardelle_1c_native_pipeline",
+    }
+    job = create_job(DESIGN_GROUP, "design_campaign", "protpardelle_1c", {"target_pdb": str(target_pdb), "target_chains": target_chains}, params)
+    if campaign_name.strip():
+        update_status(job.run_dir, "queued", campaign_name=campaign_name.strip())
+    raw_dir = job.run_dir / "artifacts" / "raw" / "protpardelle_1c"
+    input_dir = raw_dir / "input"
+    motif_dir = input_dir / "motifs"
+    output_dir = raw_dir / "output"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    target_artifact = _copy_target_for_design(job.run_dir, target_pdb, target_chains, "raw/protpardelle_1c/input")
+    motif_name = "mn_app_target"
+    chain_lengths, chain_map, residue_map = _write_protpardelle_target_motif(target_artifact, target_chains, motif_dir / f"{motif_name}.pdb")
+    mapped_hotspots = _map_protpardelle_hotspots(hotspots, residue_map)
+    sampling_payload = _write_protpardelle_sampling_yaml(
+        input_dir / "protpardelle_sampling.yaml",
+        motif_name,
+        chain_lengths,
+        binder_length,
+        mapped_hotspots,
+        model_name,
+        model_epoch,
+        sampling_config,
+        step_scale,
+        schurn,
+        crop_cond_start,
+        (0.0, 0.0, 0.0),
+    )
+    params.update(
+        {
+            "protpardelle_chain_map": chain_map,
+            "protpardelle_hotspots": mapped_hotspots,
+            "motif_contig": sampling_payload["motif_contigs"][0],
+            "total_lengths": sampling_payload["total_lengths"][0],
+        }
+    )
+    write_json(input_dir / "protpardelle_sampling_payload.json", sampling_payload)
+    write_json(job.run_dir / "input.json", {"inputs": {"target_pdb": str(target_pdb), "target_chains": target_chains}, "params": params})
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--gpus",
+        "all",
+        "-v",
+        f"{job.run_dir}:/work",
+        "-v",
+        "/mnt/db/reference_files/protpardelle-1c:/ref/protpardelle-1c:ro",
+        "-e",
+        "PROTPARDELLE_OUTPUT_DIR=/work/artifacts/raw/protpardelle_1c/output",
+        "-e",
+        "PROTPARDELLE_MODEL_PARAMS=/ref/protpardelle-1c/model_params",
+        "-e",
+        "ESMFOLD_PATH=/ref/protpardelle-1c/model_params/ESMFold",
+        "-e",
+        "PROTEINMPNN_WEIGHTS=/ref/protpardelle-1c/model_params/ProteinMPNN/vanilla_model_weights",
+        "-e",
+        "LIGANDMPNN_WEIGHTS=/ref/protpardelle-1c/model_params/LigandMPNN",
+        "-e",
+        "FOLDSEEK_BIN=/opt/foldseek/bin/foldseek",
+        "-w",
+        "/work",
+        manifest["image"],
+        "python",
+        "-m",
+        "protpardelle.sample",
+        "/work/artifacts/raw/protpardelle_1c/input/protpardelle_sampling.yaml",
+        "--motif-dir",
+        "/work/artifacts/raw/protpardelle_1c/input/motifs",
+        "--num-samples",
+        str(num_designs),
+        "--num-mpnn-seqs",
+        str(num_mpnn_seqs),
+        "--batch-size",
+        str(batch_size),
+        "--seed",
+        str(seed),
+    ]
     rc = _run_shell_steps(job.run_dir, [{"name": "protpardelle-1c", "command": command}])
-    candidates = _generic_candidate_records(job.run_dir, "protpardelle_1c", "backbone", params, None, ["raw/protpardelle_1c/**/*.pdb"], ["raw/protpardelle_1c/**/*.csv"]) if rc == 0 else []
-    _finish_design_job(job.run_dir, rc == 0, rc, candidates, [("raw/protpardelle_1c/**/*.pdb", "pdb"), ("raw/protpardelle_1c/**/*.csv", "csv")])
+    candidates = _normalize_protpardelle_1c_candidates(job.run_dir, params, target_artifact) if rc == 0 else []
+    _finish_design_job(
+        job.run_dir,
+        rc == 0 and bool(candidates),
+        rc,
+        candidates,
+        [
+            ("raw/protpardelle_1c/**/*.pdb", "pdb"),
+            ("raw/protpardelle_1c/**/*.csv", "csv"),
+            ("raw/protpardelle_1c/**/*.yaml", "yaml"),
+            ("raw/protpardelle_1c/**/*.json", "json"),
+            ("raw/protpardelle_1c/**/*.html", "report"),
+        ],
+    )
     return job.run_dir
 
 
-def run_proteina_complexa(run_name: str, n_steps: int = 20, replicas: int = 2) -> Path:
+def run_proteina_complexa(
+    target_pdb: Path,
+    target_chains: list[str],
+    binder_length: str,
+    hotspots: str = "",
+    campaign_name: str = "",
+    num_designs: int = 1,
+    n_steps: int = 400,
+    replicas: int = 2,
+    seed: int = 5,
+    batch_size: int = 1,
+) -> Path:
+    if not target_chains:
+        raise ValueError("At least one target chain is required.")
+    hotspots = normalize_hotspots(hotspots) if hotspots else ""
+    lengths = parse_binder_lengths(binder_length)
+    if len(lengths) == 1:
+        length_range = [lengths[0], lengths[0]]
+    else:
+        length_range = [lengths[0], lengths[1]]
+    if num_designs < 1:
+        raise ValueError("Design attempts must be at least 1.")
+    if n_steps < 1:
+        raise ValueError("Generation steps must be at least 1.")
+    if replicas < 1:
+        raise ValueError("Best-of-N replicas must be at least 1.")
+    if batch_size < 1:
+        raise ValueError("Batch size must be at least 1.")
+
     manifest = load_manifest("proteina_complexa")
-    params = {"run_name": run_name, "n_steps": n_steps, "replicas": replicas, "contract": "search_binder_local_pipeline PDL1"}
-    job = create_job(DESIGN_GROUP, "design_campaign", "proteina_complexa", {"target_pdb": "bundled:02_PDL1"}, params)
+    run_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", campaign_name.strip()).strip("_") or "mn_app_complexa"
+    params = {
+        "target_chains": target_chains,
+        "binder_length": binder_length,
+        "hotspots": hotspots,
+        "campaign_name": campaign_name.strip(),
+        "run_name": run_name,
+        "num_designs": num_designs,
+        "n_steps": n_steps,
+        "replicas": replicas,
+        "seed": seed,
+        "batch_size": batch_size,
+        "contract": "search_binder_local_pipeline",
+    }
+    job = create_job(DESIGN_GROUP, "design_campaign", "proteina_complexa", {"target_pdb": str(target_pdb), "target_chains": target_chains}, params)
+    if campaign_name.strip():
+        update_status(job.run_dir, "queued", campaign_name=campaign_name.strip())
     out_root = job.run_dir / "artifacts" / "raw" / "proteina_complexa"
+    out_root.mkdir(parents=True, exist_ok=True)
+    target_artifact = _copy_target_for_design(job.run_dir, target_pdb, target_chains, "raw/proteina_complexa/input")
+    target_input = _target_input_spec(target_artifact, target_chains)
+    if not target_input:
+        raise ValueError("Could not derive a Proteina-Complexa target_input from selected chains.")
+    params["target_input"] = target_input
+    write_json(out_root / "input" / "target_config.json", {"target_input": target_input, **params})
+
     tool = Path.cwd() / "tools_to_implement" / "Proteina-Complexa"
-    common_env = "export COMPLEXA_INIT=1 DATA_PATH=/workspace/protein-foundation-models/assets CKPT_PATH=/workspace/protein-foundation-models/ckpts AF2_DIR=/ref/af2 RF3_CKPT_PATH=/workspace/protein-foundation-models/community_models/ckpts/RF3/rf3_foundry_01_24_latest_remapped.ckpt RF3_EXEC_PATH=/workspace/.venv/bin/rf3 FOLDSEEK_EXEC=/workspace/.venv/bin/foldseek MMSEQS_EXEC=/workspace/.venv/bin/mmseqs SC_EXEC=/usr/local/bin/sc DSSP_EXEC=/usr/local/bin/dssp"
-    common_args = f"configs/search_binder_local_pipeline.yaml ++run_name={run_name} ++generation.task_name=02_PDL1 ++generation.dataloader.dataset.nres.nsamples=1 ++generation.search.best_of_n.replicas={replicas} ++generation.args.nsteps={n_steps} ++ckpt_path=/workspace/protein-foundation-models/ckpts ++ckpt_name=complexa.ckpt ++autoencoder_ckpt_path=/workspace/protein-foundation-models/ckpts/complexa_ae.ckpt"
-    steps = []
-    for stage in ["generate", "filter", "evaluate", "analyze"]:
-        steps.append(
-            {
-                "name": f"proteina-complexa-{stage}",
-                "command": ["docker", "run", "--rm", "--gpus", "all", "-v", f"{tool}:/workspace/protein-foundation-models", "-v", "/mnt/db/reference_files/proteina-complexa/ckpts:/workspace/protein-foundation-models/ckpts:ro", "-v", "/mnt/db/reference_files/proteina-complexa/hf-cache:/workspace/shared-community/hf-cache", "-v", "/mnt/db/reference_files/alphafold_models:/ref/af2:ro", manifest["image"], "bash", "-lc", f"{common_env}; complexa {stage} {common_args}"],
-            }
-        )
+    task_name = "MN_APP_TARGET"
+    hotspots_arg = "[" + ",".join(hotspots.split(",")) + "]" if hotspots else "[]"
+    overrides = [
+        f"++run_name={run_name}",
+        f"++seed={int(seed)}",
+        f"++generation.task_name={task_name}",
+        f"++generation.target_dict_cfg.{task_name}.source=mn_app",
+        f"++generation.target_dict_cfg.{task_name}.target_filename=target",
+        "++generation.target_dict_cfg.MN_APP_TARGET.target_path=/work/artifacts/raw/proteina_complexa/input/target.pdb",
+        f"++generation.target_dict_cfg.{task_name}.target_input={target_input}",
+        f"++generation.target_dict_cfg.{task_name}.hotspot_residues={hotspots_arg}",
+        f"++generation.target_dict_cfg.{task_name}.binder_length=[{length_range[0]},{length_range[1]}]",
+        f"++generation.target_dict_cfg.{task_name}.pdb_id=null",
+        f"++generation.dataloader.dataset.nres.nsamples={int(num_designs)}",
+        f"++generation.dataloader.batch_size={int(batch_size)}",
+        f"++generation.search.max_batch_size={int(batch_size)}",
+        f"++generation.search.best_of_n.replicas={int(replicas)}",
+        f"++generation.args.nsteps={int(n_steps)}",
+        "++ckpt_path=/workspace/protein-foundation-models/ckpts",
+        "++ckpt_name=complexa.ckpt",
+        "++autoencoder_ckpt_path=/workspace/protein-foundation-models/ckpts/complexa_ae.ckpt",
+        "++gen_njobs=1",
+        "++eval_njobs=1",
+    ]
+    override_text = " ".join(shlex.quote(item) for item in overrides)
+    script = (
+        "set -euxo pipefail; "
+        "cd /work/artifacts/raw/proteina_complexa; "
+        "export COMPLEXA_INIT=1 "
+        "DATA_PATH=/workspace/protein-foundation-models/assets "
+        "CKPT_PATH=/workspace/protein-foundation-models/ckpts "
+        "AF2_DIR=/ref/af2 "
+        "RF3_CKPT_PATH=/workspace/protein-foundation-models/community_models/ckpts/RF3/rf3_foundry_01_24_latest_remapped.ckpt "
+        "RF3_EXEC_PATH=/workspace/.venv/bin/rf3 "
+        "FOLDSEEK_EXEC=/workspace/.venv/bin/foldseek "
+        "MMSEQS_EXEC=/workspace/.venv/bin/mmseqs "
+        "SC_EXEC=/usr/local/bin/sc "
+        "DSSP_EXEC=/usr/local/bin/dssp "
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; "
+        f"complexa design /workspace/protein-foundation-models/configs/search_binder_local_pipeline.yaml {override_text}; "
+        'test -n "$(find evaluation_results -type f -name \"RAW_protein_binder_results_search_binder_local_pipeline_combined.csv\" -print -quit)"'
+    )
+    steps = [
+        {
+            "name": "proteina-complexa-design",
+            "command": [
+                "docker",
+                "run",
+                "--rm",
+                "--gpus",
+                "all",
+                "-v",
+                f"{job.run_dir}:/work",
+                "-v",
+                f"{tool}:/workspace/protein-foundation-models",
+                "-v",
+                "/mnt/db/reference_files/proteina-complexa/ckpts:/workspace/protein-foundation-models/ckpts:ro",
+                "-v",
+                "/mnt/db/reference_files/proteina-complexa/hf-cache:/workspace/shared-community/hf-cache",
+                "-v",
+                "/mnt/db/reference_files/alphafold_models:/ref/af2:ro",
+                manifest["image"],
+                "bash",
+                "-lc",
+                script,
+            ],
+        }
+    ]
     rc = _run_shell_steps(job.run_dir, steps)
-    if rc == 0:
-        out_root.mkdir(parents=True, exist_ok=True)
-        for dirname in ["inference", "evaluation_results", "logs"]:
-            src = tool / dirname
-            if src.exists():
-                shutil.copytree(src, out_root / dirname, dirs_exist_ok=True)
-    candidates = _generic_candidate_records(job.run_dir, "proteina_complexa", "backbone+validation", params, None, ["raw/proteina_complexa/**/*.pdb"], ["raw/proteina_complexa/**/*.csv"]) if rc == 0 else []
-    _finish_design_job(job.run_dir, rc == 0, rc, candidates, [("raw/proteina_complexa/**/*.pdb", "pdb"), ("raw/proteina_complexa/**/*.csv", "csv"), ("raw/proteina_complexa/**/*.json", "json"), ("raw/proteina_complexa/**/*.log", "log")])
+    candidates = _normalize_proteina_complexa_candidates(job.run_dir, params, target_artifact) if rc == 0 else []
+    _finish_design_job(
+        job.run_dir,
+        rc == 0 and bool(candidates),
+        rc,
+        candidates,
+        [
+            ("raw/proteina_complexa/**/*.pdb", "pdb"),
+            ("raw/proteina_complexa/**/*.csv", "csv"),
+            ("raw/proteina_complexa/**/*.json", "json"),
+            ("raw/proteina_complexa/**/*.yaml", "yaml"),
+            ("raw/proteina_complexa/**/*.log", "log"),
+        ],
+    )
     return job.run_dir

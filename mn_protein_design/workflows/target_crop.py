@@ -7,6 +7,7 @@ from mn_protein_design.core.artifacts import Artifact, artifact_path
 from mn_protein_design.core.jobs import collect_jobs, create_job, finish_job, read_json, update_status, write_json
 from mn_protein_design.core.residue_selection import parse_selection
 from mn_protein_design.core.structures import filter_pdb_to_residues, pdb_summary, residues_within_spheres
+from mn_protein_design.workflows.target_msa import ensure_boltz_msas_for_target
 
 
 TASK_GROUP = "target-crop"
@@ -42,6 +43,7 @@ def run_target_crop(
     sphere_diameter_angstrom: float = 12.0,
     remove_waters: bool = True,
     remove_hetero: bool = False,
+    prepare_msa: bool = True,
 ) -> Path:
     target_pdb = target_pdb.expanduser().resolve()
     if not target_pdb.exists():
@@ -72,6 +74,7 @@ def run_target_crop(
             "sphere_diameter_angstrom": sphere_diameter_angstrom,
             "remove_waters": remove_waters,
             "remove_hetero": remove_hetero,
+            "prepare_msa": prepare_msa,
         },
     )
     update_status(job.run_dir, "running")
@@ -106,6 +109,21 @@ def run_target_crop(
             "selected_residues": selected_rows,
             "artifacts": {"target_cropped": "artifacts/target_cropped.pdb"},
         }
+        msa_by_chain = {}
+        msa_error = ""
+        if prepare_msa:
+            try:
+                msa_by_chain = ensure_boltz_msas_for_target(
+                    job.run_dir,
+                    cropped_pdb,
+                    None,
+                    raw_subdir="target_msa",
+                )
+                crop_payload["boltz_msa_by_chain"] = msa_by_chain
+            except Exception as exc:
+                msa_error = str(exc)
+                with (job.run_dir / "stderr.log").open("a") as stderr:
+                    stderr.write(f"Target MSA preparation failed: {type(exc).__name__}: {exc}\n")
         write_json(crop_json, crop_payload)
         artifacts = [
             Artifact("crop_input", input_pdb, "pdb", "Prepared target used for cropping").to_json(job.run_dir),
@@ -125,9 +143,12 @@ def run_target_crop(
                     "selected_residue_count": len(selected_residues),
                     "cropped_chains": len(summary["chains"]),
                 },
+                "target_msa_by_chain": msa_by_chain,
+                "target_msa_error": msa_error,
                 "downstream_artifacts": {
                     "target_cropped_pdb": "artifacts/target_cropped.pdb",
                     "crop_json": "artifacts/crop.json",
+                    "target_msa_by_chain": msa_by_chain,
                 },
             },
         )

@@ -48,8 +48,27 @@ services:
       dockerfile: containers/protpardelle-1c/Dockerfile
       platforms: ["linux/x86_64"]
 
+  biohub-esm:
+    image: mnprot-biohub-esm-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/biohub-esm/Dockerfile
+      platforms: ["linux/x86_64"]
+    volumes:
+      - biohub-esm-hf-cache:/cache/huggingface
+
+  colabfold:
+    image: mnprot-colabfold-cuda12:1.6.1
+    build:
+      context: .
+      dockerfile: containers/colabfold/Dockerfile
+      platforms: ["linux/x86_64"]
+
   ligandmpnn:
     image: ovo-ligandmpnn:latest
 
   foundry-cu128:
     image: ovoex-foundry-cu128:latest
+
+volumes:
+  biohub-esm-hf-cache:

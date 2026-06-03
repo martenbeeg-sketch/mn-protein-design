@@ -17,6 +17,7 @@ STAGE_SEQUENCE_DESIGN = "sequence_design"
 STAGE_MONOMER_REFOLDING = "monomer_refolding"
 STAGE_COMPLEX_REFOLDING = "complex_refolding"
 STAGE_ANALYSIS = "analysis"
+STAGE_BENCHMARK = "benchmark"
 
 LEGACY_STAGE_MAP = {
     "backbone": STAGE_GENERATION_BACKBONE,

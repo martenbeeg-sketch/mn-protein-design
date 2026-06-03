@@ -1,6 +1,6 @@
 # mn-protein-design App Build Plan
 
-`mn-protein-design` should be a small Docker-orchestrated Streamlit workbench, closer in spirit to `mn-ligand` than to OVO. OVO is useful for understanding typed pipelines and downstream artifact compatibility, but v1 should avoid its heavier database, plugin, and Nextflow architecture.
+`mn-protein-design` is a small Docker-orchestrated Streamlit workbench for local protein binder design. The app should stay closer to `mn-ligand` than to the heavier OVO architecture: task pages, file-backed jobs, strict artifacts, and clear result pages. OVO remains useful as a reference for working pipelines and refolding behavior, but the app should be self-contained and should not call OVO directly.
 
 The core object model is:
 
@@ -15,40 +15,100 @@ Project
           Logs
 ```
 
-A **task** is the user-facing action: prepare a target, detect a PPI interface, predict hotspots, define a design region, design binders, refold candidates, analyze results, or triage candidates. A **job** is one submitted run with frozen inputs, parameters, Docker image, status, logs, outputs, and provenance. A **pipeline** is a job composed of multiple tool runs with typed handoff artifacts.
+A **task** is a user-facing action such as target preparation, hotspot detection, design, sequence design, refolding, or analysis. A **job** is one frozen run with inputs, parameters, Docker image, status, logs, result files, and provenance. A **tool run** is the raw execution of one backend. A **candidate set** is the normalized handoff between tools.
 
-For binder design, the main v1 abstraction should be a **design campaign**: a parent design job that can run one or more backend tools, normalize their outputs, and optionally apply common downstream sequence design, refolding, filtering, and ranking.
+The current design philosophy is:
 
-## Task Groups
+```text
+Vanilla tool pipeline first
+  Preserve each tool's intended workflow, defaults, native metrics, and native result tables.
+
+Normalize outputs second
+  Convert native outputs into candidates.jsonl with target/binder chain roles, structures, sequences, and metrics.
+
+Common validation only when useful
+  Run app-level monomer refolding, complex refolding, IPSAE/iPAE scoring, and ranking only when it adds information or when the user explicitly sends a native result set through Refolding / Validation.
+```
+
+Do not hide native tool behavior behind a single generic wizard. Each design backend gets its own tab on the Design task page, with shared target/hotspot inputs at the top and tool-specific settings inside the tab.
+
+## Runtime Contract
+
+Every job writes to the file-backed run store:
+
+```text
+mn-protein-design-workdir/workdir/runs/<task-group>/<run_id>/
+  input.json
+  metadata.json
+  command.json
+  stdout.log
+  stderr.log
+  result.json
+  artifacts/
+```
+
+`metadata.json` must carry enough provenance for downstream filtering and deletion:
+
+```json
+{
+  "job_code": "A1B2C",
+  "task_group": "design",
+  "job_type": "design_campaign",
+  "tool": "genie3",
+  "status": "completed",
+  "campaign_name": "PDL1 Genie3 Boltz2 vanilla 1 design",
+  "upstream_task_group": "target-prep",
+  "upstream_run_id": "20260519-101544-47e30b79",
+  "upstream_job_code": "8D2B8"
+}
+```
+
+`result.json` should use a stable shape:
+
+```json
+{
+  "success": true,
+  "job_type": "design_campaign",
+  "tool": "boltzgen",
+  "inputs": {},
+  "outputs": {
+    "candidates_jsonl": "artifacts/normalized_candidates/candidates.jsonl"
+  },
+  "metrics": {},
+  "downstream_artifacts": {}
+}
+```
+
+## Task Pages
 
 ### Target Preparation
 
 Purpose:
 
-* upload or download PDB/mmCIF files
-* select chains
-* remove ligands, waters, alternate locations, or unwanted residues
-* trim/crop around chains, residue ranges, interfaces, or hotspot regions
-* normalize chain IDs, residue numbering, insertion codes, and residue selections
-* preserve a mapping between viewer sequence indices and true PDB residue numbering
+* upload or download PDB/mmCIF structures
+* select target chains
+* trim each selected chain independently
+* detect non-standard residues and optionally repair them
+* optionally run PDBFixer for non-canonical residue replacement and missing atom cleanup
+* preserve true PDB numbering, insertion codes, chain IDs, and viewer index mappings
 
 Outputs:
 
 ```text
-target_clean.pdb
 target_trimmed.pdb
 target.json
 residue_numbering_map.json
+noncanonical_residues.json
 viewer_state.json
 ```
 
-### PPI / Binding Site Detection
+### PPI / Hotspot Detection
 
 Purpose:
 
-* ScanNet residue-level PPI/interface probabilities
-* Surf2Spot hotspot or nanobody epitope predictions
-* MaSIF target surface generation or patch search when the container contract is stable
+* ScanNet residue-level PPI/interface prediction
+* Surf2Spot hotspot prediction
+* MaSIF-seed surface/patch workflow when the local image contract is stable
 
 Outputs:
 
@@ -59,308 +119,281 @@ hotspot_clusters.json
 viewer_state.json
 ```
 
-### Hotspot / Design Region Definition
+### Target Cropping
 
-Purpose:
+Cropping is separate from target preparation. Preparation trims selected chains; cropping happens after PPI/hotspot detection and can combine:
 
-* manual residue picking in Mol* or py3Dmol
-* import hotspot residues from ScanNet, Surf2Spot, or MaSIF
-* cluster and rank candidate patches
-* create design-region hints for downstream tools
-* define avoid residues, preferred contact residues, and optional fixed interface residues
-* export tool-neutral hotspot and contig-hint files
+* manual residue ranges
+* Mol* residue picks from sequence or structure
+* sphere expansion around selected residues
+* plane/slice selection when implemented
 
 Outputs:
 
 ```text
-hotspots.json
-selected_patch.json
-contig_hint.json
-interface_constraints.json
+target_cropped.pdb
+crop_selection.json
+residue_numbering_map.json
 viewer_state.json
 ```
 
-### Backbone / Binder Design
+### Design
 
-Purpose:
+The Design page is the home for generator-specific vanilla workflows. Shared controls include:
 
-* generate binder backbones or complexes against a prepared target and design region
-* support both single-tool design runs and multi-tool design campaigns
-* support native tool pipelines as well as synchronized benchmarking pipelines
-* normalize raw tool outputs into a shared candidate artifact format
-* support lightweight design-only runs first, then fuller sequence/refold pipelines
+* prepared target or cropped target
+* hotspot selection from Mol*
+* binder length or range
+* design attempt count
+* campaign name
 
-Initial tools:
+Each tool tab owns its native parameters and payload preview. The user should be able to inspect what files and settings are sent to the algorithm.
+
+Current tabs:
 
 * RFdiffusion classic
 * RFdiffusion3 / Foundry
-* BindCraft / FreeBindCraft
+* BindCraft
 * BoltzGen
-* Genie3
-* Proteina-Complexa
 * PXDesign
+* Genie3
 * Protpardelle-1c
+* Proteina-Complexa
+
+The app should not force all tools into the same pipeline shape. Native end-to-end tools keep their own native analysis. Generator-only tools feed the common downstream modules.
+
+### Sequence Design
+
+Purpose:
+
+* run ProteinMPNN, LigandMPNN, Foundry MPNN, or tool-specific sequence redesign
+* rename sequences per backbone as `<backbone_id>_mpnn_001`, `<backbone_id>_mpnn_002`, etc.
+* produce normalized sequence-designed candidates
 
 Outputs:
 
 ```text
-designed_complexes/
-binder_only/
-sequences.fasta
-raw_model_metadata.json
-normalized_candidates/
-candidates.jsonl
-campaign_result.json
-```
-
-### Design Campaigns
-
-Purpose:
-
-A **design campaign** is a parent design job that can run several binder-design tools against the same target, hotspot set, binder-length constraints, and common downstream validation settings. It allows the app to answer two different questions:
-
-```text
-How well does each tool perform as originally intended?
-How well do different generators perform under the same downstream evaluation pipeline?
-```
-
-Supported campaign modes:
-
-```text
-Native mode
-  Run each tool close to its original pipeline and preserve native outputs/metrics.
-
-Synchronized benchmark mode
-  Run tools to comparable checkpoints, normalize outputs, then apply common
-  ProteinMPNN, refolding, filtering, and ranking.
-
-Hybrid mode
-  Keep native tool outputs, but also send normalized candidates through the common
-  downstream validation and optional redesign pipeline.
-```
-
-Common design parameters:
-
-```text
-target_pdb
-target_chains
-hotspots
-avoid_residues
-binder_length_min
-binder_length_max
-num_backbones_or_candidates
-num_sequences_per_backbone
-random_seed
-use_soluble_mpnn
-run_monomer_validation
-run_complex_validation
-run_minimization_or_relaxation
-run_interface_fixed_redesign
-common_filter_preset
-```
-
-Tool-specific parameters remain available in per-tool tabs, but all selected tools should emit normalized candidates whenever possible.
-
-Campaign outputs:
-
-```text
-campaign_config.json
-tool_runs/
-raw_candidates/
-normalized_candidates/
-sequence_design/
-refolding/
-analysis/
-ranked_designs.csv
-campaign_result.json
-```
-
-### Sequence Design / Refinement
-
-Purpose:
-
-* ProteinMPNN or LigandMPNN when not embedded in the design backend
-* optional soluble ProteinMPNN redesign for all candidates, including tools that already produced a sequence
-* interface-aware redesign where contacting residues can be fixed and the rest redesigned
-* side-chain reconstruction, relaxation, clash cleanup, and optional scoring
-* keep PyRosetta-dependent analysis optional so the app can run with lighter open tooling first
-
-Outputs:
-
-```text
-redesigned_sequences.fasta
 redesigned_candidates.jsonl
-relaxed_structures/
+redesigned_sequences.fasta
 sequence_design_scores.csv
-fixed_positions.json
 ```
 
-### Refolding / Structure Prediction Validation
+### Refolding / Validation
 
 Purpose:
 
-* independently repredict designed sequences and complexes after sequence design
-* run AF2 initial-guess refolding, following the OVO `AlphaFoldInitialGuess` pattern
-* run Boltz2 initial-guess refolding, following the newer OVO Boltz refolding workflow
-* compare the refolded structure to the design model, target, motif, hotspot residues, and binder pose
-* produce confidence metrics that downstream analysis can rank and filter
-
-Inputs:
-
-```text
-target_clean.pdb
-designed_complex.pdb
-redesigned_sequences.fasta
-hotspots.json
-candidates.jsonl
-```
+* always run monomer refolding before complex refolding when the user starts validation from this page
+* use Boltz2 monomer refolding by default where available
+* use AF2 initial guess as the default complex refolding mode
+* make Boltz2 target-template complex refolding selectable
+* use target-template behavior: the target template is the target protein only, not the accepted binder pose
+* write normalized prediction artifacts and full PAE matrices when available so app-level IPSAE/iPAE scoring is possible
 
 Outputs:
 
 ```text
-af2_refolded/
-boltz2_refolded/
-refolding_metrics.csv
-refolding_result.json
+monomer_refolding/
+complex_refolding/
 validated_candidates.jsonl
+refolding_metrics.csv
 ```
 
 Key metrics:
 
-* AF2 pLDDT, pTM/ipTM, PAE, interface PAE
-* AF2 target-aligned binder RMSD and binder/monomer RMSD
-* Boltz2 pLDDT, PDE/ipDE-style confidence metrics where available
-* Boltz2 design RMSD, binder RMSD, motif RMSD, target-aligned binder RMSD
-* hotspot contact recovery and interface contact preservation
-* optional iPAE/iPSAE-style interface-confidence metrics when available
+* monomer RMSD against the designed backbone
+* target-aligned binder pose RMSD for complex refolding
+* pLDDT, pTM/ipTM, PAE/iPAE
+* Boltz2 confidence/PDE-style metrics where available
+* hotspot contact recovery
+* IPSAE-derived scores when PAE matrices are available
 
-### Analysis / Filtering
+### Analysis
 
-Purpose:
-
-* interface metrics
-* pLDDT, PAE, ipTM-like, PDE, and ipDE-like metrics where available
-* iPAE/iPSAE-style interface scoring where available
-* shape complementarity, buried SASA, contacts, hotspot contacts
-* clash and minimization checks
-* monomer-vs-design agreement
-* diversity clustering
-* final ranked design table
-* compare pass rates across tools and campaign modes
-
-Outputs:
+The Analysis page must distinguish two result types:
 
 ```text
-metrics.csv
-ranked_designs.csv
-tool_summary.csv
-selected_design_bundle/
-analysis_result.json
+Native Pipeline Results
+  Tool-specific tables and viewers from the vanilla workflow.
+  Examples: BindCraft accepted designs, BoltzGen all_designs_metrics.csv,
+  PXDesign native summary, Proteina-Complexa native binder CSV, Genie3 native results.
+
+App Re-analysis Results
+  Common app ranking after Refolding / Validation has produced normalized
+  complex predictions and PAE matrices.
 ```
 
-## Tool Matrix
+Native end-to-end tools should show their native table and native Mol* viewer, then stop. The app re-analysis section should not appear for native runs unless the user has explicitly selected a refolding/validation candidate set. This avoids mixing native tool scores with app-level refolding scores.
 
-| Group                  | Tool                                            | Role                                                 | v1 Status                              |
-| ---------------------- | ----------------------------------------------- | ---------------------------------------------------- | -------------------------------------- |
-| Target preparation     | internal Python / BioPython / PDBFixer          | clean, crop, trim, validate, residue-number mapping  | Implement first                        |
-| PPI detection          | ScanNet                                         | residue-level PPI / epitope / IDP binding prediction | Container smoke passed                 |
-| Hotspot detection      | Surf2Spot                                       | PPI hotspot and nanobody epitope clusters            | Container smoke passed                 |
-| Surface matching       | MaSIF-seed                                      | surface patch / seed search                          | Later, after contract stabilization    |
-| Binder design          | RFdiffusion classic                             | established binder/scaffold generation               | Smoke passed using OVO image           |
-| Binder design          | RFdiffusion3 / Foundry                          | modern RFdiffusion backend                           | Smoke passed using Foundry image       |
-| Binder design          | BindCraft / FreeBindCraft                       | fuller binder workflow baseline                      | BindCraft smoke passed using OVO image |
-| Binder design          | BoltzGen                                        | design-only and inverse-folding/filtering workflow   | PDL1 design-only smoke passed          |
-| Binder design          | PXDesign                                        | target parsing and backbone design                   | Container smoke passed                 |
-| Binder design          | Protpardelle-1c                                 | motif-conditioned binder backbone design             | Container smoke passed                 |
-| Binder design          | Proteina-Complexa                               | advanced binder generation backend                   | PDL1 smoke recreated                   |
-| Binder design          | Genie3                                          | generative backbone backend                          | Container smoke passed                 |
-| Sequence design        | ProteinMPNN / soluble ProteinMPNN               | common sequence-design and redesign backend          | Add after first design adapter         |
-| Refolding / validation | AF2 initial guess                               | independent refolding and confidence metrics         | Borrow contract from OVO               |
-| Refolding / validation | Boltz2 initial guess                            | modern structure prediction/refolding validation     | Borrow contract from OVO               |
-| Analysis               | IPSAE, Rosetta-style metrics, interface metrics | ranking and filtering                                | Add after design contracts             |
+App re-analysis should show:
 
-The strongest implementation rule is to make artifact contracts boring and strict before adding too many tools. Protein design tools all have their own worldview, so the app should normalize them into a small shared vocabulary: target, chains, residues, hotspot set, design region, candidate structure, sequence, metrics, rank.
+* live filters above the table
+* ranked candidate table
+* structure viewer with target and designed/predicted binder overlays
+* plots for useful numeric metrics
 
 ## Normalized Candidate Contract
 
-Every binder-design backend should be normalized into a shared candidate representation. Some tools produce only backbones, some produce sequences, some produce complexes, and some produce native metrics. The app should not force them to behave identically at generation time; instead, it should normalize their outputs before common downstream stages.
+Every backend should emit `artifacts/normalized_candidates/candidates.jsonl`.
 
-Each campaign should write:
-
-```text
-normalized_candidates/
-  candidates.jsonl
-  candidate_000001/
-    design_model.pdb
-    complex.pdb
-    binder_only.pdb
-    sequence.fasta
-    metadata.json
-```
-
-Candidate JSON shape:
+Candidate shape:
 
 ```json
 {
-  "candidate_id": "rfdiffusion_classic_000001",
-  "campaign_id": "design_2026_05_20_001",
+  "candidate_id": "rfdiffusion_classic_00001_protein_mpnn_001",
   "source_tool": "rfdiffusion_classic",
-  "source_mode": "synchronized",
-  "stage": "normalized",
-  "parent_candidate_id": null,
-
-  "target_pdb": "artifacts/target.pdb",
-  "design_model_pdb": "normalized_candidates/candidate_000001/design_model.pdb",
-  "complex_pdb": "normalized_candidates/candidate_000001/complex.pdb",
-  "binder_pdb": "normalized_candidates/candidate_000001/binder_only.pdb",
-  "sequence_fasta": "normalized_candidates/candidate_000001/sequence.fasta",
-
+  "result_kind": "normalized",
+  "stage": "complex_refolding",
+  "parent_candidate_id": "rfdiffusion_classic_00001",
   "target_chains": ["A"],
-  "binder_chain": "B",
-  "hotspots": ["A:150", "A:154", "A:188"],
-  "binder_length": 85,
-
-  "has_backbone": true,
-  "has_sequence": false,
-  "has_complex": true,
-
-  "metrics": {},
-  "metadata": {}
+  "binder_chains": ["B"],
+  "target_pdb": "artifacts/target.pdb",
+  "design_model_pdb": "artifacts/raw/rfdiffusion/output/design_00001.pdb",
+  "complex_pdb": "artifacts/raw/af2_initial_guess/output/design_00001_af2ig.pdb",
+  "binder_sequence": "MSEQUENCE...",
+  "hotspots": ["A54", "A56", "A58"],
+  "metrics": {
+    "binder_plddt": 88.2,
+    "iptm": 0.76,
+    "ipae": 5.8,
+    "ipsae": 0.42,
+    "monomer_rmsd": 1.2,
+    "binder_rmsd": 2.4
+  },
+  "raw_metadata": {}
 }
 ```
 
-Common downstream stages should consume `candidates.jsonl` instead of tool-specific folders.
+Important chain rule:
 
-## Tool Capabilities
+* never assume chain `A` is always binder or target
+* infer target chains from the selected prepared/cropped target
+* infer binder chains as the non-target chains in generated complexes
+* carry `target_chains` and `binder_chains` through every downstream job
 
-Each binder-design manifest should declare capabilities so that the campaign engine can decide which downstream stages are needed.
+## Current Tool Status
 
-Example capability fields:
+| Group | Tool | Role | Current status | Implementation philosophy |
+| --- | --- | --- | --- | --- |
+| Target prep | internal Python / BioPython / PDBFixer | trim, repair, non-canonical residue handling | Implemented scaffold and active workflow | Keep target chain/numbering mapping canonical |
+| PPI detection | ScanNet | PPI/interface scoring | Implemented | Native Docker result plus normalized artifacts |
+| Hotspot detection | Surf2Spot | hotspot prediction | Implemented | Requires cleaned structures; repair non-canonical residues before use |
+| Surface matching | MaSIF-seed | surface patch/seed search | Partly wired; image is `masif_seed:latest` | Keep as detection/hotspot support, not design |
+| Design | RFdiffusion classic | backbone generator | Implemented with full vanilla-style downstream app pipeline | Generator -> MPNN -> monomer -> AF2 initial guess -> analysis |
+| Design | RFdiffusion3 / Foundry | backbone generator | Implemented with full downstream app pipeline | Same normalized behavior as RFdiffusion classic |
+| Design | BindCraft / FreeBindCraft | native end-to-end binder workflow | Implemented | Use native accepted designs and native CSVs; app validation is separate |
+| Design | BoltzGen | native end-to-end design workflow | Implemented | Use `all_designs_metrics.csv` from `final_ranked_designs` for native table |
+| Design | PXDesign | native end-to-end design workflow | Implemented | Show native summary; app re-analysis only after explicit validation |
+| Design | Proteina-Complexa | native end-to-end design workflow | Implemented | Use native CSV; rank by native iPAE-like value when present, otherwise ipTM |
+| Design | Genie3 | native end-to-end workflow with ColabFold or Boltz2 option | Implemented | Use `/mnt/db/reference_files/genie3`, `/mnt/db/reference_files/alphafold_models`, and `/mnt/db/reference_files/boltz_models` caches |
+| Design | Protpardelle-1c | motif-conditioned or protein-design generator | Not implemented in app yet | Next candidate if its vanilla binder workflow is clear |
+| Design / foundation model | ESM repo in `tools_to_implement/esm` | ESM/ESM3 tooling; potential sequence or structure generation/scoring | Not implemented; no smoke test yet | Must inspect repo and define whether it is a design backend, scoring backend, or utility backend before adding UI |
+| Sequence design | ProteinMPNN / LigandMPNN / Foundry MPNN | common sequence redesign | Implemented where needed | Keep model choice explicit; default to protein sequence design unless tool requires ligand-aware weights |
+| Refolding | AF2 initial guess | target-template complex refolding | Implemented | Default complex validation route |
+| Refolding | Boltz2 | monomer and optional complex validation | Implemented | Use model/cache in `/mnt/db/reference_files/boltz_models` |
+| Analysis | IPSAE / iPAE / interface metrics | common app re-analysis | Implemented for normalized refolding outputs | Only meaningful when PAE matrices and chain roles are available |
 
-```yaml
-capabilities:
-  produces_backbone: true
-  produces_sequence: false
-  produces_complex: true
-  supports_hotspots: true
-  supports_binder_length: true
-  supports_fixed_interface: false
-  supports_native_pipeline: true
-  supports_synchronized_pipeline: true
-  supports_hybrid_pipeline: true
-  has_native_metrics: false
-```
+## Vanilla Tool Implementation Pattern
 
-The campaign engine can then apply simple rules:
+For each new design backend, implement in this order:
+
+1. Inspect the upstream repo documentation and examples.
+2. Identify the intended vanilla workflow.
+3. Identify required model/cache folders under `/mnt/db/reference_files`.
+4. Build or select the Docker image.
+5. Create a workflow wrapper in `mn_protein_design/workflows/<tool>.py`.
+6. Add a Design page tab with only the useful user-facing parameters.
+7. Show the exact payload/files sent to the algorithm.
+8. Preserve native outputs under `artifacts/raw/<tool>/`.
+9. Normalize outputs into `artifacts/normalized_candidates/candidates.jsonl`.
+10. Add native table support on the Analysis page.
+11. Add native Mol* viewer support for accepted/passing designs.
+12. Decide whether app re-analysis adds information.
+
+If the tool is native end-to-end and already produces ranked/refolded designs, do not automatically run app re-analysis. Instead, show native results. If the user wants IPSAE/iPAE or common AF2/Boltz2 comparisons, they can send the native candidates through Refolding / Validation.
+
+## Testing Pattern
+
+Smoke tests are useful for Docker mechanics, but not enough to define app behavior. For every new tool:
 
 ```text
-If candidate has no sequence -> run ProteinMPNN.
-If candidate has sequence and hybrid mode is enabled -> optionally create solubleMPNN variants.
-If candidate has no independently predicted complex -> run AF2/Boltz2 validation.
-If common analysis is enabled -> score every candidate with the same filters.
+1. Docker smoke
+   Does the image run with local model/cache mounts?
+
+2. Vanilla app-style run
+   Use a prepared PDL1 target or another known target.
+   Run the same settings a user would enter in the Design page.
+
+3. Artifact contract check
+   Confirm input.json, metadata.json, command.json, stdout.log,
+   stderr.log, result.json, raw artifacts, and candidates.jsonl exist.
+
+4. Native analysis check
+   Confirm native result tables and native Mol* viewer work.
+
+5. Optional validation check
+   If useful, send native/generated candidates through Refolding / Validation.
+
+6. App analysis check
+   Confirm app re-analysis appears only for normalized validation outputs,
+   not for native end-to-end design pages unless explicitly selected.
 ```
 
-## Proposed Package Layout
+Test outputs can live under `smoke_tests/` while debugging. Do not commit smoke outputs, `tools_to_implement/`, `ui_inspiration/`, or workdir runs.
+
+## Protpardelle-1c Next Steps
+
+`tools_to_implement/protpardelle-1c` is not implemented in the app yet. Before adding the tab:
+
+* inspect the README and examples for the intended vanilla run
+* determine whether it generates binder backbones, sequences, complexes, or only motif-conditioned scaffolds
+* determine whether it supports target-conditioned binder design directly
+* identify required model files and Docker image
+* run a small PDL1-style app test if target-conditioned binder design is supported
+* normalize any produced structures into the shared candidate contract
+
+If Protpardelle-1c is generator-only, it should follow the RFdiffusion pattern:
+
+```text
+Protpardelle generation
+  -> normalize backbones/complexes
+  -> sequence design
+  -> monomer refolding
+  -> AF2/Boltz2 complex refolding
+  -> app analysis
+```
+
+If it is not a target-conditioned binder design tool, keep it out of the main Design page until its role is clear.
+
+## ESM Repo Next Steps
+
+`tools_to_implement/esm` is newly present and has not been smoke-tested. Treat it as an unknown capability, not automatically as a binder design backend.
+
+Before implementation:
+
+* inspect `tools_to_implement/esm/README.md`, `tools_to_implement/esm/_assets/ESM3_README.md`, and examples
+* decide whether the app use case is sequence generation, structure prediction, variant scoring, inverse folding, or embeddings
+* identify model weights, license/API requirements, and whether local weights are available
+* define the Docker image and local cache contract
+* create a minimal smoke test because none exists yet
+* only then decide where it belongs:
+
+```text
+Design tab
+  if it can generate target-conditioned binder candidates.
+
+Sequence Design tab
+  if it is best used for sequence generation/redesign.
+
+Refolding / Validation tab
+  if it is best used as ESMFold-like structure prediction.
+
+Analysis tab
+  if it is best used for embeddings or sequence/structure scoring.
+```
+
+Do not expose ESM in the UI until its role and model/cache requirements are clear.
+
+## Package Layout
 
 ```text
 mn_protein_design/
@@ -369,19 +402,16 @@ mn_protein_design/
   app/
     pages/
       jobs.py
-      jobs_target.py
-      jobs_detection.py
-      jobs_design.py
       target_preparation.py
       ppi_detection.py
-      hotspot_detection.py
+      target_cropping.py
       design.py
+      sequence_design.py
       refolding.py
       analysis.py
       results.py
     components/
-      structure_viewer/
-      campaign_config/
+      molstar_viewer.py
   core/
     jobs.py
     manifests.py
@@ -390,397 +420,55 @@ mn_protein_design/
     structures.py
     residue_selection.py
     candidates.py
-    campaign.py
+    job_graph.py
   workflows/
     target_prep.py
     scannet.py
     surf2spot.py
+    design.py
     rfdiffusion.py
     rfdiffusion3.py
     bindcraft.py
     boltzgen.py
     pxdesign.py
-    protpardelle.py
     proteina_complexa.py
     genie3.py
-    design_campaign.py
-    normalize_candidates.py
+    protpardelle.py
+    esm.py
     proteinmpnn.py
-    soluble_mpnn.py
-    interface_redesign.py
     af2_initial_guess.py
     boltz2_refolding.py
-    candidate_filters.py
-  manifests/
-    scannet.yaml
-    surf2spot.yaml
-    rfdiffusion.yaml
-    rfdiffusion3.yaml
-    bindcraft.yaml
-    boltzgen.yaml
-    pxdesign.yaml
-    protpardelle_1c.yaml
-    proteina_complexa.yaml
-    genie3.yaml
-    proteinmpnn.yaml
-    soluble_mpnn.yaml
-    af2_initial_guess.yaml
-    boltz2_refolding.yaml
-mn-protein-design-workdir/
-  workdir/
-    runs/
+    analysis.py
 ```
-
-Tool Dockerfiles stay in the existing top-level `containers/` directory. The Streamlit app should use manifests and workflow wrappers rather than embedding Docker shell snippets directly in page files.
-
-## Manifest Contract
-
-Each tool should have a manifest that captures the app-facing contract:
-
-```yaml
-tool: scannet
-group: detection
-image: mnprot-scannet:latest
-gpu: false
-inputs:
-  target_pdb:
-    type: pdb
-params:
-  mode:
-    type: enum
-    default: interface
-    choices: [interface]
-  assembly:
-    type: bool
-    default: false
-outputs:
-  scored_pdb:
-    path: predictions/*.pdb
-    type: pdb
-  residue_scores:
-    path: predictions/*.csv
-    type: residue_score_table
-```
-
-Binder-design manifests should extend the same pattern with capabilities and normalized candidate outputs:
-
-```yaml
-tool: rfdiffusion_classic
-group: design
-image: mnprot-rfdiffusion:latest
-gpu: true
-capabilities:
-  produces_backbone: true
-  produces_sequence: false
-  produces_complex: true
-  supports_hotspots: true
-  supports_binder_length: true
-  supports_native_pipeline: true
-  supports_synchronized_pipeline: true
-  supports_hybrid_pipeline: true
-inputs:
-  target_pdb:
-    type: pdb
-  hotspots_json:
-    type: hotspots
-  contig_hint:
-    type: contig_hint
-common_params:
-  binder_length_min:
-    type: int
-    default: 60
-  binder_length_max:
-    type: int
-    default: 120
-  num_designs:
-    type: int
-    default: 100
-params:
-  contig:
-    type: string
-    default: ""
-  partial_T:
-    type: int
-    default: 50
-  hotspot_res:
-    type: residue_list
-    default: []
-outputs:
-  raw_designs:
-    path: outputs/*.pdb
-    type: raw_candidate_set
-  metadata:
-    path: outputs/*.json
-    type: raw_model_metadata
-```
-
-The UI can render common controls from these manifests. Custom pages add the protein-specific UX: chain picking, residue picking, hotspot preview, design-region selection, campaign mode selection, candidate triage, and result ranking.
 
 ## Navigation Model
 
-Do not make v1 one giant wizard. Protein design needs iteration and backtracking. Use task pages plus job/result pages:
+Keep the app task-based:
 
 ```text
 Jobs
-  Target Prep
-  Detection
-  Design
-  Refolding
-  Analysis
 
 Tasks
-  Prepare Target
-  Detect Interface / Hotspots
-  Define Design Region
-  Run Design Campaign
-  Refold / Validate Designs
-  Analyze Designs
+  Target Preparation
+  PPI / Hotspot Detection
+  Target Cropping
+  Design
+  Sequence Design
+  Refolding / Validation
+  Analysis
 ```
 
-This mirrors the useful `mn-ligand` split between task pages and job/result pages while keeping the workflow lighter than OVO.
-
-## Design Page UX
-
-The design page should create a campaign config rather than directly constructing Docker commands.
-
-Suggested layout:
-
-```text
-Run Binder Design Campaign
-
-1. Target
-   - select prepared target
-   - show target viewer
-   - select hotspot/design-region job
-   - preview hotspots and selected patch
-
-2. Common design parameters
-   - binder length min/max
-   - number of candidates per tool
-   - number of sequences per backbone
-   - random seed
-   - common downstream stages
-
-3. Pipeline mode
-   - native
-   - synchronized benchmark
-   - hybrid
-
-4. Tool selection
-   - RFdiffusion classic
-   - RFdiffusion3 / Foundry
-   - BindCraft / FreeBindCraft
-   - BoltzGen
-   - PXDesign
-   - Proteina-Complexa
-   - Protpardelle-1c
-   - Genie3
-
-5. Tool-specific tabs
-   - render only selected tools
-   - expose native parameters without mixing them into the common schema
-
-6. Common filters
-   - min pLDDT
-   - min ipTM or equivalent
-   - max interface PAE / iPAE / iPSAE where available
-   - max clashes
-   - hotspot contact recovery
-   - diversity clustering
-
-7. Submit campaign
-```
-
-The page should write `campaign_config.json` and call `run_design_campaign(config)`. It should not know individual Docker commands.
-
-## Pipeline Philosophy
-
-Borrow OVO's good part: typed parameters, known outputs, and downstream compatibility.
-
-```text
-Target Prep job
-  -> produces clean target structure
-
-Hotspot Detection job
-  -> consumes clean target
-  -> produces hotspot residues
-
-Design Region job
-  -> consumes target + hotspot predictions or manual residues
-  -> produces hotspots.json, selected_patch.json, contig_hint.json
-
-Design Campaign job
-  -> consumes target + hotspot residues + common/tool-specific parameters
-  -> produces raw and normalized candidate structures
-
-Sequence Design job or campaign stage
-  -> consumes normalized candidates
-  -> produces redesigned sequences and side-chain-complete structures
-
-Refolding job or campaign stage
-  -> consumes redesigned sequences + target/design structures
-  -> produces AF2 or Boltz2 predictions and refolding metrics
-
-Analysis job or campaign stage
-  -> consumes design, sequence, and refolding outputs
-  -> produces ranked table and selected design bundle
-```
-
-Do not adopt Nextflow first. A local Docker runner with metadata files is enough for v1 and matches the `mn-ligand` style.
-
-## Campaign Execution Philosophy
-
-A design campaign should be a parent job with subruns. Each selected backend tool gets a tool-run folder. Common stages get stage folders.
-
-```text
-runs/design/<campaign_run_id>/
-  input.json
-  metadata.json
-  command.json
-  stdout.log
-  stderr.log
-  result.json
-  campaign_config.json
-
-  tool_runs/
-    rfdiffusion_classic/
-      input.json
-      command.json
-      stdout.log
-      stderr.log
-      result.json
-      artifacts/
-
-    bindcraft/
-      input.json
-      command.json
-      stdout.log
-      stderr.log
-      result.json
-      artifacts/
-
-  stages/
-    normalize_candidates/
-    proteinmpnn/
-    soluble_mpnn/
-    monomer_validation/
-    af2_initial_guess/
-    boltz2_refolding/
-    minimization/
-    interface_redesign/
-    analysis/
-
-  artifacts/
-    target.pdb
-    hotspots.json
-    contig_hint.json
-    raw_candidates/
-    normalized_candidates/
-    sequence_design/
-    refolding/
-    analysis/
-```
-
-This keeps campaigns reproducible and keeps native tool logs/artifacts separate from normalized app artifacts.
-
-## Run Folder Contract
-
-Every job should write:
-
-```text
-runs/<task-group>/<run_id>/
-  input.json
-  metadata.json
-  command.json
-  stdout.log
-  stderr.log
-  result.json
-  artifacts/
-    target.pdb
-    hotspots.json
-    designs/
-    refolded/
-    metrics.csv
-```
-
-Every `result.json` should use a normalized shape:
-
-```json
-{
-  "success": true,
-  "job_type": "design",
-  "tool": "rfdiffusion",
-  "inputs": {},
-  "outputs": {},
-  "metrics": {},
-  "downstream_artifacts": {}
-}
-```
-
-Campaign `result.json` should add campaign-level summaries:
-
-```json
-{
-  "success": true,
-  "job_type": "design_campaign",
-  "campaign_mode": "hybrid",
-  "selected_tools": ["rfdiffusion_classic", "bindcraft", "boltzgen"],
-  "inputs": {},
-  "outputs": {
-    "candidates_jsonl": "artifacts/normalized_candidates/candidates.jsonl",
-    "ranked_designs": "artifacts/analysis/ranked_designs.csv"
-  },
-  "metrics": {
-    "raw_candidates": 300,
-    "normalized_candidates": 270,
-    "passed_final_filters": 12
-  },
-  "tool_summaries": {},
-  "downstream_artifacts": {}
-}
-```
-
-This gives durable handoff without requiring a heavy database. A later DB can index the same files instead of replacing them.
-
-## Implementation Order
-
-1. Scaffold the app package, CLI, Streamlit navigation, runtime workdir, and generic job table.
-2. Implement target preparation first; this becomes the canonical artifact source.
-3. Make residue numbering and viewer-selection mapping robust, including PDB residue offsets and insertion-code awareness.
-4. Add ScanNet as the first detection Docker tool because its output contract is simple: scored PDB plus residue CSV.
-5. Add Surf2Spot second because it introduces clustered hotspot outputs.
-6. Add manual hotspot selection and patch-selection UI.
-7. Define `DesignCampaignConfig`, `Candidate`, and the normalized candidate contract before adding many design tools.
-8. Add RFdiffusion classic as the first design backend.
-9. Add candidate normalization and a simple candidate results table.
-10. Add ProteinMPNN / soluble ProteinMPNN as a common downstream stage.
-11. Add a refolding/validation job type with AF2 initial guess and Boltz2 initial guess contracts borrowed from OVO.
-12. Add analysis/ranking page that can consume design-only results or refolding-enriched results.
-13. Add BindCraft/FreeBindCraft or BoltzGen as fuller end-to-end design backends.
-14. Add PXDesign, Protpardelle-1c, Proteina-Complexa, Genie3, and Foundry/RFD3 behind the same manifest/job contract.
-15. Add hybrid campaign mode: preserve native outputs while creating common redesigned/refolded variants.
-16. Add advanced analysis metrics such as IPSAE and optional Rosetta-style scoring once candidate artifact contracts are stable.
-
-## v1 Boundaries
-
-Keep v1 local and file-backed:
-
-* Docker as the execution boundary
-* `/mnt/db/reference_files` as the shared model/reference cache
-* `mn-protein-design-workdir/workdir/runs` as the durable job store
-* JSON manifests and result files as the compatibility layer
-* normalized candidate artifacts as the cross-tool handoff layer
-* no Nextflow, no heavy database, no remote scheduler
-
-This gives us a clean spine now and leaves room for heavier orchestration later without redesigning the user-facing workflow.
+The Jobs page is the single job index. It should be filterable by task group, job type, tool, and status, with newest jobs first. Deletion must be explicit and should warn about downstream dependent jobs, but deleting one analysis job should not force deletion of its upstream design run.
 
 ## Design Principles
 
 * Keep Streamlit pages thin: pages create configs and display results; workflow modules execute jobs.
-* Keep Docker commands inside manifests and workflow wrappers, not page files.
-* Normalize every design backend into candidate artifacts before common downstream stages.
-* Preserve native outputs so tool-specific behavior is not lost.
-* Support synchronized benchmarking only after a candidate contract exists.
-* Store enough metadata to distinguish native performance from generator-plus-common-pipeline performance.
-* Prefer boring files and strict JSON/CSV/PDB contracts over early database complexity.
-* Build one stable adapter first, then scale to many tools.
+* Keep Docker commands inside workflow wrappers and manifests, not page files.
+* Preserve native outputs and native metrics for every tool.
+* Normalize every backend into `candidates.jsonl`.
+* Keep native result views separate from app re-analysis views.
+* Track chain roles dynamically instead of relying on fixed chain IDs.
+* Keep target-template refolding target-only unless a future mode explicitly asks for complex templates.
+* Store enough metadata to reconstruct provenance and downstream relationships.
+* Prefer local model caches under `/mnt/db/reference_files` and avoid silent downloads.
+* Add one tool at a time: vanilla workflow, normalized outputs, native analysis, optional validation.

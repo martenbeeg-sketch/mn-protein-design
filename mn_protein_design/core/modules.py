@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from mn_protein_design.core.candidates import (
     STAGE_ANALYSIS,
     STAGE_COMPLEX_REFOLDING,
+    STAGE_BENCHMARK,
     STAGE_GENERATION_BACKBONE,
     STAGE_GENERATION_BACKBONE_SEQUENCE,
     STAGE_MONOMER_REFOLDING,
@@ -73,7 +74,12 @@ MODULE_SPECS: dict[str, ModuleSpec] = {
         module_id="complex_refolding",
         label="Complex Refolding",
         family="refolding-validation",
-        tools=("af2_initial_guess", "boltz2_initial_guess"),
+        tools=(
+            "af2_initial_guess",
+            "boltz2_initial_guess",
+            "esmfold2_complex_validation",
+            "esmfold2_initial_guess_validation",
+        ),
         consumes=(STAGE_SEQUENCE_DESIGN, STAGE_GENERATION_BACKBONE_SEQUENCE, STAGE_MONOMER_REFOLDING, STAGE_COMPLEX_REFOLDING),
         produces=(STAGE_COMPLEX_REFOLDING,),
         description="Predict and score the binder-target complex.",
@@ -93,6 +99,20 @@ MODULE_SPECS: dict[str, ModuleSpec] = {
         ),
         produces=(STAGE_ANALYSIS,),
         description="Filter, rank, cluster, and report candidate sets.",
+        supported_backends=("docker",),
+    ),
+    "binder_benchmark": ModuleSpec(
+        module_id="binder_benchmark",
+        label="Binder Benchmark",
+        family="benchmark",
+        tools=(
+            "esmfold2_benchmark",
+            "de_novo_binder_scoring_metrics",
+            "de_novo_binder_scoring_scripts",
+        ),
+        consumes=(),
+        produces=(STAGE_BENCHMARK,),
+        description="Score known, non-binding, and unknown candidates with ESM/ESMFold2 features.",
         supported_backends=("docker",),
     ),
 }

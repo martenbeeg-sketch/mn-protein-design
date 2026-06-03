@@ -27,6 +27,7 @@ state = st.session_state.setdefault(
         "remove_hetero": False,
         "map_known_modified_residues": False,
         "replace_nonstandard_residues": False,
+        "prepare_msa": True,
     },
 )
 
@@ -117,6 +118,15 @@ with left:
         )
         state["remove_waters"] = st.checkbox("Remove waters", value=state["remove_waters"])
         state["remove_hetero"] = st.checkbox("Remove hetero atoms", value=state["remove_hetero"])
+        state["prepare_msa"] = st.checkbox(
+            "Prepare Boltz2 target MSA",
+            value=state.get("prepare_msa", True),
+            help=(
+                "Caches one A3M per selected target chain in "
+                "/mnt/db/reference_files/boltz_models/msa_repository for downstream "
+                "Genie3/Boltz2 workflows."
+            ),
+        )
         nonstandard = detect_nonstandard_residues(_selected_text_for_nonstandard_detection())
         if nonstandard:
             st.warning(f"Detected {len(nonstandard)} nonstandard residue(s) in the selected target.")
@@ -191,6 +201,7 @@ with left:
                     remove_hetero=state["remove_hetero"],
                     map_known_modified_residues=state["map_known_modified_residues"],
                     replace_nonstandard_residues=state["replace_nonstandard_residues"],
+                    prepare_msa=state.get("prepare_msa", True),
                 )
             st.success(f"Prepared target job {run_dir.name}")
             st.markdown(f"[Open result](/results?task_group=target-prep&run_id={run_dir.name})")

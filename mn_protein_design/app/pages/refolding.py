@@ -12,13 +12,14 @@ from mn_protein_design.core.candidates import (
     STAGE_SEQUENCE_DESIGN,
 )
 from mn_protein_design.core.jobs import read_json
+from mn_protein_design.workflows import refolding as refolding_workflow
 from mn_protein_design.workflows.modules import candidate_sources, load_source_candidates
 
 
 st.title("Refolding / Validation")
-st.caption("Consumes normalized candidates and runs monomer refolding, complex refolding, and analysis as one validation pack.")
+st.caption("Consumes normalized candidates and runs refolding/validation engines on existing designs.")
 
-sources = candidate_sources("design")
+sources = candidate_sources()
 usable_sources = [
     source
     for source in sources
@@ -58,6 +59,98 @@ st.dataframe(
     hide_index=True,
 )
 
+st.subheader("ESMFold2 Complex Validation")
+st.caption(
+    "Refolds existing target+binder candidates with local Biohub ESMFold2 and writes a new normalized validation job."
+)
+esm_mode = st.segmented_control(
+    "ESMFold2 mode",
+    ["sequence", "initial_guess"],
+    selection_mode="single",
+    default="sequence",
+    format_func={
+        "sequence": "Sequence only",
+        "initial_guess": "Initial guess",
+    }.get,
+    key="esmfold2_validation_mode",
+)
+esm_cols = st.columns(5)
+with esm_cols[0]:
+    esm_max_candidates = st.number_input(
+        "Max candidates",
+        min_value=1,
+        max_value=1000,
+        value=min(20, max(1, int(source["candidate_count"]))),
+        step=1,
+        key="esmfold2_validation_max_candidates",
+    )
+with esm_cols[1]:
+    esm_sampling_steps = st.number_input(
+        "Sampling steps",
+        min_value=1,
+        max_value=256,
+        value=32,
+        step=1,
+        key="esmfold2_validation_sampling_steps",
+    )
+with esm_cols[2]:
+    esm_loops = st.number_input(
+        "Recycling loops",
+        min_value=1,
+        max_value=16,
+        value=3,
+        step=1,
+        key="esmfold2_validation_loops",
+    )
+with esm_cols[3]:
+    esm_seed = st.number_input(
+        "Seed",
+        min_value=0,
+        max_value=999999,
+        value=0,
+        step=1,
+        key="esmfold2_validation_seed",
+    )
+with esm_cols[4]:
+    esm_contact_cutoff = st.number_input(
+        "Contact cutoff",
+        min_value=2.0,
+        max_value=20.0,
+        value=8.0,
+        step=0.5,
+        key="esmfold2_validation_contact_cutoff",
+    )
+esm_device = st.segmented_control(
+    "ESMFold2 device",
+    ["auto", "cuda", "cpu"],
+    selection_mode="single",
+    default="auto",
+    format_func={"auto": "Auto", "cuda": "CUDA", "cpu": "CPU"}.get,
+    key="esmfold2_validation_device",
+)
+if st.button("Run ESMFold2 validation", type="primary"):
+    try:
+        with st.spinner("Running ESMFold2 complex validation..."):
+            run_dir = refolding_workflow.run_esmfold2_complex_validation(
+                source_run_dir=Path(str(source["run_dir"])),
+                candidates_jsonl=Path(str(source["candidates_jsonl"])),
+                max_candidates=int(esm_max_candidates),
+                num_loops=int(esm_loops),
+                num_sampling_steps=int(esm_sampling_steps),
+                seed=int(esm_seed),
+                device=str(esm_device or "auto"),
+                contact_cutoff=float(esm_contact_cutoff),
+                use_initial_guess=str(esm_mode or "sequence") == "initial_guess",
+            )
+        result = read_json(run_dir / "result.json")
+        if result.get("success") is True:
+            st.success("ESMFold2 validation finished.")
+        else:
+            st.error("ESMFold2 validation failed. Open the job logs for details.")
+        show_pipeline_links(run_dir, [run_dir])
+    except Exception as exc:
+        st.error(str(exc))
+
 st.subheader("Run Full Refolding / Validation")
 st.caption(
     "This always runs the validation pack in order: monomer refolding, complex refolding, then analysis."
@@ -84,12 +177,14 @@ else:
 st.markdown("**2. Complex Refolding**")
 complex_tool = st.segmented_control(
     "Complex tool",
-    ["af2_initial_guess", "boltz2_initial_guess"],
+    ["af2_initial_guess", "boltz2_initial_guess", "esmfold2_complex_validation", "esmfold2_initial_guess_validation"],
     selection_mode="single",
     default="af2_initial_guess",
     format_func={
         "af2_initial_guess": "AF2 initial guess",
         "boltz2_initial_guess": "Boltz2 initial guess",
+        "esmfold2_complex_validation": "ESMFold2 validation",
+        "esmfold2_initial_guess_validation": "ESMFold2 initial guess",
     }.get,
 )
 selected_complex_tool = str(complex_tool or "af2_initial_guess")
@@ -102,6 +197,13 @@ if selected_complex_tool == "boltz2_initial_guess":
         format_func={"target_template": "Target template", "no_template": "No template"}.get,
     )
     multimer = True
+elif selected_complex_tool in {"esmfold2_complex_validation", "esmfold2_initial_guess_validation"}:
+    template_mode = "target_template"
+    multimer = True
+    if selected_complex_tool == "esmfold2_initial_guess_validation":
+        st.info("ESMFold2 uses the target structure as a target distogram prior, matching the target-template idea of AF2 initial guess.")
+    else:
+        st.info("ESMFold2 refolds each existing candidate sequence against its target; no AF2/Boltz template is used.")
 else:
     af2_options = {
         "af2_model_1_multimer_tt_3rec": ("AF2 multimer, target template", "target_template", True, 3),
@@ -143,6 +245,11 @@ steps = [
             "template_mode": str(template_mode or "target_template"),
             "multimer": bool(multimer),
             "num_recycles": 3,
+            "max_candidates": int(esm_max_candidates),
+            "num_sampling_steps": int(esm_sampling_steps),
+            "seed": int(esm_seed),
+            "device": str(esm_device or "auto"),
+            "contact_cutoff": float(esm_contact_cutoff),
         },
     },
     {

@@ -12,6 +12,7 @@ from mn_protein_design.core.structures import (
     pdb_chains,
     replace_nonstandard_residues_with_pdbfixer,
 )
+from mn_protein_design.workflows.target_msa import ensure_boltz_msas_for_target
 
 
 TASK_GROUP = "target-prep"
@@ -26,6 +27,7 @@ def prepare_target(
     remove_hetero: bool = False,
     map_known_modified_residues: bool = False,
     replace_nonstandard_residues: bool = False,
+    prepare_msa: bool = True,
 ) -> Path:
     source_pdb = source_pdb.expanduser().resolve()
     if not source_pdb.exists():
@@ -46,6 +48,7 @@ def prepare_target(
         "remove_hetero": remove_hetero,
         "map_known_modified_residues": map_known_modified_residues,
         "replace_nonstandard_residues": replace_nonstandard_residues,
+        "prepare_msa": prepare_msa,
     }
     job = create_job(TASK_GROUP, job_type="target_preparation", tool="internal_pdb_cleaner", inputs=inputs, params=params)
     update_status(job.run_dir, "running")
@@ -94,6 +97,21 @@ def prepare_target(
                 "target_trimmed": "artifacts/target_trimmed.pdb",
             },
         }
+        msa_by_chain = {}
+        msa_error = ""
+        if prepare_msa:
+            try:
+                msa_by_chain = ensure_boltz_msas_for_target(
+                    job.run_dir,
+                    trimmed_target,
+                    sorted(keep_chain_set or []),
+                    raw_subdir="target_msa",
+                )
+                target_payload["boltz_msa_by_chain"] = msa_by_chain
+            except Exception as exc:
+                msa_error = str(exc)
+                with (job.run_dir / "stderr.log").open("a") as stderr:
+                    stderr.write(f"Target MSA preparation failed: {type(exc).__name__}: {exc}\n")
         if map_known_modified_residues:
             target_payload["artifacts"]["target_mapped"] = "artifacts/target_mapped.pdb"
         if replace_nonstandard_residues:
@@ -128,9 +146,12 @@ def prepare_target(
             {
                 "outputs": {"artifacts": artifacts, "target": target_payload},
                 "metrics": {**stats, **mapping_metrics, **repair_metrics},
+                "target_msa_by_chain": msa_by_chain,
+                "target_msa_error": msa_error,
                 "downstream_artifacts": {
                     "target_clean_pdb": "artifacts/target_clean.pdb",
                     "target_trimmed_pdb": "artifacts/target_trimmed.pdb",
+                    "target_msa_by_chain": msa_by_chain,
                     **({"target_mapped_pdb": "artifacts/target_mapped.pdb"} if map_known_modified_residues else {}),
                     **({"target_repaired_pdb": "artifacts/target_repaired.pdb"} if replace_nonstandard_residues else {}),
                     "target_json": "artifacts/target.json",

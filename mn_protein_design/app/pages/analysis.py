@@ -52,7 +52,16 @@ def _candidate_result_kind(candidate: dict) -> str:
     if explicit:
         return str(explicit)
     tool = str(candidate.get("source_tool") or source.get("tool") or "").lower()
-    if tool in {"bindcraft", "boltzgen", "pxdesign"}:
+    if tool in {
+        "bindcraft",
+        "boltzgen",
+        "pxdesign",
+        "proteina_complexa",
+        "genie3",
+        "protpardelle_1c",
+        "rfdiffusion3_foundry",
+        "rfdiffusion_classic",
+    }:
         return "native_pipeline"
     if metrics.get("analysis_backend") or candidate.get("stage") == "analysis":
         return "app_reanalysis"
@@ -84,6 +93,39 @@ def _native_table_specs(source_run_dir: Path, source_tool: str) -> list[tuple[st
         px_dir = raw_dir / "pxdesign"
         for path in sorted([*px_dir.glob("output/design_outputs/*/summary.csv"), *px_dir.glob("design_outputs/*/summary.csv")]):
             specs.append((f"PXDesign summary: {path.parent.name}", path))
+    elif tool == "proteina_complexa":
+        eval_dir = raw_dir / "proteina_complexa" / "evaluation_results"
+        for path in sorted(eval_dir.glob("*/RAW_protein_binder_results_search_binder_local_pipeline_combined.csv")):
+            specs.append(("Proteina-Complexa combined binder results", path))
+        for path in sorted(eval_dir.glob("*/binder_results_search_binder_local_pipeline_*.csv")):
+            specs.append((f"Proteina-Complexa binder results: {path.stem}", path))
+        for path in sorted(eval_dir.glob("*/overall_binder_performance_search_binder_local_pipeline_aggregated.csv")):
+            specs.append(("Proteina-Complexa aggregated performance", path))
+    elif tool == "genie3":
+        output_dir = raw_dir / "genie3" / "output"
+        for path in sorted(output_dir.glob("*/results/info.csv")):
+            specs.append((f"Genie3 info: {path.parents[1].name}", path))
+        for path in sorted(output_dir.glob("*/results/v0_success/success_info.csv")):
+            specs.append((f"Genie3 v0 successes: {path.parents[2].name}", path))
+        for path in sorted(output_dir.glob("*/results/v0_success/successful_incomplex_binders_cluster.csv")):
+            specs.append((f"Genie3 successful binder clusters: {path.parents[2].name}", path))
+    elif tool == "protpardelle_1c":
+        output_dir = raw_dir / "protpardelle_1c" / "output"
+        for path in sorted(output_dir.glob("**/esm_metrics.csv")):
+            specs.append((f"Protpardelle-1c ESMFold metrics: {path.parent.name}", path))
+        for path in sorted(output_dir.glob("**/scaffold_info.csv")):
+            specs.append((f"Protpardelle-1c scaffold info: {path.parent.name}", path))
+        for path in sorted(output_dir.glob("**/design_input.csv")):
+            specs.append((f"Protpardelle-1c design input: {path.parent.name}", path))
+    elif tool == "rfdiffusion3_foundry":
+        output_dir = raw_dir / "rfdiffusion3_foundry"
+        mapping = output_dir / "foundry_native_mapping.tsv"
+        if mapping.exists():
+            specs.append(("Foundry native design mapping", mapping))
+        for path in sorted(output_dir.glob("rf3/**/*_ranking_scores.csv")):
+            specs.append((f"RF3 ranking scores: {path.parent.name}", path))
+        for path in sorted(output_dir.glob("rf3/**/*_confidences.csv")):
+            specs.append((f"RF3 confidences: {path.parent.name}", path))
     return [(label, path) for label, path in specs if path.is_file()]
 
 
@@ -93,6 +135,42 @@ def _read_native_csv(path: Path) -> pd.DataFrame:
     except Exception as exc:
         st.warning(f"Could not read {path.name}: {exc}")
         return pd.DataFrame()
+
+
+def _proteina_complexa_native_pass_df(df: pd.DataFrame) -> pd.Series | None:
+    required = {"self_complex_i_pAE", "self_complex_pLDDT"}
+    rmsd_column = "self_binder_scRMSD_ca" if "self_binder_scRMSD_ca" in df.columns else "self_binder_scRMSD"
+    if not required.issubset(df.columns) or rmsd_column not in df.columns:
+        return None
+    ipae = pd.to_numeric(df["self_complex_i_pAE"], errors="coerce")
+    plddt = pd.to_numeric(df["self_complex_pLDDT"], errors="coerce")
+    rmsd = pd.to_numeric(df[rmsd_column], errors="coerce")
+    return (ipae * 31.0 <= 7.0) & (plddt >= 0.9) & (rmsd < 1.5)
+
+
+def _augment_proteina_complexa_native_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "self_complex_i_pAE" in df.columns:
+        ipae = pd.to_numeric(df["self_complex_i_pAE"], errors="coerce")
+        df["native_ipae_scaled"] = ipae * 31.0
+        df = df.assign(_native_rank_value=ipae, _native_rank_missing=ipae.isna())
+        df = df.sort_values(["_native_rank_missing", "_native_rank_value"], ascending=[True, True]).drop(
+            columns=["_native_rank_value", "_native_rank_missing"]
+        )
+        df.insert(0, "native_rank", range(1, len(df) + 1))
+        df["native_rank_metric"] = "self_complex_i_pAE"
+    elif "self_complex_i_pTM" in df.columns:
+        iptm = pd.to_numeric(df["self_complex_i_pTM"], errors="coerce")
+        df = df.assign(_native_rank_value=iptm, _native_rank_missing=iptm.isna())
+        df = df.sort_values(["_native_rank_missing", "_native_rank_value"], ascending=[True, False]).drop(
+            columns=["_native_rank_value", "_native_rank_missing"]
+        )
+        df.insert(0, "native_rank", range(1, len(df) + 1))
+        df["native_rank_metric"] = "self_complex_i_pTM"
+    native_pass = _proteina_complexa_native_pass_df(df)
+    if native_pass is not None:
+        df["native_pass_filters"] = native_pass
+    return df.reset_index(drop=True)
 
 
 def _native_structure_text(path: Path) -> str:
@@ -126,19 +204,45 @@ def _truthy_native_value(value: object) -> bool | None:
 def _native_candidate_label(index: int, candidate: dict) -> str:
     metrics = candidate.get("metrics") or {}
     label_parts = [str(index), str(candidate.get("candidate_id") or "candidate")]
-    final_rank = metrics.get("final_rank")
+    final_rank = metrics.get("final_rank") or metrics.get("native_final_rank")
     if final_rank not in {None, ""}:
         label_parts.append(f"rank {final_rank}")
-    pass_filters = _truthy_native_value(metrics.get("pass_filters"))
+    pass_filters = _truthy_native_value(metrics.get("native_pass_filters"))
+    if pass_filters is None:
+        pass_filters = _truthy_native_value(metrics.get("pass_filters"))
     if pass_filters is not None:
         label_parts.append("passing" if pass_filters else "not passing")
     return " | ".join(label_parts)
 
 
+def _native_candidate_sort_key(candidate: dict) -> tuple:
+    metrics = candidate.get("metrics") or {}
+    source_tool = str(candidate.get("source_tool") or "").lower()
+    if source_tool == "protpardelle_1c":
+        def number(key: str, default: float) -> float:
+            try:
+                return float(metrics.get(key))
+            except (TypeError, ValueError):
+                return default
+
+        return (
+            0 if _truthy_native_value(metrics.get("native_pass_filters")) is True else 1,
+            number("ca_scaffold_scrmsd", float("inf")),
+            number("pae", float("inf")),
+            -number("binder_plddt", float("-inf")),
+            number("allatom_motif_pred_rmsd", float("inf")),
+        )
+    final_rank = metrics.get("final_rank") or metrics.get("native_final_rank")
+    try:
+        return (0, float(final_rank))
+    except (TypeError, ValueError):
+        return (1, str(candidate.get("candidate_id") or ""))
+
+
 def _show_native_design_viewer(source_run_dir: Path, source_candidates: list[dict]) -> None:
     structure_options = [
         (index, candidate, structure_path)
-        for index, candidate in enumerate(source_candidates, start=1)
+        for index, candidate in enumerate(sorted(source_candidates, key=_native_candidate_sort_key), start=1)
         for structure_path in [_native_candidate_structure_path(source_run_dir, candidate)]
         if structure_path is not None
     ]
@@ -216,18 +320,46 @@ def _show_native_pipeline_results(source_run_dir: Path, source_tool: str, source
     if df.empty:
         st.info("The selected native result table is empty.")
         return
+    if source_tool.lower() == "proteina_complexa":
+        df = _augment_proteina_complexa_native_df(df)
     summary_cols = st.columns(4)
     summary_cols[0].metric("Rows", len(df))
-    pass_columns = [col for col in df.columns if col.lower() in {"pass_filters", "passes_filters", "accepted"} or col.lower().endswith("-success")]
+    pass_columns = [
+        col
+        for col in df.columns
+        if col.lower() in {"native_pass_filters", "pass_filters", "passes_filters", "accepted"} or col.lower().endswith("-success")
+    ]
     if pass_columns:
         pass_col = pass_columns[0]
         pass_values = df[pass_col].astype(str).str.lower().isin({"true", "1", "yes", "passed", "accepted"})
         summary_cols[1].metric(f"Passing by {pass_col}", int(pass_values.sum()))
-    score_columns = [col for col in df.columns if col.lower() in {"quality_score", "analysis_score", "score", "af2_iptm", "iptm"}]
-    if score_columns:
+    if source_tool.lower() == "proteina_complexa" and "self_complex_i_pAE" in df.columns:
+        values = pd.to_numeric(df["self_complex_i_pAE"], errors="coerce")
+        if values.notna().any():
+            summary_cols[2].metric("Best self_complex_i_pAE", f"{values.min():.3g}")
+    elif source_tool.lower() == "protpardelle_1c" and "plddt" in df.columns:
+        values = pd.to_numeric(df["plddt"], errors="coerce")
+        if values.notna().any():
+            display_value = values.max() * 100.0 if values.max() <= 1.0 else values.max()
+            summary_cols[2].metric("Best pLDDT", f"{display_value:.3g}")
+    elif source_tool.lower() == "protpardelle_1c" and "pae" in df.columns:
+        values = pd.to_numeric(df["pae"], errors="coerce")
+        if values.notna().any():
+            summary_cols[2].metric("Best PAE", f"{values.min():.3g}")
+    else:
+        score_columns = [col for col in df.columns if col.lower() in {"quality_score", "analysis_score", "score", "af2_iptm", "iptm"}]
+        if score_columns:
+            values = pd.to_numeric(df[score_columns[0]], errors="coerce")
+            if values.notna().any():
+                summary_cols[2].metric(f"Best {score_columns[0]}", f"{values.max():.3g}")
+    if source_tool.lower() == "proteina_complexa" and "native_ipae_scaled" in df.columns:
+        values = pd.to_numeric(df["native_ipae_scaled"], errors="coerce")
+        if values.notna().any():
+            summary_cols[3].metric("Best native iPAE*31", f"{values.min():.3g}")
+    elif "score_columns" in locals() and score_columns:
         values = pd.to_numeric(df[score_columns[0]], errors="coerce")
         if values.notna().any():
-            summary_cols[2].metric(f"Best {score_columns[0]}", f"{values.max():.3g}")
+            summary_cols[3].metric("Mean score", f"{values.mean():.3g}")
     st.dataframe(df, use_container_width=True, hide_index=True)
     st.caption(f"Native file: {selected_path.relative_to(source_run_dir)}")
     _show_native_design_viewer(source_run_dir, source_candidates)
@@ -241,8 +373,8 @@ for candidate in candidates:
         "stage": candidate.get("stage"),
         "source_tool": candidate.get("source_tool"),
         "result_kind": _candidate_result_kind(candidate),
-        "native_pass_filters": metrics.get("pass_filters"),
-        "native_final_rank": metrics.get("final_rank"),
+        "native_pass_filters": metrics.get("native_pass_filters", metrics.get("pass_filters")),
+        "native_final_rank": metrics.get("final_rank") or metrics.get("native_final_rank"),
         "complex_pdb": candidate.get("complex_pdb"),
         "binder_sequence": candidate.get("binder_sequence"),
         "metric_count": len(metrics),
@@ -273,10 +405,20 @@ st.dataframe(normalized_df[[col for col in summary_columns if col in normalized_
 with st.expander("All normalized candidate fields"):
     st.dataframe(normalized_df, use_container_width=True, hide_index=True)
 
-native_end_to_end_tools = {"bindcraft", "boltzgen", "pxdesign"}
+native_end_to_end_tools = {
+    "bindcraft",
+    "boltzgen",
+    "pxdesign",
+    "proteina_complexa",
+    "genie3",
+    "protpardelle_1c",
+    "rfdiffusion3_foundry",
+    "rfdiffusion_classic",
+}
 source_tool = str(source.get("tool") or "").lower()
 if source_tool in native_end_to_end_tools:
     _show_native_pipeline_results(Path(str(source["run_dir"])), source_tool, candidates)
+    st.stop()
 
 
 def _analysis_run_dir_from_csv(path: Path) -> Path:
@@ -328,7 +470,17 @@ def _path_from(base: Path, text: object) -> Path | None:
     if not text:
         return None
     path = Path(str(text))
+    if path.is_absolute() and str(path).startswith("/work/"):
+        return base / path.relative_to("/work")
     return path if path.is_absolute() else base / path
+
+
+def _first_existing_path(base: Path, *values: object) -> Path | None:
+    for value in values:
+        path = _path_from(base, value)
+        if path and path.exists():
+            return path
+    return None
 
 
 def _structure_text(path: Path) -> str:
@@ -347,7 +499,16 @@ def _monomer_overlay_paths(path: Path, row: pd.Series) -> tuple[Path | None, Pat
 
     complex_source = (candidate.get("raw_metadata") or {}).get("source_candidate")
     if not isinstance(complex_source, dict):
-        return None, None
+        complex_source = candidate
+    native_metrics = complex_source.get("metrics") or {}
+    native_reference = _first_existing_path(
+        complex_run_dir,
+        native_metrics.get("generation_filepath"),
+        native_metrics.get("monomer_refolding_reference"),
+        (complex_source.get("raw_metadata") or {}).get("input_complex"),
+    )
+    if native_reference:
+        return native_reference, None
     monomer_source = (complex_source.get("raw_metadata") or {}).get("source_candidate")
     if not isinstance(monomer_source, dict):
         return None, None
@@ -608,7 +769,7 @@ def _show_selected_design_structure(path: Path, df: pd.DataFrame, title: str) ->
         st.info("No resolved complex structure file is available for the displayed candidates.")
         return
 
-    st.subheader("Selected Passing Design")
+    st.subheader("Selected Design")
     labels = [
         f"{int(row.get('analysis_rank')) if pd.notna(row.get('analysis_rank')) else index} | {row.get('candidate_id')}"
         for index, row, _structure_path in structure_rows
@@ -621,26 +782,31 @@ def _show_selected_design_structure(path: Path, df: pd.DataFrame, title: str) ->
     )
     _index, row, structure_path = structure_rows[selected]
     metric_specs = [
-        ("monomer_rmsd", "Monomer RMSD"),
-        ("binder_rmsd", "Binder Pose RMSD"),
-        ("ipae", "iPAE"),
-        ("ipsae", "ipSAE"),
+        (["monomer_rmsd"], "Monomer RMSD"),
+        (["binder_rmsd", "complex_scrmsd"], "Binder Pose RMSD"),
+        (["ipae", "source_ipae", "min_interface_pae", "avg_interface_pae"], "iPAE"),
+        (["ipsae", "source_ipsae", "ipsae_min"], "ipSAE"),
     ]
     if str(row.get("source_tool") or "").lower() == "boltzgen" or "min_interaction_pae" in row:
         metric_specs = [
-            ("pass_filters", "Native pass"),
-            ("final_rank", "Native rank"),
-            ("quality_score", "Quality score"),
-            ("interaction_pae", "Interaction PAE"),
-            ("min_interaction_pae", "Min interaction PAE"),
-            ("iptm", "ipTM"),
-            ("design_to_target_iptm", "Design-target ipTM"),
-            ("filter_rmsd", "Filter RMSD"),
+            (["pass_filters"], "Native pass"),
+            (["final_rank"], "Native rank"),
+            (["quality_score"], "Quality score"),
+            (["interaction_pae"], "Interaction PAE"),
+            (["min_interaction_pae"], "Min interaction PAE"),
+            (["iptm"], "ipTM"),
+            (["design_to_target_iptm"], "Design-target ipTM"),
+            (["filter_rmsd"], "Filter RMSD"),
         ]
     metric_cols = st.columns(min(4, len(metric_specs)))
-    for index, (metric, label) in enumerate(metric_specs):
+    for index, (metric_keys, label) in enumerate(metric_specs):
         col = metric_cols[index % len(metric_cols)]
-        value = row.get(metric)
+        value = None
+        for metric in metric_keys:
+            candidate_value = row.get(metric)
+            if not pd.isna(candidate_value):
+                value = candidate_value
+                break
         if pd.isna(value):
             metric_cols_value = "n/a"
         elif isinstance(value, bool):
@@ -784,7 +950,7 @@ def _show_selected_design_structure(path: Path, df: pd.DataFrame, title: str) ->
         )
     if show_predicted_complex and not aligned_complex_pdb:
         st.warning("Could not align the predicted complex onto the starting target for this candidate.")
-    if show_aligned_monomer and not aligned_monomer_pdb:
+    if show_aligned_monomer and not aligned_monomer_pdb and monomer_path:
         st.warning("Could not align the predicted monomer onto the designed backbone for this candidate.")
     st.caption("Overlay: " + ", ".join(overlay_labels) + ".")
     molstar_custom_component(
@@ -1016,19 +1182,9 @@ def _analysis_result_label(run_dir: Path) -> str:
     return " | ".join(parts)
 
 
-if source_tool in native_end_to_end_tools:
-    st.subheader("App Re-analysis")
-    st.info(
-        "This native end-to-end pipeline already contains its own tool-specific evaluation table above. "
-        "The app re-analysis step is hidden here because it cannot add iPSAE or related PAE-derived scores "
-        "unless these candidates are first passed through the Refolding / Validation task, which writes the "
-        "normalized prediction artifacts and full PAE matrices needed for app-level scoring."
-    )
-    st.stop()
-
-
-st.subheader("App Re-analysis Results")
 completed_analysis_runs = _completed_analysis_runs(Path(str(source["run_dir"])))
+
+st.subheader("Completed App Re-analysis Jobs")
 completed_run = None
 if completed_analysis_runs:
     selected_completed = st.selectbox(
@@ -1108,9 +1264,10 @@ if completed_run is not None:
 else:
     st.info("Run app re-analysis to create a normalized ranking table.")
 
-st.subheader("Run App Re-analysis")
+if source_tool not in native_end_to_end_tools:
+    st.subheader("Run App Re-analysis")
 
-if st.button("Run app re-analysis", type="primary"):
+if source_tool not in native_end_to_end_tools and st.button("Run app re-analysis", type="primary"):
     try:
         run_dir = run_analysis_contract(
             source_run_dir=source["run_dir"],

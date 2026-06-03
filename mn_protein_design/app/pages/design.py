@@ -17,9 +17,10 @@ from mn_protein_design.core.candidates import candidate_stage_counts, read_candi
 from mn_protein_design.core.jobs import read_json
 from mn_protein_design.core.structures import filter_pdb_text
 from mn_protein_design.workflows import design as design_workflow
-from mn_protein_design.workflows.campaigns import run_lineage_steps
+from mn_protein_design.workflows import esm_binder as esm_binder_workflow
 
 design_workflow = importlib.reload(design_workflow)
+esm_binder_workflow = importlib.reload(esm_binder_workflow)
 build_rfdiffusion_run_parameters = design_workflow.build_rfdiffusion_run_parameters
 default_target_contig = design_workflow.default_target_contig
 design_jobs_for_target = design_workflow.design_jobs_for_target
@@ -32,6 +33,7 @@ run_protpardelle_1c = design_workflow.run_protpardelle_1c
 run_pxdesign = design_workflow.run_pxdesign
 run_rfdiffusion3_foundry = design_workflow.run_rfdiffusion3_foundry
 run_rfdiffusion_classic = design_workflow.run_rfdiffusion_classic
+run_esmfold2_binder_screening = esm_binder_workflow.run_esmfold2_binder_screening
 target_label = design_workflow.target_label
 normalize_rfdiffusion3_contig = design_workflow._normalize_rfdiffusion3_contig
 
@@ -496,7 +498,7 @@ with campaign_cols[1]:
     )
 
 st.subheader("Generator")
-rfdiffusion_tab, bindcraft_tab, foundry_tab, boltzgen_tab, pxdesign_tab, genie3_tab, protpardelle_tab, complexa_tab = st.tabs(
+rfdiffusion_tab, bindcraft_tab, foundry_tab, boltzgen_tab, pxdesign_tab, genie3_tab, esm_tab, protpardelle_tab, complexa_tab = st.tabs(
     [
         "RFdiffusion classic",
         "BindCraft",
@@ -504,6 +506,7 @@ rfdiffusion_tab, bindcraft_tab, foundry_tab, boltzgen_tab, pxdesign_tab, genie3_
         "BoltzGen",
         "PXDesign",
         "Genie3",
+        "ESM experimental",
         "Protpardelle-1c",
         "Proteina-Complexa",
     ]
@@ -1120,6 +1123,7 @@ with rfdiffusion_tab:
                     contig=contig,
                     binder_length=binder_length,
                     hotspots=hotspots,
+                    campaign_name=campaign_name,
                     num_designs=int(rfdiffusion_num_designs),
                     timesteps=int(timesteps),
                     model_weights=model_weights,
@@ -1143,80 +1147,38 @@ with rfdiffusion_tab:
                     mpnn_omit_aa=mpnn_omit_aa,
                     mpnn_bias_aa=mpnn_bias_aa,
                     mpnn_run_parameters=mpnn_run_parameters,
-                    sequence_design_method=sequence_design_method,
+                    sequence_design_method=full_mpnn_model if full_pipeline else sequence_design_method,
                     mpnn_fastrelax_cycles=int(mpnn_fastrelax_cycles),
                     refolding_test=refolding_test,
                     execution_backend=execution_backend,
+                    run_vanilla_pipeline=bool(full_pipeline),
+                    monomer_refolding_tool=monomer_tool,
+                    complex_refolding_tool=complex_tool,
+                    complex_template_mode=complex_template_mode,
+                    complex_multimer=bool(complex_multimer),
+                    complex_num_recycles=int(complex_num_recycles),
+                    analysis_keep_top_n=int(keep_top_n),
+                    analysis_thresholds={
+                        "min_binder_plddt": float(min_binder_plddt),
+                        "min_confidence": 0.0,
+                        "min_iptm": 0.0,
+                        "min_ipsae": float(min_ipsae),
+                        "max_ipae": float(max_ipae),
+                        "max_ipde": 20.0,
+                        "max_binder_rmsd": float(max_binder_rmsd),
+                        **(
+                            {
+                                "min_hotspot_contact_fraction": float(min_final_hotspot_contact_fraction),
+                                "max_hotspot_distance": float(max_final_hotspot_distance),
+                            }
+                            if min_final_hotspot_contact_fraction is not None
+                            and max_final_hotspot_distance is not None
+                            else {}
+                        ),
+                    },
                 )
             st.success("RFdiffusion job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
-            if full_pipeline:
-                steps = [
-                    {
-                        "module": "sequence_design",
-                        "tool": "ligandmpnn",
-                        "params": {
-                            "model_type": str(full_mpnn_model),
-                            "design_chains": "",
-                            "num_seq_per_target": int(mpnn_num_sequences),
-                            "sampling_temp": float(mpnn_sampling_temp),
-                            "omit_aas": str(mpnn_omit_aa or "CX"),
-                            "seed": None,
-                            "require_backbone_hotspot_filter_pass": bool(apply_backbone_hotspot_prefilter),
-                        },
-                    },
-                    {
-                        "module": "monomer_refolding",
-                        "tool": str(monomer_tool),
-                        "params": {"min_plddt": float(min_binder_plddt)},
-                    },
-                    {
-                        "module": "complex_refolding",
-                        "tool": str(complex_tool),
-                        "params": {
-                            "require_monomer_success": True,
-                            "template_mode": complex_template_mode,
-                            "multimer": complex_multimer,
-                            "num_recycles": complex_num_recycles,
-                        },
-                    },
-                    {
-                        "module": "analysis",
-                        "tool": "ranking",
-                        "params": {
-                            "keep_top_n": int(keep_top_n),
-                            "thresholds": {
-                                "min_binder_plddt": float(min_binder_plddt),
-                                "min_confidence": 0.0,
-                                "min_iptm": 0.0,
-                                "min_ipsae": float(min_ipsae),
-                                "max_ipae": float(max_ipae),
-                                "max_ipde": 20.0,
-                                "max_binder_rmsd": float(max_binder_rmsd),
-                                **(
-                                    {
-                                        "min_hotspot_contact_fraction": float(min_final_hotspot_contact_fraction),
-                                        "max_hotspot_distance": float(max_final_hotspot_distance),
-                                    }
-                                    if min_final_hotspot_contact_fraction is not None
-                                    and max_final_hotspot_distance is not None
-                                    else {}
-                                ),
-                            },
-                        },
-                    },
-                ]
-                with st.spinner("Running sequence design, refolding, and analysis..."):
-                    child_runs = run_lineage_steps(
-                        campaign_name.strip() or f"RFdiffusion full pipeline from {run_dir.name}",
-                        _source_from_run_dir(run_dir),
-                        steps,
-                    )
-                if child_runs and read_json(child_runs[-1] / "result.json").get("success") is not True:
-                    st.error("Full pipeline stopped on a failed step. Open the child job for logs.")
-                else:
-                    st.success("Full RFdiffusion pipeline finished.")
-                _lineage_links(child_runs)
         except Exception as exc:
             st.error(str(exc))
 
@@ -1414,45 +1376,48 @@ with bindcraft_tab:
             st.error(str(exc))
 
 with foundry_tab:
-    st.caption("RFdiffusion3 / Foundry replaces only the backbone generator. Downstream sequence design, refolding, and analysis use the same normalized pipeline.")
+    st.caption("RFdiffusion3 / Foundry runs the native Foundry chain: RFD3 backbone generation, Foundry MPNN redesign, then RF3 refolding with cached target MSAs.")
     st.subheader("Run Mode")
     foundry_run_mode = st.segmented_control(
-        "RFdiffusion3 workflow",
-        ["generation_only", "full_vanilla_pipeline"],
+        "RFdiffusion3 / Foundry workflow",
+        ["vanilla_pipeline", "generation_only"],
         selection_mode="single",
-        default="full_vanilla_pipeline",
+        default="vanilla_pipeline",
         format_func={
+            "vanilla_pipeline": "Vanilla Foundry pipeline",
             "generation_only": "Generation only",
-            "full_vanilla_pipeline": "Full vanilla pipeline",
         }.get,
         key=f"foundry_run_mode_{source_key}",
     )
-    foundry_full_pipeline = str(foundry_run_mode or "full_vanilla_pipeline") == "full_vanilla_pipeline"
+    foundry_vanilla_pipeline = str(foundry_run_mode or "vanilla_pipeline") == "vanilla_pipeline"
 
-    st.markdown("#### 1. RFdiffusion3 Generation")
     foundry_num_designs = int(num_candidates)
-    foundry_cols = st.columns(2)
+    st.markdown("#### Foundry Native Settings")
+    foundry_cols = st.columns(3)
     with foundry_cols[0]:
+        st.metric("Design attempts", foundry_num_designs)
+    with foundry_cols[1]:
         foundry_timesteps = st.number_input(
-            "Diffusion timesteps",
+            "RFD3 diffusion timesteps",
             min_value=1,
             max_value=200,
             value=int(loaded_params.get("timesteps") or 50),
             step=1,
             key=f"foundry_timesteps_{source_key}",
         )
-    with foundry_cols[1]:
+    with foundry_cols[2]:
         foundry_is_non_loopy = st.checkbox(
             "Non-loopy binder",
             value=bool(loaded_params.get("is_non_loopy", True)),
             key=f"foundry_is_non_loopy_{source_key}",
         )
+
     foundry_contig_key = f"foundry_contig_{source_key}"
     foundry_auto_contig_key = f"{foundry_contig_key}_auto"
     foundry_manual_contig_key = f"{foundry_contig_key}_manual"
     computed_foundry_contig = _rfdiffusion3_contig(target_pdb, target_chains, binder_length)
     foundry_manual_contig = st.checkbox(
-        "Edit RFdiffusion3 contig manually",
+        "Edit RFD3 contig manually",
         value=bool(st.session_state.get(foundry_manual_contig_key, False)),
         key=foundry_manual_contig_key,
         help="Leave off to rebuild the contig from the selected target and binder length on every rerun.",
@@ -1470,18 +1435,15 @@ with foundry_tab:
         st.session_state[foundry_contig_key] = normalize_rfdiffusion3_contig(str(st.session_state.get(foundry_contig_key)))
         st.session_state[foundry_auto_contig_key] = computed_foundry_contig
     foundry_contig = st.text_input(
-        "RFdiffusion3 contig",
+        "RFD3 contig",
         help="Auto-built from the prepared target plus binder length unless manual editing is enabled.",
         disabled=not foundry_manual_contig,
         key=foundry_contig_key,
     )
+
     foundry_infer_ori_strategy = "hotspots" if hotspots else "default"
-    st.caption(
-        "Binder placement uses selected hotspots."
-        if hotspots
-        else "Binder placement uses the default RFdiffusion3 orientation because no hotspots are selected."
-    )
-    with st.expander("Advanced RFdiffusion3 placement override", expanded=False):
+    st.caption("RFD3 uses selected hotspots for binder placement." if hotspots else "RFD3 uses default binder placement because no hotspots are selected.")
+    with st.expander("Advanced RFD3 placement override", expanded=False):
         foundry_infer_ori_strategy = st.selectbox(
             "Binder placement strategy",
             ["hotspots", "default"] if hotspots else ["default", "hotspots"],
@@ -1494,166 +1456,46 @@ with foundry_tab:
     foundry_mpnn_sequences = 1
     foundry_mpnn_model_type = "protein_mpnn"
     foundry_mpnn_checkpoint = "/weights/proteinmpnn_v_48_020.pt"
-    foundry_monomer_tool = "boltz2_monomer"
-    foundry_complex_tool = "af2_initial_guess"
-    foundry_complex_template_mode = "target_template"
-    foundry_complex_multimer = True
-    foundry_complex_num_recycles = 3
-    foundry_keep_top_n = 100
-    foundry_min_binder_plddt = 70.0
-    foundry_max_ipae = 10.0
-    foundry_min_ipsae = 0.0
-    foundry_max_binder_rmsd = 5.0
-    foundry_min_final_hotspot_contact_fraction: float | None = None
-    foundry_max_final_hotspot_distance: float | None = None
-
-    if foundry_full_pipeline:
-        st.markdown("#### 2. Sequence Design")
-        foundry_mpnn_cols = st.columns(2)
-        with foundry_mpnn_cols[0]:
+    foundry_prepare_target_msa = True
+    if foundry_vanilla_pipeline:
+        st.markdown("#### Foundry MPNN And RF3")
+        foundry_model_options = _foundry_mpnn_model_options()
+        loaded_checkpoint = str(loaded_params.get("mpnn_checkpoint_path") or loaded_params.get("checkpoint_path") or "/weights/proteinmpnn_v_48_020.pt")
+        loaded_model_type = str(loaded_params.get("mpnn_model_type") or loaded_params.get("model_type") or _foundry_mpnn_model_from_checkpoint(loaded_checkpoint))
+        native_cols = st.columns(3)
+        with native_cols[0]:
             foundry_mpnn_sequences = st.number_input(
-                "Sequences per backbone",
+                "MPNN sequences per backbone",
                 min_value=1,
                 max_value=1000,
-                value=int(loaded_params.get("batch_size") or 1),
+                value=int(loaded_params.get("mpnn_sequences_per_backbone") or loaded_params.get("batch_size") or 1),
                 step=1,
                 key=f"foundry_mpnn_sequences_{source_key}",
             )
-        with foundry_mpnn_cols[1]:
-            foundry_model_options = _foundry_mpnn_model_options()
-            loaded_checkpoint = str(loaded_params.get("checkpoint_path") or "/weights/proteinmpnn_v_48_020.pt")
-            loaded_model_type = str(loaded_params.get("model_type") or _foundry_mpnn_model_from_checkpoint(loaded_checkpoint))
+        with native_cols[1]:
             foundry_mpnn_model_type = st.selectbox(
-                "MPNN model",
+                "Foundry MPNN model",
                 list(foundry_model_options),
                 format_func=lambda key: foundry_model_options[key]["label"],
                 index=list(foundry_model_options).index(loaded_model_type) if loaded_model_type in foundry_model_options else 0,
                 key=f"foundry_mpnn_model_type_{source_key}",
             )
             foundry_mpnn_checkpoint = foundry_model_options[foundry_mpnn_model_type]["checkpoint"]
-            st.caption(foundry_model_options[foundry_mpnn_model_type]["description"])
-
-        st.markdown("#### 3. Refolding")
-        refold_cols = st.columns(2)
-        with refold_cols[0]:
-            foundry_monomer_tool = st.selectbox(
-                "Monomer refolding",
-                ["boltz2_monomer", "esmfold", "af2_monomer"],
-                format_func={
-                    "boltz2_monomer": "Boltz2 monomer",
-                    "esmfold": "ESMFold",
-                    "af2_monomer": "AF2 monomer contract",
-                }.get,
-                key=f"foundry_full_monomer_tool_{source_key}",
+        with native_cols[2]:
+            foundry_prepare_target_msa = st.checkbox(
+                "Use cached target MSA for RF3",
+                value=bool(loaded_params.get("prepare_target_msa", True)),
+                key=f"foundry_prepare_target_msa_{source_key}",
+                help="Uses /mnt/db/reference_files/boltz_models/msa_repository; missing target MSAs are created through the shared Boltz2 MSA cache helper.",
             )
-        with refold_cols[1]:
-            foundry_complex_tool = st.selectbox(
-                "Complex refolding",
-                ["af2_initial_guess", "boltz2_initial_guess"],
-                format_func={
-                    "af2_initial_guess": "AF2 initial guess",
-                    "boltz2_initial_guess": "Boltz2 initial guess",
-                }.get,
-                key=f"foundry_full_complex_tool_{source_key}",
-            )
-        if foundry_complex_tool == "af2_initial_guess":
-            foundry_af2_options = {
-                "af2_model_1_multimer_tt_3rec": {
-                    "label": "AF2 multimer, target template",
-                    "template_mode": "target_template",
-                    "multimer": True,
-                    "num_recycles": 3,
-                },
-                "af2_model_1_ptm_tt_3rec": {
-                    "label": "AF2 monomer model, target template",
-                    "template_mode": "target_template",
-                    "multimer": False,
-                    "num_recycles": 3,
-                },
-                "af2_model_1_multimer_tbt_3rec": {
-                    "label": "AF2 multimer, target + binder templates",
-                    "template_mode": "target_binder_template",
-                    "multimer": True,
-                    "num_recycles": 3,
-                },
-                "af2_model_1_multimer_ct_3rec": {
-                    "label": "AF2 multimer, complex template",
-                    "template_mode": "complex_template",
-                    "multimer": True,
-                    "num_recycles": 3,
-                },
-            }
-            foundry_af2_refolding_test = st.selectbox(
-                "AF2 complex refolding model",
-                list(foundry_af2_options),
-                format_func=lambda key: foundry_af2_options[key]["label"],
-                index=0,
-                key=f"foundry_full_af2_refolding_test_{source_key}",
-            )
-            foundry_complex_template_mode = str(foundry_af2_options[foundry_af2_refolding_test]["template_mode"])
-            foundry_complex_multimer = bool(foundry_af2_options[foundry_af2_refolding_test]["multimer"])
-            foundry_complex_num_recycles = int(foundry_af2_options[foundry_af2_refolding_test]["num_recycles"])
-        else:
-            foundry_boltz_template_mode = st.segmented_control(
-                "Boltz2 complex template",
-                ["target_template", "no_template"],
-                selection_mode="single",
-                default="target_template",
-                format_func={"target_template": "Target template", "no_template": "No template"}.get,
-                key=f"foundry_full_boltz_template_mode_{source_key}",
-            )
-            foundry_complex_template_mode = str(foundry_boltz_template_mode or "target_template")
-
-        st.markdown("#### 4. Filtering And Analysis")
-        analysis_cols = st.columns(5)
-        with analysis_cols[0]:
-            foundry_keep_top_n = st.number_input("Keep top results", min_value=1, max_value=10000, value=100, step=10, key=f"foundry_keep_top_n_{source_key}")
-        with analysis_cols[1]:
-            foundry_min_binder_plddt = st.number_input("Min binder pLDDT", min_value=0.0, max_value=100.0, value=70.0, step=1.0, key=f"foundry_min_binder_plddt_{source_key}")
-        with analysis_cols[2]:
-            foundry_max_ipae = st.number_input("Max iPAE", min_value=0.0, max_value=100.0, value=10.0, step=1.0, key=f"foundry_max_ipae_{source_key}")
-        with analysis_cols[3]:
-            foundry_min_ipsae = st.number_input("Min ipSAE", min_value=0.0, max_value=1.0, value=0.0, step=0.05, key=f"foundry_min_ipsae_{source_key}")
-        with analysis_cols[4]:
-            foundry_max_binder_rmsd = st.number_input("Max binder RMSD", min_value=0.0, max_value=100.0, value=5.0, step=0.5, key=f"foundry_max_binder_rmsd_{source_key}")
-        foundry_hotspot_filter_enabled = st.checkbox(
-            "Filter final complexes by hotspot/site recovery",
-            value=False,
-            disabled=not bool(hotspots),
-            key=f"foundry_hotspot_filter_enabled_{source_key}",
-        )
-        hotspot_filter_cols = st.columns(2)
-        with hotspot_filter_cols[0]:
-            foundry_min_final_hotspot_contact_fraction = st.number_input(
-                "Final min hotspot contact fraction",
-                min_value=0.0,
-                max_value=1.0,
-                value=0.5,
-                step=0.05,
-                disabled=not foundry_hotspot_filter_enabled,
-                key=f"foundry_min_hotspot_contact_fraction_{source_key}",
-            )
-        with hotspot_filter_cols[1]:
-            foundry_max_final_hotspot_distance = st.number_input(
-                "Final max nearest hotspot distance",
-                min_value=0.0,
-                max_value=50.0,
-                value=8.0,
-                step=0.5,
-                disabled=not foundry_hotspot_filter_enabled,
-                key=f"foundry_max_hotspot_distance_{source_key}",
-            )
-        if not foundry_hotspot_filter_enabled:
-            foundry_min_final_hotspot_contact_fraction = None
-            foundry_max_final_hotspot_distance = None
-    else:
-        st.caption("Generation-only mode stops after RFdiffusion3 / Foundry. Downstream modules can be launched later from Campaigns.")
+        st.caption(foundry_model_options[foundry_mpnn_model_type]["description"])
 
     _tool_payload_expander(
         "RFdiffusion3 / Foundry",
         {
             "docker_image": "ovoex-foundry-cu128:latest",
-            "input_json": {
+            "mode": "vanilla_foundry_pipeline" if foundry_vanilla_pipeline else "rfd3_generation_only",
+            "rfd3_input_json": {
                 "design_1": {
                     "dialect": 2,
                     "input": "target.pdb",
@@ -1663,7 +1505,7 @@ with foundry_tab:
                     "select_hotspots": _hotspot_atom_map(hotspots) if hotspots else None,
                 }
             },
-            "command_args": {
+            "rfd3_command_args": {
                 "out_dir": "rfd3",
                 "inputs": "rfd3_inputs_staged.json",
                 "ckpt_path": "/weights/rfd3_latest.ckpt",
@@ -1673,47 +1515,21 @@ with foundry_tab:
                 "skip_existing": False,
                 "prevalidate_inputs": True,
             },
-            "full_pipeline": {
-                "enabled": foundry_full_pipeline,
-                "sequence_design": {
-                    "tool": "foundry_mpnn",
-                    "number_of_batches": 1,
-                    "batch_size": int(foundry_mpnn_sequences),
-                    "model_type": foundry_mpnn_model_type,
-                    "checkpoint_path": foundry_mpnn_checkpoint,
-                },
-                "monomer_refolding": {"tool": foundry_monomer_tool, "min_plddt": float(foundry_min_binder_plddt)},
-                "complex_refolding": {
-                    "tool": foundry_complex_tool,
-                    "template_mode": foundry_complex_template_mode,
-                    "multimer": foundry_complex_multimer,
-                    "num_recycles": foundry_complex_num_recycles,
-                },
-                "analysis": {
-                    "keep_top_n": int(foundry_keep_top_n),
-                    "thresholds": {
-                        "min_binder_plddt": float(foundry_min_binder_plddt),
-                        "min_confidence": 0.0,
-                        "min_iptm": 0.0,
-                        "min_ipsae": float(foundry_min_ipsae),
-                        "max_ipae": float(foundry_max_ipae),
-                        "max_ipde": 20.0,
-                        "max_binder_rmsd": float(foundry_max_binder_rmsd),
-                        **(
-                            {
-                                "min_hotspot_contact_fraction": float(foundry_min_final_hotspot_contact_fraction),
-                                "max_hotspot_distance": float(foundry_max_final_hotspot_distance),
-                            }
-                            if foundry_min_final_hotspot_contact_fraction is not None
-                            and foundry_max_final_hotspot_distance is not None
-                            else {}
-                        ),
-                    },
-                },
+            "foundry_mpnn": {
+                "enabled": foundry_vanilla_pipeline,
+                "batch_size": int(foundry_mpnn_sequences),
+                "number_of_batches": 1,
+                "model_type": foundry_mpnn_model_type,
+                "checkpoint_path": foundry_mpnn_checkpoint,
+            },
+            "rf3": {
+                "enabled": foundry_vanilla_pipeline,
+                "checkpoint_path": "/weights/rf3_foundry_01_24_latest_remapped.ckpt",
+                "target_msa": bool(foundry_prepare_target_msa),
             },
         },
     )
-    foundry_run_label = "Run RFdiffusion3 full pipeline" if foundry_full_pipeline else "Run RFdiffusion3 generation"
+    foundry_run_label = "Run Foundry vanilla pipeline" if foundry_vanilla_pipeline else "Run RFD3 generation"
     if st.button(foundry_run_label, type="primary", disabled=not target_chains):
         try:
             with st.spinner("Running RFdiffusion3 / Foundry..."):
@@ -1722,78 +1538,20 @@ with foundry_tab:
                     target_chains=target_chains,
                     binder_length=binder_length,
                     hotspots=hotspots,
+                    campaign_name=campaign_name,
                     num_designs=int(foundry_num_designs),
                     timesteps=int(foundry_timesteps),
                     contig=foundry_contig,
                     is_non_loopy=bool(foundry_is_non_loopy),
                     infer_ori_strategy=foundry_infer_ori_strategy,
+                    run_vanilla_pipeline=foundry_vanilla_pipeline,
+                    mpnn_sequences_per_backbone=int(foundry_mpnn_sequences),
+                    mpnn_model_type=foundry_mpnn_model_type,
+                    mpnn_checkpoint_path=foundry_mpnn_checkpoint,
+                    prepare_target_msa=bool(foundry_prepare_target_msa),
                 )
             st.success("RFdiffusion3 / Foundry job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
-            if foundry_full_pipeline:
-                steps = [
-                    {
-                        "module": "sequence_design",
-                        "tool": "foundry_mpnn",
-                        "params": {
-                            "number_of_batches": 1,
-                            "batch_size": int(foundry_mpnn_sequences),
-                            "model_type": foundry_mpnn_model_type,
-                            "checkpoint_path": foundry_mpnn_checkpoint,
-                        },
-                    },
-                    {
-                        "module": "monomer_refolding",
-                        "tool": str(foundry_monomer_tool),
-                        "params": {"min_plddt": float(foundry_min_binder_plddt)},
-                    },
-                    {
-                        "module": "complex_refolding",
-                        "tool": str(foundry_complex_tool),
-                        "params": {
-                            "require_monomer_success": True,
-                            "template_mode": foundry_complex_template_mode,
-                            "multimer": foundry_complex_multimer,
-                            "num_recycles": foundry_complex_num_recycles,
-                        },
-                    },
-                    {
-                        "module": "analysis",
-                        "tool": "ranking",
-                        "params": {
-                            "keep_top_n": int(foundry_keep_top_n),
-                            "thresholds": {
-                                "min_binder_plddt": float(foundry_min_binder_plddt),
-                                "min_confidence": 0.0,
-                                "min_iptm": 0.0,
-                                "min_ipsae": float(foundry_min_ipsae),
-                                "max_ipae": float(foundry_max_ipae),
-                                "max_ipde": 20.0,
-                                "max_binder_rmsd": float(foundry_max_binder_rmsd),
-                                **(
-                                    {
-                                        "min_hotspot_contact_fraction": float(foundry_min_final_hotspot_contact_fraction),
-                                        "max_hotspot_distance": float(foundry_max_final_hotspot_distance),
-                                    }
-                                    if foundry_min_final_hotspot_contact_fraction is not None
-                                    and foundry_max_final_hotspot_distance is not None
-                                    else {}
-                                ),
-                            },
-                        },
-                    },
-                ]
-                with st.spinner("Running Foundry MPNN, refolding, and analysis..."):
-                    child_runs = run_lineage_steps(
-                        campaign_name.strip() or f"RFdiffusion3 full pipeline from {run_dir.name}",
-                        _source_from_run_dir(run_dir),
-                        steps,
-                    )
-                if child_runs and read_json(child_runs[-1] / "result.json").get("success") is not True:
-                    st.error("Full pipeline stopped on a failed step. Open the child job for logs.")
-                else:
-                    st.success("Full RFdiffusion3 pipeline finished.")
-                _lineage_links(child_runs)
         except Exception as exc:
             st.error(str(exc))
 
@@ -1992,6 +1750,17 @@ with pxdesign_tab:
             help="PXDesign docs recommend this kernel optimization for modern GPUs in extended mode. It is used by the Protenix filter.",
             key=f"pxdesign_use_deepspeed_{source_key}",
         )
+    pxdesign_prepare_msa = st.checkbox(
+        "Use cached target MSA for Protenix evaluation",
+        value=bool(loaded_params.get("prepare_target_msa", True)),
+        disabled=pxdesign_mode == "generation_only",
+        help=(
+            "For PXDesign preview/extended runs, materializes per-chain MSA directories "
+            "from /mnt/db/reference_files/boltz_models/msa_repository. Missing MSAs are "
+            "created with the same Boltz2 MSA-server cache helper used by Genie3."
+        ),
+        key=f"pxdesign_prepare_msa_{source_key}",
+    )
     first_chain = target_chains[0] if target_chains else "A"
     px_hotspots_by_chain: dict[str, list[int]] = {}
     for token in hotspots.split(",") if hotspots else []:
@@ -2000,7 +1769,13 @@ with pxdesign_tab:
         except ValueError:
             continue
     px_yaml_chains = {
-        chain: {"hotspots": px_hotspots_by_chain[chain]} if px_hotspots_by_chain.get(chain) else "all"
+        chain: (
+            {
+                **({"hotspots": px_hotspots_by_chain[chain]} if px_hotspots_by_chain.get(chain) else {}),
+                **({"msa": f"input/msa/{chain}"} if pxdesign_prepare_msa and pxdesign_mode != "generation_only" else {}),
+            }
+            or "all"
+        )
         for chain in (target_chains or [first_chain])
     }
     _tool_payload_expander(
@@ -2052,6 +1827,7 @@ with pxdesign_tab:
                     n_max_runs=int(pxdesign_n_max_runs),
                     use_fast_ln=bool(pxdesign_use_fast_ln),
                     use_deepspeed_evo_attention=bool(pxdesign_use_deepspeed),
+                    prepare_target_msa=bool(pxdesign_prepare_msa),
                 )
             st.success("PXDesign job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
@@ -2059,91 +1835,548 @@ with pxdesign_tab:
             st.error(str(exc))
 
 with genie3_tab:
-    st.caption("Current adapter uses the bundled Genie3 BinderBench PDL1 contract.")
-    genie3_num_designs = st.number_input("Candidates", 1, 100, int(num_candidates), key=f"genie3_num_designs_{source_key}")
+    st.caption("Runs Genie3's native binder-design workflow against the selected prepared target.")
+    genie3_mode = st.segmented_control(
+        "Genie3 workflow",
+        ["generation_only", "full_vanilla_pipeline"],
+        selection_mode="single",
+        default=str(loaded_params.get("run_mode") or "full_vanilla_pipeline"),
+        format_func={
+            "generation_only": "Generation only",
+            "full_vanilla_pipeline": "Full vanilla pipeline",
+        }.get,
+        key=f"genie3_run_mode_{source_key}",
+    )
+    genie3_full_pipeline = str(genie3_mode or "full_vanilla_pipeline") == "full_vanilla_pipeline"
+    st.markdown("#### 1. Genie3 Generation")
+    genie3_gen_cols = st.columns(3)
+    with genie3_gen_cols[0]:
+        genie3_num_designs = st.number_input(
+            "Design attempts",
+            1,
+            1000,
+            int(num_candidates),
+            key=f"genie3_num_designs_{source_key}",
+        )
+    with genie3_gen_cols[1]:
+        genie3_seed = st.number_input(
+            "Seed",
+            min_value=0,
+            max_value=999999,
+            value=int(loaded_params.get("seed") or 7),
+            step=1,
+            key=f"genie3_seed_{source_key}",
+        )
+    with genie3_gen_cols[2]:
+        genie3_num_devices = st.number_input(
+            "GPU devices",
+            min_value=1,
+            max_value=8,
+            value=int(loaded_params.get("num_devices") or 1),
+            step=1,
+            key=f"genie3_num_devices_{source_key}",
+        )
+    genie3_cond_options = ["hotspot", "extended", "common", "iter_common", "iter_common_prob"]
+    loaded_cond = str(loaded_params.get("cond_strategy") or "extended")
+    if loaded_cond not in genie3_cond_options:
+        loaded_cond = "extended"
+    genie3_cond_strategy = st.selectbox(
+        "Conditioning strategy",
+        genie3_cond_options,
+        index=genie3_cond_options.index(loaded_cond),
+        help="Genie3 interface conditioning. 'extended' uses residues around the selected hotspots; iterative modes reuse previous round successes.",
+        key=f"genie3_cond_strategy_{source_key}",
+    )
+    genie3_adv = st.expander("Genie3 advanced generation", expanded=False)
+    with genie3_adv:
+        genie3_direction_scale = st.number_input(
+            "direction_scale",
+            min_value=0.0,
+            max_value=2.0,
+            value=float(loaded_params.get("direction_scale") or 0.0),
+            step=0.1,
+            help="Repo default for binder design is 0.0.",
+            key=f"genie3_direction_scale_{source_key}",
+        )
+        genie3_compile = st.checkbox(
+            "Enable torch.compile",
+            value=bool(loaded_params.get("compile_generation", False)),
+            help="Genie3 beam-search examples enable this, but the app keeps it off by default for stable container runs.",
+            key=f"genie3_compile_{source_key}",
+        )
+        genie3_beam = st.checkbox(
+            "Use beam search",
+            value=bool(loaded_params.get("enable_beam_search", False)),
+            help="Adds Genie3 inference.search=beam and ColabFold reward. More expensive, but can improve quality.",
+            key=f"genie3_beam_{source_key}",
+        )
+        genie3_beam_width = st.number_input(
+            "Beam width",
+            min_value=1,
+            max_value=16,
+            value=int(loaded_params.get("beam_width") or 4),
+            step=1,
+            disabled=not genie3_beam,
+            key=f"genie3_beam_width_{source_key}",
+        )
+    if genie3_full_pipeline:
+        st.markdown("#### 2. Native Evaluation")
+        eval_cols = st.columns(4)
+        with eval_cols[0]:
+            genie3_num_seq = st.number_input(
+                "inverse_folding.num_seq",
+                min_value=1,
+                max_value=64,
+                value=int(loaded_params.get("inverse_folding_num_seq") or 1),
+                step=1,
+                help="Genie3 repo example default for binder design is 1.",
+                key=f"genie3_inverse_folding_num_seq_{source_key}",
+            )
+        with eval_cols[1]:
+            loaded_folding_model = str(loaded_params.get("folding_model_name") or "colabfold")
+            if loaded_folding_model not in {"colabfold", "boltz2"}:
+                loaded_folding_model = "colabfold"
+            genie3_folding_model = st.selectbox(
+                "folding.model_name",
+                ["colabfold", "boltz2"],
+                index=["colabfold", "boltz2"].index(loaded_folding_model),
+                help="Genie3's repo default is ColabFold. Use Boltz2 when the Genie3 container does not include colabfold_batch.",
+                key=f"genie3_folding_model_{source_key}",
+            )
+        with eval_cols[2]:
+            folding_mode_options = ["template", "msa"] if genie3_folding_model == "colabfold" else ["msa"]
+            loaded_folding_mode = str(loaded_params.get("folding_mode") or ("msa" if genie3_folding_model == "boltz2" else "template"))
+            if loaded_folding_mode not in folding_mode_options:
+                loaded_folding_mode = folding_mode_options[0]
+            genie3_folding_mode = st.selectbox(
+                "folding.mode",
+                folding_mode_options,
+                index=folding_mode_options.index(loaded_folding_mode),
+                help="Template mode is the Genie3/ColabFold repo default. Boltz2 evaluation uses MSA mode.",
+                key=f"genie3_folding_mode_{source_key}",
+            )
+        with eval_cols[3]:
+            genie3_num_models = st.number_input(
+                "folding.num_models",
+                min_value=1,
+                max_value=10,
+                value=int(loaded_params.get("folding_num_models") or 5),
+                step=1,
+                key=f"genie3_folding_num_models_{source_key}",
+            )
+        genie3_num_recycles = st.number_input(
+            "folding.num_recycles",
+            min_value=1,
+            max_value=50,
+            value=int(loaded_params.get("folding_num_recycles") or 20),
+            step=1,
+            key=f"genie3_folding_num_recycles_{source_key}",
+        )
+    else:
+        genie3_num_seq = 1
+        genie3_folding_model = "colabfold"
+        genie3_folding_mode = "template"
+        genie3_num_models = 5
+        genie3_num_recycles = 20
     _tool_payload_expander(
         "Genie3",
         {
             "docker_image": "mnprot-genie3-cu128:latest",
-            "contract": "smoke_tests/genie3_pdl1_binder_smoke.yaml",
-            "command_args": {
-                "config": "/work/config/genie3_pdl1_binder_smoke.yaml",
-                "num_devices": 1,
-                "verbose": True,
+            "command": "genie3 run" if genie3_full_pipeline else "genie3 generate",
+            "experiment_yaml": "artifacts/raw/genie3/experiment.yaml",
+            "dataset": "artifacts/raw/genie3/dataset/mn_app",
+            "generation": {
+                "source": "target",
+                "n_sample": int(genie3_num_designs),
+                "cond_strategy": genie3_cond_strategy,
+                "direction_scale": float(genie3_direction_scale),
+                "beam_search": bool(genie3_beam),
             },
-            "note": "The current Genie3 adapter does not yet convert the selected custom target into a Genie3 dataset item.",
+            "evaluation": {
+                "version": "binder",
+                "inverse_folding.num_seq": int(genie3_num_seq),
+                "folding.model_name": genie3_folding_model,
+                "folding.mode": genie3_folding_mode,
+                "folding.num_models": int(genie3_num_models),
+                "folding.num_recycles": int(genie3_num_recycles),
+            } if genie3_full_pipeline else None,
+            "target": {
+                "chains": target_chains,
+                "hotspots": hotspots,
+                "binder_length": binder_length,
+            },
         },
     )
-    if st.button("Run Genie3 contract", type="primary"):
+    genie3_run_label = "Run Genie3 full vanilla pipeline" if genie3_full_pipeline else "Run Genie3 generation"
+    if st.button(genie3_run_label, type="primary", disabled=not target_chains):
         try:
             with st.spinner("Running Genie3..."):
-                run_dir = run_genie3(int(genie3_num_designs))
+                run_dir = run_genie3(
+                    target_pdb=target_pdb,
+                    target_chains=target_chains,
+                    binder_length=binder_length,
+                    hotspots=hotspots,
+                    campaign_name=campaign_name,
+                    num_designs=int(genie3_num_designs),
+                    seed=int(genie3_seed),
+                    num_devices=int(genie3_num_devices),
+                    direction_scale=float(genie3_direction_scale),
+                    cond_strategy=genie3_cond_strategy,
+                    inverse_folding_num_seq=int(genie3_num_seq),
+                    folding_model_name=genie3_folding_model,
+                    folding_mode=genie3_folding_mode,
+                    folding_num_models=int(genie3_num_models),
+                    folding_num_recycles=int(genie3_num_recycles),
+                    compile_generation=bool(genie3_compile),
+                    run_mode=str(genie3_mode or "full_vanilla_pipeline"),
+                    enable_beam_search=bool(genie3_beam),
+                    beam_width=int(genie3_beam_width),
+                )
             st.success("Genie3 job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
         except Exception as exc:
             st.error(str(exc))
 
-with protpardelle_tab:
-    st.caption("Current adapter uses the bundled Protpardelle-1c PDL1 motif contract.")
-    settings_cols = st.columns(2)
-    with settings_cols[0]:
-        protpardelle_num_designs = st.number_input("Candidates", 1, 100, int(num_candidates), key=f"protpardelle_num_designs_{source_key}")
-    with settings_cols[1]:
-        protpardelle_seed = st.number_input("Seed", 0, 999999, int(loaded_params.get("seed") or 7), key=f"protpardelle_seed_{source_key}")
+with esm_tab:
+    st.caption(
+        "Experimental local ESMFold2 screening loop. It folds target+binder sequence proposals and ranks them by "
+        "ESMFold2 confidence and hotspot/interface geometry. This is not Biohub's unreleased ESMFold2 inversion protocol."
+    )
+    st.subheader("ESMFold2 Binder Screening")
+    esm_cols = st.columns(4)
+    with esm_cols[0]:
+        esm_num_designs = st.number_input(
+            "Sequence proposals",
+            1,
+            100,
+            int(loaded_params.get("num_designs") or min(max(int(num_candidates), 1), 8)),
+            key=f"esm_num_designs_{source_key}",
+            help="If no sequences are pasted below, the workflow samples this many simple soluble sequence proposals.",
+        )
+    with esm_cols[1]:
+        esm_num_steps = st.number_input(
+            "Sampling steps",
+            1,
+            200,
+            int(loaded_params.get("num_sampling_steps") or 32),
+            key=f"esm_num_sampling_steps_{source_key}",
+        )
+    with esm_cols[2]:
+        esm_num_loops = st.number_input(
+            "Recycling loops",
+            1,
+            10,
+            int(loaded_params.get("num_loops") or 3),
+            key=f"esm_num_loops_{source_key}",
+        )
+    with esm_cols[3]:
+        esm_seed = st.number_input(
+            "Seed",
+            0,
+            999999,
+            int(loaded_params.get("seed") or 11),
+            key=f"esm_seed_{source_key}",
+        )
+    esm_binder_sequences = st.text_area(
+        "Optional binder sequences",
+        value=str(loaded_params.get("binder_sequences_text") or ""),
+        placeholder="Paste FASTA or one sequence per line. Leave empty to sample simple sequence proposals.",
+        height=140,
+        key=f"esm_binder_sequences_{source_key}",
+    )
+    esm_device = st.selectbox(
+        "Device",
+        ["auto", "cuda", "cpu"],
+        index=["auto", "cuda", "cpu"].index(str(loaded_params.get("device") or "auto"))
+        if str(loaded_params.get("device") or "auto") in {"auto", "cuda", "cpu"}
+        else 0,
+        key=f"esm_device_{source_key}",
+        help="ESMFold2 is GPU-oriented. CPU is mainly useful for import/debug checks.",
+    )
+    esm_contact_cutoff = st.number_input(
+        "Contact cutoff",
+        min_value=3.0,
+        max_value=20.0,
+        value=float(loaded_params.get("contact_cutoff") or 8.0),
+        step=0.5,
+        key=f"esm_contact_cutoff_{source_key}",
+    )
     _tool_payload_expander(
-        "Protpardelle-1c",
+        "ESMFold2 experimental payload",
         {
-            "docker_image": "mnprot-protpardelle-1c-cu128:latest",
-            "contract": "smoke_tests/protpardelle_pdl1_smoke.yaml",
-            "command_args": {
-                "config": "/work/config/protpardelle_pdl1_smoke.yaml",
-                "motif_dir": "/opt/protpardelle-1c/examples/motifs/bindcraft",
-                "num_samples": int(protpardelle_num_designs),
-                "num_mpnn_seqs": 0,
-                "batch_size": 1,
-                "seed": int(protpardelle_seed),
+            "model_dir": str(esm_binder_workflow.ESMFOLD2_MODEL_DIR),
+            "target": {
+                "pdb": str(target_pdb),
+                "chains": target_chains,
+                "hotspots": hotspots,
+            },
+            "binder": {
+                "length": binder_length,
+                "num_designs": int(esm_num_designs),
+                "uses_pasted_sequences": bool(esm_binder_sequences.strip()),
+            },
+            "folding": {
+                "num_sampling_steps": int(esm_num_steps),
+                "num_loops": int(esm_num_loops),
+                "device": esm_device,
             },
         },
     )
-    if st.button("Run Protpardelle-1c contract", type="primary"):
+    if st.button("Run ESMFold2 experimental screening", type="primary", disabled=not target_chains):
+        try:
+            with st.spinner("Running ESMFold2 screening..."):
+                run_dir = run_esmfold2_binder_screening(
+                    target_pdb=target_pdb,
+                    target_chains=target_chains,
+                    hotspots=hotspots,
+                    binder_length=binder_length,
+                    num_designs=int(esm_num_designs),
+                    binder_sequences_text=esm_binder_sequences,
+                    campaign_name=campaign_name,
+                    num_loops=int(esm_num_loops),
+                    num_sampling_steps=int(esm_num_steps),
+                    seed=int(esm_seed),
+                    device=esm_device,
+                    contact_cutoff=float(esm_contact_cutoff),
+                )
+            st.success("ESMFold2 screening job finished.")
+            st.link_button("Open result", result_link("design", run_dir.name))
+        except Exception as exc:
+            st.error(str(exc))
+
+with protpardelle_tab:
+    st.caption(
+        "Native Protpardelle-1c binder-generation workflow. The app writes a target motif PDB, "
+        "maps hotspots into Protpardelle numbering, runs scaffold generation, then runs ProteinMPNN "
+        "and ESMFold self-consistency inside the tool."
+    )
+    st.subheader("Protpardelle-1c Generation")
+    protpardelle_cols = st.columns(4)
+    with protpardelle_cols[0]:
+        protpardelle_num_designs = st.number_input(
+            "Design attempts",
+            1,
+            1000,
+            int(loaded_params.get("num_designs") or max(int(num_candidates), 100)),
+            key=f"protpardelle_num_designs_{source_key}",
+            help="Protpardelle's BindCraft benchmark uses 100 backbone attempts. Small 10-design runs are useful for smoke tests but can easily produce no acceptable designs.",
+        )
+    with protpardelle_cols[1]:
+        protpardelle_num_mpnn = st.number_input(
+            "MPNN sequences per design",
+            0,
+            100,
+            int(loaded_params.get("num_mpnn_seqs") or 2),
+            key=f"protpardelle_num_mpnn_{source_key}",
+            help="The native Protpardelle BindCraft benchmark uses 2 MPNN sequences per backbone.",
+        )
+    with protpardelle_cols[2]:
+        protpardelle_batch_size = st.number_input(
+            "Sampling batch size",
+            1,
+            128,
+            int(loaded_params.get("batch_size") or 1),
+            key=f"protpardelle_batch_size_{source_key}",
+        )
+    with protpardelle_cols[3]:
+        protpardelle_seed = st.number_input(
+            "Seed",
+            0,
+            999999,
+            int(loaded_params.get("seed") or 7),
+            key=f"protpardelle_seed_{source_key}",
+        )
+    preset_options = {
+        "binder_generation": {
+            "label": "Binder generation cc83 epoch 2616",
+            "model_name": "cc83",
+            "model_epoch": "2616",
+            "sampling_config": "sampling_sidechain_conditional",
+        },
+        "binder_generation_cc95": {
+            "label": "Binder generation cc95 epoch 3490",
+            "model_name": "cc95",
+            "model_epoch": "3490",
+            "sampling_config": "sampling_sidechain_conditional",
+        },
+    }
+    current_preset_key = "binder_generation_cc95" if str(loaded_params.get("model_name")) == "cc95" else "binder_generation"
+    preset_key = st.selectbox(
+        "Model preset",
+        list(preset_options),
+        index=list(preset_options).index(current_preset_key),
+        format_func=lambda key: preset_options[key]["label"],
+        key=f"protpardelle_model_preset_{source_key}",
+    )
+    preset = preset_options[preset_key]
+    advanced = st.expander("Advanced Protpardelle sampling parameters")
+    with advanced:
+        adv_cols = st.columns(3)
+        with adv_cols[0]:
+            protpardelle_step_scale = st.number_input(
+                "step_scale",
+                0.1,
+                5.0,
+                float(loaded_params.get("step_scale") or 1.2),
+                step=0.1,
+                key=f"protpardelle_step_scale_{source_key}",
+            )
+        with adv_cols[1]:
+            protpardelle_schurn = st.number_input(
+                "schurn",
+                0,
+                1000,
+                int(loaded_params.get("schurn") or 200),
+                key=f"protpardelle_schurn_{source_key}",
+            )
+        with adv_cols[2]:
+            protpardelle_crop_cond_start = st.number_input(
+                "crop_cond_start",
+                0.0,
+                1.0,
+                float(loaded_params.get("crop_cond_start") or 0.0),
+                step=0.05,
+                key=f"protpardelle_crop_cond_start_{source_key}",
+            )
+    lengths = design_workflow.parse_binder_lengths(binder_length)
+    binder_range = [lengths[0], lengths[0]] if len(lengths) == 1 else [lengths[0], lengths[1]]
+    protpardelle_preview = {
+        "docker_image": "mnprot-protpardelle-1c-cu128:latest",
+        "reference_mount": "/mnt/db/reference_files/protpardelle-1c:/ref/protpardelle-1c:ro",
+        "target_chains": target_chains,
+        "hotspots_original_numbering": hotspots,
+        "generated_inputs": {
+            "motif_pdb": "artifacts/raw/protpardelle_1c/input/motifs/mn_app_target.pdb",
+            "sampling_yaml": "artifacts/raw/protpardelle_1c/input/protpardelle_sampling.yaml",
+        },
+        "command_args": {
+            "model": [
+                preset["model_name"],
+                preset["model_epoch"],
+                preset["sampling_config"],
+            ],
+            "num_samples": int(protpardelle_num_designs),
+            "num_mpnn_seqs": int(protpardelle_num_mpnn),
+            "batch_size": int(protpardelle_batch_size),
+            "binder_length_range": binder_range,
+            "step_scale": float(protpardelle_step_scale),
+            "schurn": int(protpardelle_schurn),
+            "crop_cond_start": float(protpardelle_crop_cond_start),
+            "seed": int(protpardelle_seed),
+        },
+    }
+    _tool_payload_expander(
+        "Protpardelle-1c payload sent to algorithm",
+        protpardelle_preview,
+    )
+    if st.button("Run Protpardelle-1c native pipeline", type="primary", disabled=not target_chains):
         try:
             with st.spinner("Running Protpardelle-1c..."):
-                run_dir = run_protpardelle_1c(int(protpardelle_num_designs), int(protpardelle_seed))
+                run_dir = run_protpardelle_1c(
+                    target_pdb=target_pdb,
+                    target_chains=target_chains,
+                    binder_length=binder_length,
+                    hotspots=hotspots,
+                    campaign_name=campaign_name,
+                    num_designs=int(protpardelle_num_designs),
+                    num_mpnn_seqs=int(protpardelle_num_mpnn),
+                    model_name=preset["model_name"],
+                    model_epoch=preset["model_epoch"],
+                    sampling_config=preset["sampling_config"],
+                    step_scale=float(protpardelle_step_scale),
+                    schurn=int(protpardelle_schurn),
+                    crop_cond_start=float(protpardelle_crop_cond_start),
+                    batch_size=int(protpardelle_batch_size),
+                    seed=int(protpardelle_seed),
+                )
             st.success("Protpardelle-1c job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
         except Exception as exc:
             st.error(str(exc))
 
 with complexa_tab:
-    st.caption("Current adapter uses the bundled Proteina-Complexa PDL1 search_binder_local_pipeline contract.")
-    settings_cols = st.columns(3)
-    with settings_cols[0]:
-        complexa_run_name = st.text_input("Run name", value=str(loaded_params.get("run_name") or "mn_app_complexa"), key=f"complexa_run_name_{source_key}")
-    with settings_cols[1]:
-        complexa_steps = st.number_input("Generation steps", 1, 1000, int(loaded_params.get("n_steps") or 20), key=f"complexa_steps_{source_key}")
-    with settings_cols[2]:
-        complexa_replicas = st.number_input("Best-of-N replicas", 1, 100, int(loaded_params.get("replicas") or 2), key=f"complexa_replicas_{source_key}")
+    st.caption("Native Proteina-Complexa binder pipeline. Target chains, hotspots, and binder length come from the selected prepared structure.")
+    complexa_cols = st.columns(4)
+    with complexa_cols[0]:
+        complexa_steps = st.number_input(
+            "Generation steps",
+            1,
+            1000,
+            int(loaded_params.get("n_steps") or 400),
+            key=f"complexa_steps_{source_key}",
+        )
+    with complexa_cols[1]:
+        complexa_replicas = st.number_input(
+            "Best-of-N replicas",
+            1,
+            100,
+            int(loaded_params.get("replicas") or 2),
+            key=f"complexa_replicas_{source_key}",
+        )
+    with complexa_cols[2]:
+        complexa_seed = st.number_input(
+            "Seed",
+            0,
+            999999,
+            int(loaded_params.get("seed") or 5),
+            key=f"complexa_seed_{source_key}",
+        )
+    with complexa_cols[3]:
+        complexa_batch_size = st.number_input(
+            "GPU batch size",
+            1,
+            16,
+            int(loaded_params.get("batch_size") or 1),
+            help="Lower values are slower but avoid CUDA out-of-memory during best-of-N generation.",
+            key=f"complexa_batch_size_{source_key}",
+        )
+    complexa_lengths = design_workflow.parse_binder_lengths(binder_length)
+    complexa_length_range = (
+        [complexa_lengths[0], complexa_lengths[0]]
+        if len(complexa_lengths) == 1
+        else [complexa_lengths[0], complexa_lengths[1]]
+    )
+    complexa_target_input = design_workflow._target_input_spec(target_pdb, target_chains)
+    complexa_hotspot_list = [token for token in hotspots.split(",") if token]
     _tool_payload_expander(
         "Proteina-Complexa",
         {
             "docker_image": "ovoex-proteina-complexa:latest",
-            "contract": "configs/search_binder_local_pipeline.yaml with task 02_PDL1",
-            "stages": ["generate", "filter", "evaluate", "analyze"],
+            "contract": "configs/search_binder_local_pipeline.yaml",
+            "stages": ["design"],
             "command_args": {
-                "run_name": complexa_run_name,
-                "generation.task_name": "02_PDL1",
-                "generation.dataloader.dataset.nres.nsamples": 1,
+                "run_name": campaign_name or "mn_app_complexa",
+                "generation.task_name": "MN_APP_TARGET",
+                "generation.target_dict_cfg.MN_APP_TARGET.target_path": "/work/artifacts/raw/proteina_complexa/input/target.pdb",
+                "generation.target_dict_cfg.MN_APP_TARGET.target_input": complexa_target_input,
+                "generation.target_dict_cfg.MN_APP_TARGET.hotspot_residues": complexa_hotspot_list,
+                "generation.target_dict_cfg.MN_APP_TARGET.binder_length": complexa_length_range,
+                "generation.dataloader.dataset.nres.nsamples": int(num_candidates),
+                "generation.dataloader.batch_size": int(complexa_batch_size),
+                "generation.search.max_batch_size": int(complexa_batch_size),
                 "generation.search.best_of_n.replicas": int(complexa_replicas),
                 "generation.args.nsteps": int(complexa_steps),
+                "seed": int(complexa_seed),
                 "ckpt_name": "complexa.ckpt",
                 "autoencoder_ckpt_path": "/workspace/protein-foundation-models/ckpts/complexa_ae.ckpt",
             },
         },
     )
-    if st.button("Run Proteina-Complexa contract", type="primary"):
+    if st.button("Run Proteina-Complexa vanilla pipeline", type="primary"):
         try:
             with st.spinner("Running Proteina-Complexa..."):
-                run_dir = run_proteina_complexa(str(complexa_run_name), int(complexa_steps), int(complexa_replicas))
+                run_dir = run_proteina_complexa(
+                    target_pdb=target_pdb,
+                    target_chains=target_chains,
+                    binder_length=binder_length,
+                    hotspots=hotspots,
+                    campaign_name=campaign_name,
+                    num_designs=int(num_candidates),
+                    n_steps=int(complexa_steps),
+                    replicas=int(complexa_replicas),
+                    seed=int(complexa_seed),
+                    batch_size=int(complexa_batch_size),
+                )
             st.success("Proteina-Complexa job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
         except Exception as exc:

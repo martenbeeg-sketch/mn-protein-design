@@ -17,7 +17,7 @@ from mn_protein_design.core.candidates import (
     write_candidates,
 )
 from mn_protein_design.core.hotspot_metrics import calculate_hotspot_metrics
-from mn_protein_design.core.jobs import create_job, finish_job, update_status, write_json
+from mn_protein_design.core.jobs import create_job, finish_job, read_json, update_status, write_json
 
 
 ANALYSIS_GROUP = "analysis"
@@ -711,7 +711,16 @@ def _run_ipsae(source_run_dir: Path, run_dir: Path, candidates: list[dict[str, A
                 target_chain=target_chain,
                 dist_cutoff=dist_cutoff,
             )
-            candidate["metrics"] = {**dict(candidate.get("metrics") or {}), **pae_metrics, **row_metrics, **summary_metrics}
+            merged_metrics = dict(candidate.get("metrics") or {})
+            for metric_block in [pae_metrics, row_metrics, summary_metrics]:
+                merged_metrics.update(
+                    {
+                        key: value
+                        for key, value in metric_block.items()
+                        if value is not None
+                    }
+                )
+            candidate["metrics"] = merged_metrics
         by_id[str(candidate.get("candidate_id"))] = candidate
     return enhanced
 
@@ -878,6 +887,7 @@ def run_analysis_contract(
 ) -> Path:
     source_run_dir = Path(source_run_dir)
     candidates_jsonl = Path(candidates_jsonl)
+    source_metadata = read_json(source_run_dir / "metadata.json")
     source_candidates = [
         candidate
         for candidate in read_candidates(candidates_jsonl)
@@ -893,6 +903,14 @@ def run_analysis_contract(
         inputs={"source_run_dir": str(source_run_dir), "candidates_jsonl": str(candidates_jsonl)},
         params={"keep_top_n": keep_top_n, "thresholds": {**DEFAULT_THRESHOLDS, **(thresholds or {})}, "backend": "internal"},
     )
+    inherited_metadata = {
+        "campaign_name": source_metadata.get("campaign_name") or "",
+        "campaign_id": source_metadata.get("campaign_id") or source_metadata.get("run_id") or "",
+        "upstream_task_group": source_metadata.get("task_group") or source_run_dir.parent.name,
+        "upstream_run_id": source_metadata.get("run_id") or source_run_dir.name,
+        "upstream_job_code": source_metadata.get("job_code") or "",
+    }
+    write_json(job.run_dir / "metadata.json", {**read_json(job.run_dir / "metadata.json"), **inherited_metadata})
     write_json(
         job.run_dir / "command.json",
         {

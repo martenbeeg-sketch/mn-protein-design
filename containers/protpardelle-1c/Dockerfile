@@ -15,6 +15,11 @@ RUN apt-get update \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
+RUN wget -q https://mmseqs.com/foldseek/foldseek-linux-gpu.tar.gz \
+    && tar -xzf foldseek-linux-gpu.tar.gz -C /opt \
+    && rm foldseek-linux-gpu.tar.gz \
+    && ln -sf /opt/foldseek/bin/foldseek /usr/local/bin/foldseek
+
 COPY tools_to_implement/protpardelle-1c/ /opt/protpardelle-1c/
 
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
@@ -29,6 +34,7 @@ ENV PROJECT_ROOT_DIR=/opt/protpardelle-1c \
     PROTEINMPNN_WEIGHTS=/ref/protpardelle-1c/model_params/ProteinMPNN/vanilla_model_weights \
     LIGANDMPNN_WEIGHTS=/ref/protpardelle-1c/model_params/LigandMPNN \
     PROTPARDELLE_OUTPUT_DIR=/work/output \
+    FOLDSEEK_BIN=/opt/foldseek/bin/foldseek \
     HF_HOME=/ref/protpardelle-1c/hf-cache \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
