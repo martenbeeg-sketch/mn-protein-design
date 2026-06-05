@@ -42,7 +42,7 @@ def run_worker_job(run_dir: Path) -> int:
         raise RuntimeError(f"No worker_request.json found for {run_dir}")
 
     try:
-        if kind == "de_novo_binder_scoring_dataset":
+        if kind in {"de_novo_binder_scoring_dataset", "candidate_refolding_evaluation"}:
             from mn_protein_design.workflows.benchmark import run_de_novo_binder_scoring_dataset
 
             kwargs = _restore_worker_kwargs(request)

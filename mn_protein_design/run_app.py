@@ -37,6 +37,7 @@ def main() -> None:
                 _page(package_root, "app/pages/target_cropping.py", "Target Cropping", "target-cropping"),
                 _page(package_root, "app/pages/design.py", "Design", "design"),
                 _page(package_root, "app/pages/sequence_design.py", "Sequence Design", "sequence-design"),
+                _page(package_root, "app/pages/candidate_sets.py", "Candidate Sets", "candidate-sets"),
                 _page(package_root, "app/pages/refolding.py", "Refolding / Validation", "refolding-validation"),
                 _page(package_root, "app/pages/analysis.py", "Analysis", "analysis"),
                 _page(package_root, "app/pages/benchmark.py", "Binder Benchmark", "binder-benchmark"),

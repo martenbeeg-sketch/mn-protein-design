@@ -11,7 +11,9 @@ from mn_protein_design.core.candidates import (
     STAGE_GENERATION_BACKBONE_SEQUENCE,
     STAGE_SEQUENCE_DESIGN,
 )
+from mn_protein_design.core.local_worker import spawn_worker_for_run
 from mn_protein_design.core.jobs import read_json
+from mn_protein_design.workflows import benchmark as benchmark_workflow
 from mn_protein_design.workflows import refolding as refolding_workflow
 from mn_protein_design.workflows.modules import candidate_sources, load_source_candidates
 
@@ -58,6 +60,201 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
 )
+
+st.subheader("Engine Refolding / Evaluation")
+st.caption(
+    "Run selected prediction engines on this candidate set, then calculate the same shared interface, Rosetta, "
+    "PyMOL, and structure-viewer outputs used by Binder Benchmark. No binder/nonbinder labels are required."
+)
+
+eval_name = st.text_input(
+    "Evaluation name",
+    value=f"{source['job_code']} refolding evaluation",
+    key="refolding_eval_name",
+)
+eval_max_candidates = st.number_input(
+    "Max candidates",
+    min_value=0,
+    max_value=max(1, int(source["candidate_count"])),
+    value=0,
+    step=1,
+    help="0 means all candidates from this set.",
+    key="refolding_eval_max_candidates",
+)
+if int(eval_max_candidates or 0) == 0:
+    st.info(f"All {int(source['candidate_count'])} candidates will be evaluated.")
+
+engine_cols = st.columns(4)
+with engine_cols[0]:
+    eval_run_af3 = st.checkbox("AlphaFast AF3", value=True, key="refolding_eval_run_af3")
+    eval_run_colab = st.checkbox("ColabFold", value=True, key="refolding_eval_run_colab")
+with engine_cols[1]:
+    eval_run_af2 = st.checkbox("AF2 initial guess", value=True, key="refolding_eval_run_af2")
+    eval_run_boltz2 = st.checkbox("Boltz-2", value=True, key="refolding_eval_run_boltz2")
+with engine_cols[2]:
+    eval_run_esmfold2 = st.checkbox("ESMFold2", value=True, key="refolding_eval_run_esmfold2")
+    eval_run_rf3 = st.checkbox("RF3", value=False, key="refolding_eval_run_rf3")
+with engine_cols[3]:
+    eval_run_protenix = st.checkbox("Protenix", value=False, key="refolding_eval_run_protenix")
+    eval_run_boltzgen = st.checkbox("BoltzGen Fold", value=False, key="refolding_eval_run_boltzgen")
+
+metric_cols = st.columns(4)
+with metric_cols[0]:
+    eval_common = st.checkbox("Shared PAE/interface metrics", value=True, key="refolding_eval_common_metrics")
+with metric_cols[1]:
+    eval_rosetta = st.checkbox("Rosetta metrics", value=True, key="refolding_eval_rosetta_metrics")
+with metric_cols[2]:
+    eval_pymol = st.checkbox("PyMOL metrics", value=True, key="refolding_eval_pymol_metrics")
+with metric_cols[3]:
+    eval_rosetta_cores = st.number_input(
+        "Rosetta cores",
+        min_value=1,
+        max_value=64,
+        value=32,
+        step=1,
+        key="refolding_eval_rosetta_cores",
+    )
+
+with st.expander("Engine defaults", expanded=False):
+    compute_cols = st.columns(3)
+    with compute_cols[0]:
+        eval_gpu = st.number_input("GPU device", min_value=0, max_value=16, value=0, step=1, key="refolding_eval_gpu")
+    with compute_cols[1]:
+        eval_msa_source = st.segmented_control(
+            "MSA source",
+            ["msa_repository_then_alphafast_mmseqs_gpu", "msa_repository", "alphafast_mmseqs_gpu", "repo_run_csv"],
+            selection_mode="single",
+            default="msa_repository_then_alphafast_mmseqs_gpu",
+            format_func={
+                "msa_repository_then_alphafast_mmseqs_gpu": "MSA repository, then AlphaFast",
+                "msa_repository": "MSA repository only",
+                "alphafast_mmseqs_gpu": "AlphaFast MMseqs GPU",
+                "repo_run_csv": "Existing run.csv paths",
+            }.get,
+            key="refolding_eval_msa_source",
+        )
+    with compute_cols[2]:
+        eval_models = st.multiselect(
+            "Model-input preparation",
+            ["af3", "boltz", "colabfold"],
+            default=["af3", "boltz", "colabfold"],
+            key="refolding_eval_models",
+        )
+    path_cols = st.columns(4)
+    with path_cols[0]:
+        eval_msa_repository = st.text_input(
+            "MSA repository",
+            value=str(benchmark_workflow.MSA_REPOSITORY_DIR),
+            key="refolding_eval_msa_repository",
+        )
+    with path_cols[1]:
+        eval_alphafast_db = st.text_input(
+            "MMseqs alignment DB",
+            value=str(benchmark_workflow.ALPHAFAST_DB_DIR),
+            key="refolding_eval_alphafast_db",
+        )
+    with path_cols[2]:
+        eval_alphafast_weights = st.text_input(
+            "AF3 weights",
+            value=str(benchmark_workflow.ALPHAFAST_WEIGHTS_DIR),
+            key="refolding_eval_alphafast_weights",
+        )
+    with path_cols[3]:
+        eval_colab_cache = st.text_input(
+            "AF2/ColabFold model cache",
+            value=str(benchmark_workflow.COLABFOLD_CACHE_DIR),
+            key="refolding_eval_colab_cache",
+        )
+    af_cols = st.columns(4)
+    with af_cols[0]:
+        eval_af3_recycles = st.number_input("AF3 recycles", min_value=1, max_value=48, value=10, step=1, key="refolding_eval_af3_recycles")
+    with af_cols[1]:
+        eval_af2_recycles = st.number_input("AF2-IG recycles", min_value=1, max_value=48, value=3, step=1, key="refolding_eval_af2_recycles")
+    with af_cols[2]:
+        eval_colab_recycles = st.number_input("ColabFold recycles", min_value=1, max_value=48, value=3, step=1, key="refolding_eval_colab_recycles")
+    with af_cols[3]:
+        eval_colab_models = st.number_input("ColabFold models", min_value=1, max_value=5, value=3, step=1, key="refolding_eval_colab_models")
+    boltz_cols = st.columns(5)
+    with boltz_cols[0]:
+        eval_boltz_target_template = st.checkbox("Boltz-2 target template", value=True, key="refolding_eval_boltz_template")
+    with boltz_cols[1]:
+        eval_boltz_target_msa = st.checkbox("Boltz-2 target MSAs", value=True, key="refolding_eval_boltz_msa")
+    with boltz_cols[2]:
+        eval_boltz_recycles = st.number_input("Boltz-2 recycles", min_value=1, max_value=48, value=10, step=1, key="refolding_eval_boltz_recycles")
+    with boltz_cols[3]:
+        eval_boltz_sampling = st.number_input("Boltz-2 sampling", min_value=1, max_value=1000, value=200, step=1, key="refolding_eval_boltz_sampling")
+    with boltz_cols[4]:
+        eval_boltz_samples = st.number_input("Boltz-2 samples", min_value=1, max_value=20, value=3, step=1, key="refolding_eval_boltz_samples")
+    esm_cols_eval = st.columns(4)
+    with esm_cols_eval[0]:
+        eval_esm_modes = st.multiselect("ESMFold2 modes", ["initial_guess", "sequence"], default=["initial_guess"], key="refolding_eval_esm_modes")
+    with esm_cols_eval[1]:
+        eval_esm_msa = st.checkbox("ESMFold2 target MSAs", value=False, key="refolding_eval_esm_msa")
+    with esm_cols_eval[2]:
+        eval_esm_steps = st.number_input("ESMFold2 sampling", min_value=1, max_value=256, value=32, step=1, key="refolding_eval_esm_steps")
+    with esm_cols_eval[3]:
+        eval_esm_loops = st.number_input("ESMFold2 recycles", min_value=1, max_value=16, value=3, step=1, key="refolding_eval_esm_loops")
+    new_cols = st.columns(4)
+    with new_cols[0]:
+        eval_rf3_checkpoint = st.text_input("RF3 checkpoint", value=str(refolding_workflow.RF3_CHECKPOINT), key="refolding_eval_rf3_checkpoint")
+    with new_cols[1]:
+        eval_rf3_msa = st.checkbox("RF3 target MSAs", value=True, key="refolding_eval_rf3_msa")
+    with new_cols[2]:
+        eval_protenix_msa = st.checkbox("Protenix target MSAs", value=True, key="refolding_eval_protenix_msa")
+    with new_cols[3]:
+        eval_colab_templates = st.checkbox("ColabFold target templates", value=True, key="refolding_eval_colab_templates")
+
+if st.button("Run refolding evaluation", type="primary", key="run_refolding_engine_evaluation"):
+    try:
+        run_dir = benchmark_workflow.enqueue_candidate_refolding_evaluation(
+            source_run_dir=Path(str(source["run_dir"])),
+            candidates_jsonl=Path(str(source["candidates_jsonl"])),
+            max_candidates=int(eval_max_candidates or 0),
+            evaluation_name=str(eval_name or "Refolding evaluation"),
+            models=list(eval_models or []),
+            run_common_interface_metrics=bool(eval_common),
+            run_predicted_rosetta_metrics=bool(eval_rosetta),
+            run_pymol_metrics=bool(eval_pymol),
+            pyrosetta_nprocs=int(eval_rosetta_cores),
+            run_alphafast_af3=bool(eval_run_af3),
+            run_colabfold=bool(eval_run_colab),
+            run_af2_initial_guess=bool(eval_run_af2),
+            run_boltz2_initial_guess=bool(eval_run_boltz2),
+            run_esmfold2=bool(eval_run_esmfold2),
+            run_rf3=bool(eval_run_rf3),
+            run_protenix=bool(eval_run_protenix),
+            run_boltzgen_fold=bool(eval_run_boltzgen),
+            colabfold_msa_source=str(eval_msa_source),
+            msa_repository_dir=Path(str(eval_msa_repository)),
+            alphafast_db_dir=Path(str(eval_alphafast_db)),
+            alphafast_weights_dir=Path(str(eval_alphafast_weights)),
+            colabfold_cache_dir=Path(str(eval_colab_cache)),
+            alphafast_num_recycles=int(eval_af3_recycles),
+            alphafast_gpu_device=int(eval_gpu),
+            af2_num_recycles=int(eval_af2_recycles),
+            colabfold_num_recycles=int(eval_colab_recycles),
+            colabfold_num_models=int(eval_colab_models),
+            colabfold_gpu_device=int(eval_gpu),
+            colabfold_use_target_templates=bool(eval_colab_templates),
+            boltz2_use_target_template=bool(eval_boltz_target_template),
+            boltz2_use_target_msa=bool(eval_boltz_target_msa),
+            boltz2_recycling_steps=int(eval_boltz_recycles),
+            boltz2_sampling_steps=int(eval_boltz_sampling),
+            boltz2_diffusion_samples=int(eval_boltz_samples),
+            boltz2_write_full_pae=True,
+            esmfold2_modes=list(eval_esm_modes or ["initial_guess"]),
+            esmfold2_use_target_msa=bool(eval_esm_msa),
+            num_sampling_steps=int(eval_esm_steps),
+            num_loops=int(eval_esm_loops),
+            rf3_checkpoint_path=Path(str(eval_rf3_checkpoint)),
+            rf3_use_target_msa=bool(eval_rf3_msa),
+            protenix_use_msa=bool(eval_protenix_msa),
+        )
+        spawn_worker_for_run(run_dir)
+        st.success("Refolding evaluation queued. It will keep running independently of Streamlit.")
+        show_pipeline_links(run_dir, [run_dir])
+    except Exception as exc:
+        st.error(str(exc))
 
 st.subheader("ESMFold2 Complex Validation")
 st.caption(

@@ -15,6 +15,8 @@ import streamlit.components.v1 as components
 from mn_protein_design.app.components.molstar_viewer import StructureVisualization, molstar_custom_component
 from mn_protein_design.app.pages.common import show_contract_files
 from mn_protein_design.core.artifacts import build_run_zip
+from mn_protein_design.core.benchmark_presets import load_feature_presets, save_feature_preset
+from mn_protein_design.core.candidates import candidate_stage_counts, read_candidates
 from mn_protein_design.core.jobs import get_run_dir, read_json
 from mn_protein_design.core.runtime_estimator import ENGINE_LABELS, format_duration
 
@@ -309,7 +311,7 @@ def _show_benchmark_collection_notice(benchmark_dir: Path) -> None:
             st.write("\n".join(f"- {line}" for line in source_lines))
 
 
-CLASS_COLOR_SCALE = alt.Scale(domain=["binder", "nonbinder"], range=["#D55E00", "#0072B2"])
+CLASS_COLOR_SCALE = alt.Scale(domain=["binder", "nonbinder", "candidate"], range=["#D55E00", "#0072B2", "#6B7280"])
 LINE_COLOR_SCALE = alt.Scale(domain=["precision", "recall"], range=["#009E73", "#CC79A7"])
 ENGINE_COLOR_DOMAIN = [
     "AF3",
@@ -914,6 +916,34 @@ def _show_best_engine_feature_rankings(benchmark_dir: Path) -> None:
         "negative_mean",
     ]
     st.dataframe(best[[col for col in show_cols if col in best.columns]], hide_index=True, width="stretch")
+    preset_cols = st.columns([3, 1])
+    with preset_cols[0]:
+        preset_name = st.text_input(
+            "Preset name",
+            value=f"{benchmark_dir.parents[1].name}_best_ap_per_engine",
+            key=f"{benchmark_dir.parents[1].name}_save_feature_preset_name",
+        )
+    with preset_cols[1]:
+        if st.button(
+            "Save ranking preset",
+            key=f"{benchmark_dir.parents[1].name}_save_feature_preset",
+            help="Store these best-AP engine features for ranking future refolding/evaluation runs.",
+        ):
+            preset_rows = [
+                {
+                    key: (None if pd.isna(value) else value)
+                    for key, value in row.items()
+                    if key in show_cols
+                }
+                for row in best.to_dict(orient="records")
+            ]
+            path = save_feature_preset(
+                name=preset_name,
+                source_run_dir=benchmark_dir.parents[1],
+                rows=preset_rows,
+                description="Best average-precision feature per engine from benchmark results.",
+            )
+            st.success(f"Saved preset: {path.name}")
     feature_choices = [f"{row.engine}: {row.feature}" for row in best.itertuples(index=False)]
     selected_choice = st.selectbox(
         "Rank graph feature",
@@ -956,6 +986,42 @@ def _best_rankable_features_by_engine(benchmark_dir: Path, metrics: pd.DataFrame
     return pd.DataFrame(rows).sort_values(["best_average_precision", "best_auroc"], ascending=[False, False]).reset_index(drop=True)
 
 
+def _preset_rankable_features(preset: dict[str, Any], metrics: pd.DataFrame) -> pd.DataFrame:
+    rows = list(preset.get("features") or [])
+    if not rows:
+        return pd.DataFrame()
+    ranking = pd.DataFrame(rows).copy()
+    if "feature" not in ranking.columns:
+        return pd.DataFrame()
+    if "engine" not in ranking.columns:
+        ranking["engine"] = ranking["feature"].map(_feature_engine)
+    if "category" not in ranking.columns:
+        ranking["category"] = ranking["feature"].map(_feature_category)
+    if "direction" not in ranking.columns:
+        ranking["direction"] = "higher"
+    for column in ["best_average_precision", "best_auroc"]:
+        if column in ranking.columns:
+            ranking[column] = pd.to_numeric(ranking[column], errors="coerce")
+        else:
+            ranking[column] = None
+    valid_engines = {engine for engine in ENGINE_COLOR_DOMAIN if engine not in {"Input", "Other", "Published metrics"}}
+    ranking = ranking[
+        ranking["feature"].astype(str).isin(set(metrics.columns))
+        & ranking["engine"].astype(str).isin(valid_engines)
+        & ranking["feature"].map(_is_informative_feature)
+    ].copy()
+    if ranking.empty:
+        return pd.DataFrame()
+    ranking["_sort_ap"] = pd.to_numeric(ranking["best_average_precision"], errors="coerce").fillna(-1.0)
+    ranking["_sort_auroc"] = pd.to_numeric(ranking["best_auroc"], errors="coerce").fillna(-1.0)
+    return (
+        ranking.sort_values(["_sort_ap", "_sort_auroc"], ascending=[False, False])
+        .drop(columns=["_sort_ap", "_sort_auroc"])
+        .drop_duplicates("engine")
+        .reset_index(drop=True)
+    )
+
+
 def _selected_design_from_altair_event(event: object) -> str | None:
     selection = getattr(event, "selection", None)
     if selection is None and isinstance(event, dict):
@@ -995,14 +1061,34 @@ def _ranked_design_selector(
 ) -> str | None:
     if metrics is None or metrics.empty or "binder_id" not in metrics.columns:
         return None
-    best_features = _best_rankable_features_by_engine(benchmark_dir, metrics)
-    if best_features.empty:
-        return None
     st.subheader("Design Ranking")
     st.caption(
         "Pick an engine-specific best-AP metric, then click a point or choose a ranked design. "
         "The structure matrix below updates to that design."
     )
+    current_best = _best_rankable_features_by_engine(benchmark_dir, metrics)
+    preset_options = load_feature_presets()
+    source_options: list[tuple[str, pd.DataFrame]] = []
+    if not current_best.empty:
+        source_options.append(("Current run best AP features", current_best))
+    for preset in preset_options:
+        preset_best = _preset_rankable_features(preset, metrics)
+        if not preset_best.empty:
+            name = str(preset.get("name") or Path(str(preset.get("_path") or "preset")).stem)
+            source_options.append((f"Preset: {name}", preset_best))
+    if not source_options:
+        return None
+    if len(source_options) > 1:
+        source_label = st.selectbox(
+            "Ranking preset",
+            [label for label, _features in source_options],
+            index=0 if not current_best.empty else 0,
+            key=f"{run_key}_benchmark_structure_rank_preset_v1",
+        )
+        best_features = dict(source_options)[source_label]
+    else:
+        source_label, best_features = source_options[0]
+        st.caption(f"Ranking source: {source_label}")
     choices = [f"{row.engine}: {row.feature}" for row in best_features.itertuples(index=False)]
     selected_choice = st.selectbox(
         "Rank designs by best AP metric",
@@ -1014,7 +1100,7 @@ def _ranked_design_selector(
     feature = str(selected_row["feature"])
     direction = str(selected_row.get("direction") or "higher")
     label_col = _label_column(metrics)
-    if feature not in metrics.columns or not label_col:
+    if feature not in metrics.columns:
         return None
     allowed_designs = set(records["binder_id"].dropna().astype(str))
     ranked = metrics[metrics["binder_id"].astype(str).isin(allowed_designs)].copy()
@@ -1023,7 +1109,10 @@ def _ranked_design_selector(
     if ranked.empty:
         st.info("No designs with valid values are available for this ranking metric.")
         return None
-    ranked["class"] = ranked[label_col].map(lambda value: "binder" if _truthy_benchmark_label(value) == 1 else "nonbinder")
+    if label_col:
+        ranked["class"] = ranked[label_col].map(lambda value: "binder" if _truthy_benchmark_label(value) == 1 else "nonbinder")
+    else:
+        ranked["class"] = "candidate"
     ranked["rank_score"] = -ranked[feature] if direction == "lower" else ranked[feature]
     score_display_column = f"-{feature}" if direction == "lower" else feature
     ranked[score_display_column] = ranked["rank_score"]
@@ -2432,57 +2521,73 @@ def _show_benchmark_results(run_dir: Path, result: dict) -> None:
     if not benchmark_dir.exists():
         return
 
-    st.header("Benchmark Results")
+    input_json = read_json(run_dir / "input.json")
+    is_refolding_evaluation = str(input_json.get("job_type") or "") == "refolding_evaluation"
+    st.header("Refolding Evaluation Results" if is_refolding_evaluation else "Benchmark Results")
     metrics = result.get("metrics") or {}
     outputs = result.get("outputs") or {}
     colab_summary = outputs.get("colabfold_summary_metrics") or {}
+    engine_artifacts = outputs.get("engine_artifacts") or {}
     feature_summary = _first_benchmark_feature_summary(benchmark_dir)
     merged_metrics = _read_csv(benchmark_dir / "merged_benchmark_metrics.csv")
     target_summary = _target_summary(merged_metrics)
     _show_benchmark_collection_notice(benchmark_dir)
 
-    cols = st.columns(7)
-    with cols[0]:
-        _display_metric(
-            "Records",
-            feature_summary.get("record_count")
-            or metrics.get("record_count")
-            or colab_summary.get("record_count"),
-        )
-    with cols[1]:
-        _display_metric("Targets", target_summary.get("target_count") or metrics.get("target_count"))
-    with cols[2]:
-        _display_metric(
-            "Binders",
-            feature_summary.get("positive_count")
-            or metrics.get("positive_count")
-            or colab_summary.get("positive_count"),
-        )
-    with cols[3]:
-        _display_metric(
-            "Nonbinders",
-            feature_summary.get("negative_count")
-            or metrics.get("negative_count")
-            or colab_summary.get("negative_count"),
-        )
-    with cols[4]:
-        _display_metric(
-            "Top feature",
-            feature_summary.get("top_feature")
-            or metrics.get("merged_benchmark_top_feature")
-            or metrics.get("top_feature")
-            or colab_summary.get("top_feature"),
-        )
-    with cols[5]:
-        _display_metric(
-            "Top AP",
-            feature_summary.get("top_feature_average_precision")
-            or metrics.get("merged_benchmark_top_feature_average_precision")
-            or metrics.get("top_feature_average_precision")
-            or colab_summary.get("top_feature_average_precision"),
-        )
-    with cols[6]:
-        _display_metric("ColabFold jobs", metrics.get("colabfold_selected_count"))
+    if is_refolding_evaluation:
+        cols = st.columns(5)
+        with cols[0]:
+            _display_metric("Candidates", metrics.get("record_count") or feature_summary.get("record_count"))
+        with cols[1]:
+            _display_metric("Targets", target_summary.get("target_count") or metrics.get("target_count"))
+        with cols[2]:
+            _display_metric("Engines", len(engine_artifacts) if isinstance(engine_artifacts, dict) else None)
+        with cols[3]:
+            _display_metric("MSA missing", metrics.get("msa_repository_missing_after_lookup"))
+        with cols[4]:
+            _display_metric("ColabFold jobs", metrics.get("colabfold_selected_count"))
+    else:
+        cols = st.columns(7)
+        with cols[0]:
+            _display_metric(
+                "Records",
+                feature_summary.get("record_count")
+                or metrics.get("record_count")
+                or colab_summary.get("record_count"),
+            )
+        with cols[1]:
+            _display_metric("Targets", target_summary.get("target_count") or metrics.get("target_count"))
+        with cols[2]:
+            _display_metric(
+                "Binders",
+                feature_summary.get("positive_count")
+                or metrics.get("positive_count")
+                or colab_summary.get("positive_count"),
+            )
+        with cols[3]:
+            _display_metric(
+                "Nonbinders",
+                feature_summary.get("negative_count")
+                or metrics.get("negative_count")
+                or colab_summary.get("negative_count"),
+            )
+        with cols[4]:
+            _display_metric(
+                "Top feature",
+                feature_summary.get("top_feature")
+                or metrics.get("merged_benchmark_top_feature")
+                or metrics.get("top_feature")
+                or colab_summary.get("top_feature"),
+            )
+        with cols[5]:
+            _display_metric(
+                "Top AP",
+                feature_summary.get("top_feature_average_precision")
+                or metrics.get("merged_benchmark_top_feature_average_precision")
+                or metrics.get("top_feature_average_precision")
+                or colab_summary.get("top_feature_average_precision"),
+            )
+        with cols[6]:
+            _display_metric("ColabFold jobs", metrics.get("colabfold_selected_count"))
     target_text = _target_summary_text(target_summary)
     if target_text:
         st.caption(target_text)
@@ -2513,7 +2618,6 @@ def _show_benchmark_results(run_dir: Path, result: dict) -> None:
         if partial_sources:
             st.info("Partial collection coverage: " + "; ".join(partial_sources))
 
-    engine_artifacts = outputs.get("engine_artifacts") or {}
     if isinstance(engine_artifacts, dict) and engine_artifacts:
         engines = ", ".join(str(engine).replace("_", " ") for engine in engine_artifacts)
         st.caption(
@@ -2894,6 +2998,41 @@ else:
 
 if task_group == "benchmark":
     _show_benchmark_results(run_dir, result_json)
+
+candidates = read_candidates(run_dir)
+if candidates and task_group != "benchmark":
+    st.subheader("Candidate Set")
+    stage_counts = candidate_stage_counts(candidates)
+    cols = st.columns(4)
+    cols[0].metric("Candidates", len(candidates))
+    cols[1].metric("Stages", len(stage_counts))
+    if stage_counts:
+        cols[2].metric("Primary stage", max(stage_counts, key=stage_counts.get))
+    source_tools = sorted({str(candidate.get("source_tool") or "unknown") for candidate in candidates})
+    cols[3].metric("Source tools", len(source_tools))
+    st.caption(f"Source tools: {', '.join(source_tools)}")
+    preview_rows: list[dict[str, Any]] = []
+    for candidate in candidates[:200]:
+        metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
+        preview_rows.append(
+            {
+                "candidate_id": candidate.get("candidate_id"),
+                "stage": candidate.get("stage"),
+                "source_tool": candidate.get("source_tool"),
+                "binder_chains": ",".join(candidate.get("binder_chains") or []),
+                "target_chains": ",".join(candidate.get("target_chains") or []),
+                "binder_sequence_len": len(str(candidate.get("binder_sequence") or "")),
+                "complex_pdb": candidate.get("complex_pdb"),
+                "target_pdb": candidate.get("target_pdb"),
+                "metric_count": len(metrics),
+            }
+        )
+    st.dataframe(pd.DataFrame(preview_rows), hide_index=True, width="stretch")
+    if task_group == "candidate-import":
+        st.info(
+            "Imported candidate sets are kept separate from original design jobs. "
+            "Use them as sources in Refolding / Validation or Analysis to reevaluate external designs."
+        )
 
 analysis_csv = run_dir / "artifacts" / "analysis" / "ranked_candidates.csv"
 if analysis_csv.exists():

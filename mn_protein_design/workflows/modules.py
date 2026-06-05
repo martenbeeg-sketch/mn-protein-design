@@ -12,7 +12,7 @@ def module_specs() -> list[dict]:
 
 
 def candidate_sources(task_group: str | None = None) -> list[dict]:
-    groups = [task_group] if task_group else ["design", "refolding-validation", "analysis"]
+    groups = [task_group] if task_group else ["candidate-import", "design", "refolding-validation", "analysis"]
     rows: list[dict] = []
     for group in groups:
         for job in collect_jobs(group):

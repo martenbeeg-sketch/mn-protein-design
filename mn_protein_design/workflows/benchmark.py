@@ -85,6 +85,8 @@ BENCHMARK_DATASET_PATH_KWARGS = {
     "input_zip",
     "input_csv",
     "input_pdb_dir",
+    "candidates_jsonl",
+    "source_run_dir",
     "rf3_checkpoint_path",
     "colabfold_cache_dir",
     "msa_repository_dir",
@@ -125,6 +127,36 @@ def _stage_de_novo_benchmark_worker_inputs(job: JobPaths, kwargs: dict[str, Any]
     return staged_kwargs
 
 
+def _enqueue_benchmark_worker_job(
+    *,
+    job_type: str,
+    tool_name: str,
+    input_payload: dict[str, Any],
+    params_payload: dict[str, Any],
+    kwargs: dict[str, Any],
+    kind: str = "de_novo_binder_scoring_dataset",
+) -> Path:
+    job = create_job(BENCHMARK_GROUP, job_type, tool_name, input_payload, params_payload)
+    staged_kwargs = _stage_de_novo_benchmark_worker_inputs(job, kwargs)
+    worker_kwargs = {key: _jsonable_worker_value(value) for key, value in staged_kwargs.items()}
+    write_json(
+        job.run_dir / "worker_request.json",
+        {
+            "kind": kind,
+            "kwargs": worker_kwargs,
+            "path_kwargs": sorted(BENCHMARK_DATASET_PATH_KWARGS),
+        },
+    )
+    write_json(
+        job.run_dir / "command.json",
+        {
+            "mode": "local_worker",
+            "command": ["python", "-m", "mn_protein_design.core.local_worker", "--run-dir", str(job.run_dir)],
+        },
+    )
+    return job.run_dir
+
+
 def enqueue_de_novo_binder_scoring_dataset(**kwargs: Any) -> Path:
     """Create a durable queued benchmark job for the local worker.
 
@@ -133,11 +165,10 @@ def enqueue_de_novo_binder_scoring_dataset(**kwargs: Any) -> Path:
     same final run folder layout as a directly executed benchmark.
     """
 
-    job = create_job(
-        BENCHMARK_GROUP,
-        "de_novo_binder_scoring_dataset",
-        "de_novo_binder_scoring_scripts",
-        {
+    return _enqueue_benchmark_worker_job(
+        job_type="de_novo_binder_scoring_dataset",
+        tool_name="de_novo_binder_scoring_scripts",
+        input_payload={
             "queued_worker_request": True,
             "input_zip": str(kwargs.get("input_zip")) if kwargs.get("input_zip") else None,
             "input_zip_uploaded": kwargs.get("input_zip_bytes") is not None,
@@ -145,7 +176,7 @@ def enqueue_de_novo_binder_scoring_dataset(**kwargs: Any) -> Path:
             "input_csv_uploaded": kwargs.get("input_csv_text") is not None,
             "input_pdb_dir": str(kwargs.get("input_pdb_dir")) if kwargs.get("input_pdb_dir") else None,
         },
-        {
+        params_payload={
             "queue_resource": "gpu",
             "queued_worker": "local",
             "mode": kwargs.get("mode", "pdb_only"),
@@ -160,25 +191,8 @@ def enqueue_de_novo_binder_scoring_dataset(**kwargs: Any) -> Path:
             "run_protenix": bool(kwargs.get("run_protenix")),
             "run_boltzgen_fold": bool(kwargs.get("run_boltzgen_fold")),
         },
+        kwargs=kwargs,
     )
-    staged_kwargs = _stage_de_novo_benchmark_worker_inputs(job, kwargs)
-    worker_kwargs = {key: _jsonable_worker_value(value) for key, value in staged_kwargs.items()}
-    write_json(
-        job.run_dir / "worker_request.json",
-        {
-            "kind": "de_novo_binder_scoring_dataset",
-            "kwargs": worker_kwargs,
-            "path_kwargs": sorted(BENCHMARK_DATASET_PATH_KWARGS),
-        },
-    )
-    write_json(
-        job.run_dir / "command.json",
-        {
-            "mode": "local_worker",
-            "command": ["python", "-m", "mn_protein_design.core.local_worker", "--run-dir", str(job.run_dir)],
-        },
-    )
-    return job.run_dir
 
 
 def _safe_id(value: object, fallback: str = "benchmark") -> str:
@@ -256,6 +270,134 @@ def _row_value(row: dict[str, Any], *keys: str) -> Any:
             if value is not None and str(value).strip() != "":
                 return value
     return None
+
+
+def _relative_candidate_path(source_run_dir: Path, value: object) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = source_run_dir / path
+    return path if path.exists() else None
+
+
+def _stage_candidate_set_as_repo_dataset(
+    *,
+    source_run_dir: Path,
+    candidates_jsonl: Path,
+    staged_dir: Path,
+    max_candidates: int = 0,
+) -> tuple[Path, Path, dict[str, Any]]:
+    source_run_dir = Path(source_run_dir).expanduser().resolve()
+    candidates = read_candidates(Path(candidates_jsonl).expanduser())
+    if max_candidates and int(max_candidates) > 0:
+        candidates = candidates[: int(max_candidates)]
+    if not candidates:
+        raise ValueError("No candidates are available for refolding evaluation.")
+
+    input_pdb_dir = staged_dir / "input_pdbs"
+    input_pdb_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = staged_dir / "input.csv"
+    rows: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for index, candidate in enumerate(candidates, start=1):
+        candidate_id = str(candidate.get("candidate_id") or f"candidate_{index}").strip()
+        binder_id = _safe_id(candidate_id, fallback=f"candidate_{index}")
+        complex_pdb = _relative_candidate_path(source_run_dir, candidate.get("complex_pdb") or candidate.get("binder_pdb"))
+        if complex_pdb is None:
+            skipped.append({"candidate_id": candidate_id, "reason": "missing_complex_pdb"})
+            continue
+        staged_pdb = input_pdb_dir / f"{binder_id}.pdb"
+        shutil.copy2(complex_pdb, staged_pdb)
+        target_chains = _split_list(candidate.get("target_chains"))
+        binder_chains = _split_list(candidate.get("binder_chains"))
+        metrics = dict(candidate.get("metrics") or {})
+        raw_metadata = dict(candidate.get("raw_metadata") or {})
+        rows.append(
+            {
+                "binder_id": binder_id,
+                "original_binder_id": candidate_id,
+                "target_id": str(raw_metadata.get("target_id") or metrics.get("target_id") or Path(str(candidate.get("target_pdb") or "target")).stem),
+                "binder": "",
+                "label": "",
+                "source": str(candidate.get("source_tool") or raw_metadata.get("import_name") or "candidate_set"),
+                "binder_chain": ",".join(binder_chains),
+                "target_chains": json.dumps(target_chains),
+                "complex_pdb": str(staged_pdb),
+                "target_pdb": str(_relative_candidate_path(source_run_dir, candidate.get("target_pdb")) or ""),
+                "binder_sequence": str(candidate.get("binder_sequence") or ""),
+            }
+        )
+    if not rows:
+        raise ValueError("None of the selected candidates had an existing complex PDB.")
+    with csv_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    write_json(
+        staged_dir / "candidate_staging_summary.json",
+        {
+            "source_run_dir": str(source_run_dir),
+            "candidates_jsonl": str(candidates_jsonl),
+            "candidate_count": len(candidates),
+            "staged_count": len(rows),
+            "skipped_count": len(skipped),
+            "skipped": skipped[:100],
+        },
+    )
+    return csv_path, input_pdb_dir, {"candidate_count": len(candidates), "staged_count": len(rows), "skipped_count": len(skipped)}
+
+
+def enqueue_candidate_refolding_evaluation(
+    *,
+    source_run_dir: Path,
+    candidates_jsonl: Path,
+    max_candidates: int = 0,
+    evaluation_name: str = "Refolding evaluation",
+    **kwargs: Any,
+) -> Path:
+    """Queue a benchmark-style engine evaluation for an unlabeled candidate set."""
+
+    input_payload = {
+        "queued_worker_request": True,
+        "source_run_dir": str(source_run_dir),
+        "candidates_jsonl": str(candidates_jsonl),
+    }
+    params_payload = {
+        "queue_resource": "gpu",
+        "queued_worker": "local",
+        "evaluation_name": evaluation_name,
+        "evaluation_mode": "refolding_validation",
+        "max_candidates": int(max_candidates or 0),
+        "models": list(kwargs.get("models") or []),
+        "run_alphafast_af3": bool(kwargs.get("run_alphafast_af3")),
+        "run_colabfold": bool(kwargs.get("run_colabfold")),
+        "run_af2_initial_guess": bool(kwargs.get("run_af2_initial_guess")),
+        "run_boltz2_initial_guess": bool(kwargs.get("run_boltz2_initial_guess")),
+        "run_esmfold2": bool(kwargs.get("run_esmfold2")),
+        "run_rf3": bool(kwargs.get("run_rf3")),
+        "run_protenix": bool(kwargs.get("run_protenix")),
+        "run_boltzgen_fold": bool(kwargs.get("run_boltzgen_fold")),
+    }
+    worker_kwargs = {
+        **kwargs,
+        "source_run_dir": Path(source_run_dir),
+        "candidates_jsonl": Path(candidates_jsonl),
+        "max_records": int(max_candidates or 0),
+        "mode": "pdb_only",
+        "generate_inputs": True,
+        "job_type": "refolding_evaluation",
+        "tool_name": "refolding_evaluation_engines",
+    }
+    return _enqueue_benchmark_worker_job(
+        job_type="refolding_evaluation",
+        tool_name="refolding_evaluation_engines",
+        input_payload=input_payload,
+        params_payload=params_payload,
+        kwargs=worker_kwargs,
+        kind="candidate_refolding_evaluation",
+    )
 
 
 def _stage_colabfold_target_templates(run_csv: Path, output_dir: Path, max_records: int = 0) -> tuple[Path | None, int]:
@@ -2888,6 +3030,8 @@ def run_de_novo_binder_scoring_dataset(
     input_csv: Path | None = None,
     input_csv_text: str | None = None,
     input_pdb_dir: Path | None = None,
+    source_run_dir: Path | None = None,
+    candidates_jsonl: Path | None = None,
     mode: str = "pdb_only",
     generate_inputs: bool = True,
     models: list[str] | None = None,
@@ -2950,6 +3094,8 @@ def run_de_novo_binder_scoring_dataset(
     docker_image: str = SCORING_SCRIPTS_IMAGE,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     existing_job: JobPaths | None = None,
+    job_type: str = "de_novo_binder_scoring_dataset",
+    tool_name: str = "de_novo_binder_scoring_scripts",
 ) -> Path:
     msa_source = str(colabfold_msa_source or "msa_repository_then_alphafast_mmseqs_gpu")
     msa_consuming_engines = bool(
@@ -2974,8 +3120,11 @@ def run_de_novo_binder_scoring_dataset(
         "input_zip_uploaded": input_zip_bytes is not None,
         "input_csv": str(input_csv) if input_csv else None,
         "input_pdb_dir": str(input_pdb_dir) if input_pdb_dir else None,
+        "source_run_dir": str(source_run_dir) if source_run_dir else None,
+        "candidates_jsonl": str(candidates_jsonl) if candidates_jsonl else None,
     }
     params_payload = {
+        "evaluation_mode": "refolding_validation" if candidates_jsonl else "binder_benchmark",
         "mode": mode,
         "generate_inputs": generate_inputs,
         "models": selected_models,
@@ -3040,8 +3189,8 @@ def run_de_novo_binder_scoring_dataset(
     if existing_job is None:
         job = create_job(
             BENCHMARK_GROUP,
-            "de_novo_binder_scoring_dataset",
-            "de_novo_binder_scoring_scripts",
+            job_type,
+            tool_name,
             input_payload,
             params_payload,
         )
@@ -3050,8 +3199,8 @@ def run_de_novo_binder_scoring_dataset(
         write_json(
             job.run_dir / "input.json",
             {
-                "job_type": "de_novo_binder_scoring_dataset",
-                "tool": "de_novo_binder_scoring_scripts",
+                "job_type": job_type,
+                "tool": tool_name,
                 "inputs": input_payload,
                 "params": params_payload,
             },
@@ -3059,6 +3208,28 @@ def run_de_novo_binder_scoring_dataset(
     update_status(job.run_dir, "running")
     raw_dir = job.run_dir / "artifacts" / "raw" / "de_novo_binder_scoring"
     raw_dir.mkdir(parents=True, exist_ok=True)
+    if candidates_jsonl is not None:
+        if source_run_dir is None:
+            raise ValueError("source_run_dir is required when candidates_jsonl is provided.")
+        candidate_stage_dir = job.run_dir / "artifacts" / "queued_inputs" / "candidate_repo_dataset"
+        input_csv, input_pdb_dir, candidate_stage_metrics = _stage_candidate_set_as_repo_dataset(
+            source_run_dir=Path(source_run_dir),
+            candidates_jsonl=Path(candidates_jsonl),
+            staged_dir=candidate_stage_dir,
+            max_candidates=int(max_records or 0),
+        )
+        input_payload["input_csv"] = str(input_csv)
+        input_payload["input_pdb_dir"] = str(input_pdb_dir)
+        params_payload.update(candidate_stage_metrics)
+        write_json(
+            job.run_dir / "input.json",
+            {
+                "job_type": job_type,
+                "tool": tool_name,
+                "inputs": input_payload,
+                "params": params_payload,
+            },
+        )
     staged_csv, staged_pdb_dir = _stage_repo_format_inputs(
         raw_dir=raw_dir,
         input_zip=input_zip,
