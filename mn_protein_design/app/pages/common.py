@@ -6,8 +6,153 @@ import pandas as pd
 import streamlit as st
 
 from mn_protein_design.core.candidates import candidate_stage_counts, read_candidates
-from mn_protein_design.core.jobs import ACTIVE_STATUSES, collect_jobs, delete_job_run, deletion_plan, find_downstream_jobs
+from mn_protein_design.core.jobs import (
+    ACTIVE_STATUSES,
+    collect_jobs,
+    delete_job_run,
+    deletion_plan,
+    display_job_code,
+    find_downstream_jobs,
+    read_json,
+)
+from mn_protein_design.runtime import runs_root
 from mn_protein_design.workflows.campaigns import run_lineage_steps
+
+
+def selected_dataframe_rows(event: object, key: str | None = None) -> list[int]:
+    """Return selected row positions from Streamlit dataframe selection events."""
+    selection = getattr(event, "selection", None)
+    if selection is not None:
+        rows = [int(row) for row in (getattr(selection, "rows", []) or [])]
+        if rows:
+            return rows
+    if isinstance(event, dict):
+        rows = (event.get("selection") or {}).get("rows") or []
+        rows = [int(row) for row in rows]
+        if rows:
+            return rows
+    if key:
+        state = st.session_state.get(key)
+        if isinstance(state, dict):
+            rows = (state.get("selection") or {}).get("rows") or []
+            return [int(row) for row in rows]
+    return []
+
+
+def show_delete_jobs_dialog(
+    *,
+    table_key: str,
+    pending_refs: list[tuple[str, str]],
+    selected_refs_key: str,
+    label: str = "job",
+) -> None:
+    def selected_job_summary() -> pd.DataFrame:
+        rows = []
+        root = runs_root()
+        for task, run_id in pending_refs:
+            metadata = read_json(root / str(task) / str(run_id) / "metadata.json")
+            rows.append(
+                {
+                    "job_code": display_job_code(metadata.get("job_code"), str(run_id)),
+                    "task_group": str(task),
+                    "status": str(metadata.get("status") or ""),
+                    "run_id": str(run_id),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def render_confirmation() -> None:
+        st.warning(
+            f"Delete {len(pending_refs)} selected {label}{'' if len(pending_refs) == 1 else 's'}? "
+            "This permanently removes their run directories."
+        )
+        summary_df = selected_job_summary()
+        if not summary_df.empty:
+            st.markdown("**Selected jobs**")
+            st.dataframe(summary_df, hide_index=True, width="stretch")
+
+        include_downstream = False
+        check_downstream = st.checkbox(
+            "Check downstream dependent jobs",
+            value=False,
+            key=f"{table_key}_check_downstream_delete_jobs",
+        )
+        if check_downstream:
+            downstream_rows = []
+            downstream_seen = set()
+            for task, run_id in pending_refs:
+                for downstream in find_downstream_jobs(task, run_id):
+                    identity = (str(downstream["task_group"]), str(downstream["run_id"]))
+                    if identity in downstream_seen or identity in pending_refs:
+                        continue
+                    downstream_seen.add(identity)
+                    downstream_rows.append(downstream)
+            if downstream_rows:
+                st.warning(f"{len(downstream_rows)} downstream job(s) depend on the selected job(s).")
+                st.dataframe(
+                    pd.DataFrame(downstream_rows)[
+                        ["job_code", "task_group", "job_type", "tool", "status", "run_id"]
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
+                include_downstream = st.checkbox(
+                    "Also delete downstream dependent jobs",
+                    key=f"{table_key}_include_downstream_delete_jobs",
+                )
+            else:
+                st.caption("No downstream dependent jobs found.")
+
+        planned_rows = deletion_plan(pending_refs, include_downstream=include_downstream)
+        active_planned = [row for row in planned_rows if row.get("status") in ACTIVE_STATUSES]
+        if active_planned:
+            st.error("The deletion includes running, queued, or preparing jobs. Stop those jobs first.")
+            st.dataframe(
+                pd.DataFrame(active_planned)[["job_code", "task_group", "job_type", "tool", "status", "run_id"]],
+                hide_index=True,
+                width="stretch",
+            )
+        st.caption(f"Will delete {len(planned_rows)} run director{'y' if len(planned_rows) == 1 else 'ies'}.")
+        confirm = st.checkbox(
+            "Yes, permanently delete these run directories.",
+            key=f"{table_key}_confirm_delete_jobs",
+        )
+        cancel_col, delete_col = st.columns([1, 1])
+        if cancel_col.button("Cancel", key=f"{table_key}_cancel_delete_jobs"):
+            st.session_state[f"{table_key}_delete_refs"] = []
+            st.session_state[selected_refs_key] = []
+            st.rerun()
+        if delete_col.button(
+            "Confirm delete",
+            type="primary",
+            disabled=not confirm or bool(active_planned),
+            key=f"{table_key}_delete_selected_jobs",
+        ):
+            deleted = []
+            try:
+                for row in planned_rows:
+                    delete_job_run(str(row["task_group"]), str(row["run_id"]))
+                    code = str(row["job_code"]).rsplit("job_code=", 1)[-1]
+                    deleted.append(code)
+            except Exception as exc:
+                st.session_state[f"{table_key}_delete_result"] = ("error", f"Delete failed: {exc}")
+            else:
+                st.session_state[f"{table_key}_delete_refs"] = []
+                st.session_state[selected_refs_key] = []
+                st.session_state[f"{table_key}_delete_result"] = (
+                    "success",
+                    f"Deleted {len(deleted)} job(s): {', '.join(deleted)}",
+                )
+            st.rerun()
+
+    if hasattr(st, "dialog"):
+        @st.dialog("Confirm deletion")
+        def confirmation_dialog() -> None:
+            render_confirmation()
+
+        confirmation_dialog()
+    else:
+        render_confirmation()
 
 
 def render_job_table(task_group: str | list[str] | None = None, rows_override: list[dict] | None = None) -> None:
@@ -44,10 +189,8 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
         ),
         axis=1,
     )
-    df["delete"] = False
     display_df = df[
         [
-            "delete",
             "job_code_link",
             "campaign_name",
             "task_group",
@@ -62,35 +205,14 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
             "run_id",
         ]
     ].rename(columns={"job_code_link": "job_code"})
-    disabled_delete_rows = [
-        idx for idx, row in display_df.iterrows() if row["status"] in ACTIVE_STATUSES
-    ]
-    edited_df = st.data_editor(
+    event = st.dataframe(
         display_df,
         hide_index=True,
         width="stretch",
         key=f"{table_key}_jobs_table",
-        num_rows="fixed",
-        disabled=[
-            "job_code",
-            "campaign_name",
-            "task_group",
-            "job_type",
-            "tool",
-            "status",
-            "queue_resource",
-            "current_phase",
-            "current_engine",
-            "created_at",
-            "updated_at",
-            "run_id",
-        ],
+        on_select="rerun",
+        selection_mode="multi-row",
         column_config={
-            "delete": st.column_config.CheckboxColumn(
-                "delete",
-                help="Tick finished jobs to delete.",
-                default=False,
-            ),
             "job_code": st.column_config.LinkColumn(
                 "job_code",
                 display_text=r".*job_code=([A-Z0-9]+)$",
@@ -98,93 +220,45 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
             ),
         },
     )
+    delete_result = st.session_state.pop(f"{table_key}_delete_result", None)
+    if delete_result:
+        level, message = delete_result
+        if level == "success":
+            st.success(str(message))
+        else:
+            st.error(str(message))
 
-    if disabled_delete_rows and edited_df.loc[disabled_delete_rows, "delete"].any():
+    table_widget_key = f"{table_key}_jobs_table"
+    selected_indices = [idx for idx in selected_dataframe_rows(event, table_widget_key) if 0 <= idx < len(display_df)]
+    selected_rows = display_df.iloc[selected_indices].copy() if selected_indices else display_df.iloc[0:0].copy()
+    active_selected = selected_rows[selected_rows["status"].isin(ACTIVE_STATUSES)]
+    if not active_selected.empty:
         st.warning("Running, queued, or preparing jobs cannot be deleted.")
-        edited_df.loc[disabled_delete_rows, "delete"] = False
-
-    edited_df["delete"] = edited_df["delete"].fillna(False).astype(bool)
-    editor_state = st.session_state.get(f"{table_key}_jobs_table")
-    if isinstance(editor_state, dict):
-        for raw_index, changes in (editor_state.get("edited_rows") or {}).items():
-            if not isinstance(changes, dict) or "delete" not in changes:
-                continue
-            try:
-                row_index = int(raw_index)
-            except (TypeError, ValueError):
-                continue
-            if row_index in edited_df.index:
-                edited_df.at[row_index, "delete"] = bool(changes["delete"])
-
-    selected_rows = edited_df[
-        edited_df["delete"] & ~edited_df["status"].isin(ACTIVE_STATUSES)
-    ]
+    selected_rows = selected_rows[~selected_rows["status"].isin(ACTIVE_STATUSES)]
     selected_refs = [
         (str(row["task_group"]), str(row["run_id"]))
         for row in selected_rows.to_dict(orient="records")
     ]
-    st.session_state[f"{table_key}_delete_refs"] = selected_refs
+    selected_refs_key = f"{table_key}_selected_delete_refs"
+    if selected_refs:
+        st.session_state[selected_refs_key] = selected_refs
+    cached_selected_refs = st.session_state.get(selected_refs_key) or []
 
-    if selected_rows.empty:
-        st.caption("Tick finished jobs in the delete column to show delete options.")
-    else:
-        downstream_rows = []
-        downstream_seen = set()
-        for task, run_id in selected_refs:
-            for downstream in find_downstream_jobs(task, run_id):
-                identity = (str(downstream["task_group"]), str(downstream["run_id"]))
-                if identity in downstream_seen or identity in selected_refs:
-                    continue
-                downstream_seen.add(identity)
-                downstream_rows.append(downstream)
-        include_downstream = False
-        if downstream_rows:
-            st.warning(f"{len(downstream_rows)} downstream job(s) depend on the selected job(s).")
-            with st.expander("Downstream jobs that would become orphaned", expanded=True):
-                st.dataframe(
-                    pd.DataFrame(downstream_rows)[
-                        ["job_code", "task_group", "job_type", "tool", "status", "run_id"]
-                    ],
-                    hide_index=True,
-                    width="stretch",
-                )
-            include_downstream = st.checkbox(
-                "Also delete downstream dependent jobs",
-                key=f"{table_key}_include_downstream_delete_jobs",
-            )
-        planned_rows = deletion_plan(selected_refs, include_downstream=include_downstream)
-        active_planned = [row for row in planned_rows if row.get("status") in ACTIVE_STATUSES]
-        if active_planned:
-            st.error("The deletion plan includes running, queued, or preparing jobs. Stop those jobs first.")
-            st.dataframe(
-                pd.DataFrame(active_planned)[["job_code", "task_group", "job_type", "tool", "status", "run_id"]],
-                hide_index=True,
-                width="stretch",
-            )
-        st.caption(f"Deletion plan: {len(planned_rows)} run director{'y' if len(planned_rows) == 1 else 'ies'}.")
-        confirm = st.checkbox(
-            "I understand this permanently deletes the planned run directories.",
-            key=f"{table_key}_confirm_delete_jobs",
+    delete_clicked = st.button(
+        "Delete selected jobs",
+        type="primary",
+        disabled=not cached_selected_refs,
+        key=f"{table_key}_request_delete_jobs",
+    )
+    if delete_clicked and cached_selected_refs:
+        show_delete_jobs_dialog(
+            table_key=table_key,
+            pending_refs=cached_selected_refs,
+            selected_refs_key=selected_refs_key,
+            label="job",
         )
-
-        if st.button(
-            "Delete selected jobs",
-            type="primary",
-            disabled=not confirm or bool(active_planned),
-            key=f"{table_key}_delete_selected_jobs",
-        ):
-            deleted = []
-            try:
-                for row in planned_rows:
-                    delete_job_run(str(row["task_group"]), str(row["run_id"]))
-                    code = str(row["job_code"]).rsplit("job_code=", 1)[-1]
-                    deleted.append(code)
-            except Exception as exc:
-                st.error(f"Delete failed: {exc}")
-            else:
-                st.session_state[f"{table_key}_delete_refs"] = []
-                st.success(f"Deleted {len(deleted)} job(s): {', '.join(deleted)}")
-                st.rerun()
+    else:
+        st.caption("Select finished rows in the table to enable deletion.")
 
 
 def result_link(task_group: str, run_id: str, label: str = "Open result") -> str:

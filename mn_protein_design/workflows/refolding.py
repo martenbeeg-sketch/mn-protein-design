@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import csv
 import json
 import math
 import shutil
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import yaml
 
 from mn_protein_design.core.candidates import (
     STAGE_COMPLEX_REFOLDING,
@@ -18,7 +20,7 @@ from mn_protein_design.core.candidates import (
     read_candidates,
     write_candidates,
 )
-from mn_protein_design.core.jobs import create_job, finish_job, read_json, update_status, write_json
+from mn_protein_design.core.jobs import create_job, finish_job, mark_internal_job, read_json, update_status, write_json
 from mn_protein_design.workflows import esm_binder as esm_binder_workflow
 
 
@@ -27,6 +29,13 @@ BOLTZ_MODELS_DIR = Path("/mnt/db/reference_files/boltz_models")
 ALPHAFOLD_MODELS_DIR = Path("/mnt/db/reference_files/alphafold_models")
 AF2_BINDER_EVAL = Path(__file__).resolve().parents[1] / "tools" / "af2_initial_guess_binder_eval.py"
 BOLTZ_PREPARE_INPUTS = Path("/home/user/programs/ovo/original/src/ovo/pipelines/boltz-refolding/bin/prepare_inputs.py")
+RF3_IMAGE = "ovoex-foundry-cu128:latest"
+RF3_CHECKPOINT = Path("/mnt/db/reference_files/foundry/rf3_foundry_01_24_latest_remapped.ckpt")
+PROTENIX_IMAGE = "mnprot-pxdesign-cu128:latest"
+PROTENIX_REFERENCE_DIR = Path("/mnt/db/reference_files/pxdesign")
+BOLTZGEN_IMAGE = "boltzgen:latest"
+BOLTZGEN_LOCAL_SOURCE = Path(__file__).resolve().parents[2] / "tools_to_implement" / "boltzgen" / "src" / "boltzgen"
+BOLTZGEN_BENCHMARK_PAE_CONFIG = Path(__file__).resolve().parents[2] / "tools_to_implement" / "boltzgen" / "config" / "fold_benchmark_pae.yaml"
 
 MONOMER_SUFFIXES = (
     "_boltz2_monomer",
@@ -117,6 +126,303 @@ def _strip_monomer_suffix(candidate_id: object) -> str:
         if text.endswith(suffix):
             return text[: -len(suffix)]
     return text
+
+
+def _clean_sequence(value: object) -> str:
+    return "".join(ch for ch in str(value or "").upper() if ch.isalpha())
+
+
+def _load_run_csv_msa_records(run_csv: Path | None) -> dict[str, dict[str, dict[str, str]]]:
+    if run_csv is None or not Path(run_csv).exists():
+        return {}
+    records: dict[str, dict[str, dict[str, str]]] = {}
+    with Path(run_csv).open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            binder_id = str(row.get("binder_id") or "").strip()
+            if not binder_id:
+                continue
+            chain_records: dict[str, dict[str, str]] = {}
+            binder_chain = str(row.get("binder_chain") or "A").strip() or "A"
+            for key, value in row.items():
+                if not key.startswith("msa_path_"):
+                    continue
+                chain = key.removeprefix("msa_path_")
+                if not chain or chain == binder_chain:
+                    continue
+                msa_path = str(value or "").strip()
+                if not msa_path or msa_path.lower() == "no_msa":
+                    continue
+                seq = (
+                    row.get(f"target_subchain_{chain}_seq")
+                    or row.get(f"{chain}_seq")
+                    or ""
+                )
+                chain_records[chain] = {"msa_path": msa_path, "sequence": _clean_sequence(seq)}
+            records[binder_id] = chain_records
+            records[_safe_id(binder_id)] = chain_records
+    return records
+
+
+def _inject_boltz_yaml_msas(
+    *,
+    yaml_dir: Path,
+    raw_root: Path,
+    benchmark_run_csv: Path | None,
+) -> dict[str, int]:
+    msa_records = _load_run_csv_msa_records(benchmark_run_csv)
+    metrics = {
+        "boltz2_msa_injected_count": 0,
+        "boltz2_msa_missing_count": 0,
+        "boltz2_msa_sequence_mismatch_count": 0,
+    }
+    if not msa_records or not yaml_dir.exists():
+        return metrics
+    staged_msa_dir = raw_root / "msas"
+    staged_msa_dir.mkdir(parents=True, exist_ok=True)
+    for yaml_path in sorted(yaml_dir.glob("*.yaml")):
+        binder_id = yaml_path.stem
+        chain_records = msa_records.get(binder_id) or msa_records.get(_safe_id(binder_id)) or {}
+        if not chain_records:
+            continue
+        try:
+            payload = yaml.safe_load(yaml_path.read_text()) or {}
+        except yaml.YAMLError:
+            continue
+        changed = False
+        for entry in payload.get("sequences") or []:
+            protein = entry.get("protein") if isinstance(entry, dict) else None
+            if not isinstance(protein, dict):
+                continue
+            chain_id = str(protein.get("id") or "").strip()
+            if not chain_id:
+                continue
+            record = chain_records.get(chain_id)
+            if record is None:
+                continue
+            yaml_seq = _clean_sequence(protein.get("sequence"))
+            record_seq = _clean_sequence(record.get("sequence"))
+            if record_seq and yaml_seq and record_seq != yaml_seq:
+                metrics["boltz2_msa_sequence_mismatch_count"] += 1
+                continue
+            source_msa = Path(record.get("msa_path") or "")
+            if not source_msa.exists():
+                metrics["boltz2_msa_missing_count"] += 1
+                continue
+            staged_name = f"{_safe_id(binder_id)}_chain_{_safe_id(chain_id)}{source_msa.suffix or '.a3m'}"
+            staged_msa = staged_msa_dir / staged_name
+            shutil.copy2(source_msa, staged_msa)
+            protein["msa"] = f"/work/artifacts/raw/boltz2_initial_guess/msas/{staged_name}"
+            metrics["boltz2_msa_injected_count"] += 1
+            changed = True
+        if changed:
+            yaml_path.write_text(yaml.safe_dump(payload, sort_keys=False))
+    return metrics
+
+
+def _rf3_msa_records_for_candidate(
+    candidate: dict[str, Any],
+    benchmark_msa_records: dict[str, dict[str, dict[str, str]]],
+) -> dict[str, dict[str, str]]:
+    candidate_id = str(candidate.get("candidate_id") or "").strip()
+    records = benchmark_msa_records.get(candidate_id) or benchmark_msa_records.get(_safe_id(candidate_id))
+    if records:
+        return records
+    raw = candidate.get("raw_metadata") if isinstance(candidate.get("raw_metadata"), dict) else {}
+    row = raw.get("repo_run_csv_row") if isinstance(raw.get("repo_run_csv_row"), dict) else {}
+    binder_chain = str(row.get("binder_chain") or "A").strip() or "A"
+    chain_records: dict[str, dict[str, str]] = {}
+    for key, value in row.items():
+        if not str(key).startswith("msa_path_"):
+            continue
+        chain = str(key).removeprefix("msa_path_")
+        msa_path = str(value or "").strip()
+        if not chain or chain == binder_chain or not msa_path or msa_path.lower() == "no_msa":
+            continue
+        chain_records[chain] = {
+            "msa_path": msa_path,
+            "sequence": _clean_sequence(row.get(f"target_subchain_{chain}_seq") or row.get(f"{chain}_seq") or ""),
+        }
+    return chain_records
+
+
+def _write_rf3_json_inputs(
+    *,
+    source_run_dir: Path,
+    source_candidates: list[dict[str, Any]],
+    staged: dict[str, Path],
+    input_dir: Path,
+    benchmark_run_csv: Path | None,
+    use_target_msa: bool,
+) -> tuple[dict[str, Path], dict[str, int]]:
+    benchmark_msa_records = _load_run_csv_msa_records(benchmark_run_csv)
+    rf3_inputs: dict[str, Path] = {}
+    metrics = {
+        "rf3_target_msa_injected_count": 0,
+        "rf3_target_msa_missing_count": 0,
+        "rf3_target_msa_sequence_mismatch_count": 0,
+    }
+    msa_dir = input_dir / "msas"
+    msa_dir.mkdir(parents=True, exist_ok=True)
+    for safe_id, staged_path in staged.items():
+        source = next(item for item in source_candidates if safe_id == _safe_id(item.get("candidate_id")))
+        binder_chains = _candidate_chains(source, "binder_chains", ["A"])
+        target_chains = _candidate_chains(source, "target_chains", [])
+        if not target_chains:
+            _inferred_binder, target_chains = _infer_chain_roles(source_run_dir, source)
+        target_set = set(target_chains)
+        sequences = _pdb_sequences_by_chain(staged_path)
+        raw = source.get("raw_metadata") if isinstance(source.get("raw_metadata"), dict) else {}
+        row = raw.get("repo_run_csv_row") if isinstance(raw.get("repo_run_csv_row"), dict) else {}
+        declared_sequences: dict[str, str] = {}
+        for chain in binder_chains:
+            sequence = _clean_sequence(row.get(f"{chain}_seq") or (row.get("A_seq") if chain == "A" else ""))
+            if sequence:
+                declared_sequences[chain] = sequence
+        for chain in target_chains:
+            sequence = _clean_sequence(row.get(f"target_subchain_{chain}_seq") or row.get(f"{chain}_seq") or "")
+            if sequence:
+                declared_sequences[chain] = sequence
+        if declared_sequences and all(chain in declared_sequences for chain in [*binder_chains, *target_chains]):
+            sequences = declared_sequences
+        msa_records = _rf3_msa_records_for_candidate(source, benchmark_msa_records) if use_target_msa else {}
+        components: list[dict[str, str]] = []
+        used_msa_records: set[str] = set()
+        for chain, sequence in sequences.items():
+            component = {"seq": sequence, "chain_id": chain}
+            if use_target_msa and chain in target_set:
+                record_chain = chain if chain in msa_records else ""
+                if not record_chain:
+                    for candidate_chain, record in msa_records.items():
+                        if candidate_chain in used_msa_records:
+                            continue
+                        if _clean_sequence(record.get("sequence")) == _clean_sequence(sequence):
+                            record_chain = candidate_chain
+                            break
+                record = msa_records.get(record_chain) if record_chain else None
+                if record is None:
+                    metrics["rf3_target_msa_missing_count"] += 1
+                elif _clean_sequence(record.get("sequence")) and _clean_sequence(record.get("sequence")) != _clean_sequence(sequence):
+                    metrics["rf3_target_msa_sequence_mismatch_count"] += 1
+                else:
+                    source_msa = Path(str(record.get("msa_path") or ""))
+                    if source_msa.exists():
+                        staged_msa = msa_dir / f"{safe_id}_chain_{_safe_id(chain)}{source_msa.suffix or '.a3m'}"
+                        shutil.copy2(source_msa, staged_msa)
+                        component["msa_path"] = f"/work/artifacts/raw/rf3/inputs/msas/{staged_msa.name}"
+                        metrics["rf3_target_msa_injected_count"] += 1
+                        used_msa_records.add(record_chain)
+                    else:
+                        metrics["rf3_target_msa_missing_count"] += 1
+            components.append(component)
+        input_path = input_dir / f"{safe_id}.json"
+        write_json(input_path, {"name": safe_id, "components": components})
+        rf3_inputs[safe_id] = input_path
+    return rf3_inputs, metrics
+
+
+def _write_protenix_json_inputs(
+    *,
+    source_run_dir: Path,
+    source_candidates: list[dict[str, Any]],
+    staged: dict[str, Path],
+    json_root: Path,
+    msa_root: Path,
+    benchmark_run_csv: Path | None,
+    use_target_msa: bool,
+) -> tuple[dict[str, Path], dict[str, int]]:
+    benchmark_msa_records = _load_run_csv_msa_records(benchmark_run_csv)
+    protenix_inputs: dict[str, Path] = {}
+    metrics = {
+        "protenix_target_msa_injected_count": 0,
+        "protenix_target_msa_missing_count": 0,
+        "protenix_target_msa_sequence_mismatch_count": 0,
+        "protenix_binder_query_only_msa_count": 0,
+        "protenix_target_query_only_msa_fallback_count": 0,
+    }
+    job_run_dir = json_root.parents[3]
+
+    def attach_msa(protein: dict[str, Any], chain_dir: Path) -> None:
+        protein["msa"] = {
+            "precomputed_msa_dir": f"/work/{chain_dir.relative_to(job_run_dir)}",
+            "pairing_db": "uniref100",
+            "pairing_db_fpath": None,
+            "non_pairing_db_fpath": None,
+            "search_too": None,
+            "msa_save_dir": None,
+        }
+
+    def write_query_only_msa(chain_dir: Path, safe_id: str, chain: str, sequence: str) -> None:
+        chain_dir.mkdir(parents=True, exist_ok=True)
+        content = f">{safe_id}_chain_{_safe_id(chain)}\n{sequence}\n"
+        for filename in ["pairing.a3m", "non_pairing.a3m"]:
+            (chain_dir / filename).write_text(content)
+
+    for safe_id, staged_path in staged.items():
+        source = next(item for item in source_candidates if safe_id == _safe_id(item.get("candidate_id")))
+        binder_chains = _candidate_chains(source, "binder_chains", ["A"])
+        target_chains = _candidate_chains(source, "target_chains", [])
+        if not target_chains:
+            _inferred_binder, target_chains = _infer_chain_roles(source_run_dir, source)
+        target_set = set(target_chains)
+        sequences = _pdb_sequences_by_chain(staged_path)
+        raw = source.get("raw_metadata") if isinstance(source.get("raw_metadata"), dict) else {}
+        row = raw.get("repo_run_csv_row") if isinstance(raw.get("repo_run_csv_row"), dict) else {}
+        declared_sequences: dict[str, str] = {}
+        for chain in binder_chains:
+            sequence = _clean_sequence(row.get(f"{chain}_seq") or (row.get("A_seq") if chain == "A" else ""))
+            if sequence:
+                declared_sequences[chain] = sequence
+        for chain in target_chains:
+            sequence = _clean_sequence(row.get(f"target_subchain_{chain}_seq") or row.get(f"{chain}_seq") or "")
+            if sequence:
+                declared_sequences[chain] = sequence
+        if declared_sequences and all(chain in declared_sequences for chain in [*binder_chains, *target_chains]):
+            sequences = declared_sequences
+        msa_records = _rf3_msa_records_for_candidate(source, benchmark_msa_records) if use_target_msa else {}
+        used_msa_records: set[str] = set()
+        sequence_entries: list[dict[str, Any]] = []
+        for chain, sequence in sequences.items():
+            protein: dict[str, Any] = {"sequence": sequence, "count": 1}
+            chain_dir = msa_root / safe_id / f"chain_{_safe_id(chain)}"
+            if use_target_msa and chain in target_set:
+                record_chain = chain if chain in msa_records else ""
+                if not record_chain:
+                    for candidate_chain, record in msa_records.items():
+                        if candidate_chain in used_msa_records:
+                            continue
+                        if _clean_sequence(record.get("sequence")) == _clean_sequence(sequence):
+                            record_chain = candidate_chain
+                            break
+                record = msa_records.get(record_chain) if record_chain else None
+                if record is None:
+                    metrics["protenix_target_msa_missing_count"] += 1
+                elif _clean_sequence(record.get("sequence")) and _clean_sequence(record.get("sequence")) != _clean_sequence(sequence):
+                    metrics["protenix_target_msa_sequence_mismatch_count"] += 1
+                else:
+                    source_msa = Path(str(record.get("msa_path") or ""))
+                    if source_msa.exists():
+                        chain_dir.mkdir(parents=True, exist_ok=True)
+                        for filename in ["pairing.a3m", "non_pairing.a3m"]:
+                            shutil.copy2(source_msa, chain_dir / filename)
+                        attach_msa(protein, chain_dir)
+                        metrics["protenix_target_msa_injected_count"] += 1
+                        used_msa_records.add(record_chain)
+                    else:
+                        metrics["protenix_target_msa_missing_count"] += 1
+            if use_target_msa and "msa" not in protein:
+                write_query_only_msa(chain_dir, safe_id, chain, sequence)
+                attach_msa(protein, chain_dir)
+                if chain in target_set:
+                    metrics["protenix_target_query_only_msa_fallback_count"] += 1
+                else:
+                    metrics["protenix_binder_query_only_msa_count"] += 1
+            sequence_entries.append({"proteinChain": protein})
+        candidate_json_dir = json_root / safe_id
+        candidate_json_dir.mkdir(parents=True, exist_ok=True)
+        input_path = candidate_json_dir / f"{safe_id}.json"
+        write_json(input_path, [{"sequences": sequence_entries, "name": safe_id}])
+        protenix_inputs[safe_id] = candidate_json_dir
+    return protenix_inputs, metrics
 
 
 def _monomer_candidate_id(source: dict[str, Any], tool: str) -> str:
@@ -439,6 +745,40 @@ def _renumber_structure_chain(
     return _renumber_pdb_chain(path, chain_id, start_atom, source_chains)
 
 
+def _target_output_chain_ids(target_chains: list[str]) -> list[str]:
+    reserved = {"A"}
+    fallback = [chr(code) for code in range(ord("B"), ord("Z") + 1)]
+    output_ids: list[str] = []
+    for index, chain in enumerate(target_chains):
+        candidate = str(chain or "").strip()
+        if len(candidate) != 1 or candidate in reserved or candidate in output_ids:
+            candidate = next((item for item in fallback if item not in reserved and item not in output_ids), "Z")
+        output_ids.append(candidate)
+    return output_ids
+
+
+def _write_engine_chain_map(
+    input_dir: Path,
+    safe_id: str,
+    *,
+    binder_source_chains: list[str],
+    target_source_chains: list[str],
+    target_engine_chains: list[str],
+) -> None:
+    payload = {
+        "candidate_id": safe_id,
+        "binder": [
+            {"original_chain": chain, "engine_chain": "A"}
+            for chain in binder_source_chains
+        ],
+        "targets": [
+            {"original_chain": original, "engine_chain": engine}
+            for original, engine in zip(target_source_chains, target_engine_chains)
+        ],
+    }
+    write_json(input_dir / f"{safe_id}.chain_map.json", payload)
+
+
 def _target_pdb_for_candidate(source_run_dir: Path, candidate: dict[str, Any]) -> Path | None:
     checked: set[tuple[str, str]] = set()
 
@@ -539,10 +879,22 @@ def _complex_pdb_for_candidate(source_run_dir: Path, candidate: dict[str, Any], 
         output = input_dir / f"{safe_id}{suffix}.pdb"
         inferred_binder_chains, inferred_target_chains = _infer_chain_roles(source_run_dir, candidate, path)
         binder_lines, next_atom = _renumber_structure_chain(path, "A", 1, set(inferred_binder_chains))
-        target_lines, _ = _renumber_structure_chain(path, "B", next_atom, set(inferred_target_chains))
+        target_engine_chains = _target_output_chain_ids(inferred_target_chains)
+        target_lines: list[str] = []
+        for source_chain, output_chain in zip(inferred_target_chains, target_engine_chains):
+            chain_lines, next_atom = _renumber_structure_chain(path, output_chain, next_atom, {source_chain})
+            if chain_lines:
+                target_lines.extend(chain_lines + ["TER"])
         if not binder_lines or not target_lines:
             return None
-        output.write_text("\n".join(binder_lines + ["TER"] + target_lines + ["TER", "END", ""]))
+        output.write_text("\n".join(binder_lines + ["TER"] + target_lines + ["END", ""]))
+        _write_engine_chain_map(
+            input_dir,
+            safe_id,
+            binder_source_chains=inferred_binder_chains,
+            target_source_chains=inferred_target_chains,
+            target_engine_chains=target_engine_chains,
+        )
         return output
 
     if source_complex and source_complex.exists() and len(_structure_chains(source_complex)) >= 2:
@@ -588,8 +940,23 @@ def _complex_pdb_for_candidate(source_run_dir: Path, candidate: dict[str, Any], 
     output = input_dir / f"{safe_id}.pdb"
     binder_chains, _target_chains = _infer_chain_roles(source_run_dir, candidate, binder)
     binder_lines, next_atom = _renumber_structure_chain(binder, "A", 1, binder_chains if len(_structure_chains(binder)) > 1 else None)
-    target_lines, _ = _renumber_pdb_chain(target, "B", next_atom)
-    output.write_text("\n".join(binder_lines + ["TER"] + target_lines + ["TER", "END", ""]))
+    target_structure_chains = _structure_chains(target)
+    requested_targets = _candidate_chains(candidate, "target_chains", target_structure_chains)
+    target_source_chains = [chain for chain in requested_targets if chain in target_structure_chains] or target_structure_chains
+    target_engine_chains = _target_output_chain_ids(target_source_chains)
+    target_lines: list[str] = []
+    for source_chain, output_chain in zip(target_source_chains, target_engine_chains):
+        chain_lines, next_atom = _renumber_structure_chain(target, output_chain, next_atom, {source_chain})
+        if chain_lines:
+            target_lines.extend(chain_lines + ["TER"])
+    output.write_text("\n".join(binder_lines + ["TER"] + target_lines + ["END", ""]))
+    _write_engine_chain_map(
+        input_dir,
+        safe_id,
+        binder_source_chains=binder_chains,
+        target_source_chains=target_source_chains,
+        target_engine_chains=target_engine_chains,
+    )
     return output
 
 
@@ -601,9 +968,22 @@ def _stage_complex_inputs(source_run_dir: Path, source_candidates: list[dict[str
         complex_path = _complex_pdb_for_candidate(source_run_dir, candidate, input_dir)
         staged_path = input_dir / f"{safe_id}.pdb"
         if complex_path.resolve() != staged_path.resolve():
+            source_map = complex_path.with_suffix(".chain_map.json")
             shutil.copy2(complex_path, staged_path)
+            if source_map.exists():
+                shutil.copy2(source_map, input_dir / f"{safe_id}.chain_map.json")
             if complex_path.parent.resolve() == input_dir.resolve():
                 complex_path.unlink(missing_ok=True)
+                source_map.unlink(missing_ok=True)
+        elif not (input_dir / f"{safe_id}.chain_map.json").exists():
+            binder_chains, target_chains = _infer_chain_roles(source_run_dir, candidate, staged_path)
+            _write_engine_chain_map(
+                input_dir,
+                safe_id,
+                binder_source_chains=binder_chains,
+                target_source_chains=target_chains,
+                target_engine_chains=target_chains,
+            )
         staged[safe_id] = staged_path
     return staged
 
@@ -1736,6 +2116,7 @@ def run_af2_initial_guess_complex_refolding(
     use_binder_template: bool = False,
     use_interface_template: bool = False,
     docker_image: str = "ovo-colabdesign:latest",
+    internal_parent_run_dir: Path | None = None,
 ) -> Path:
     source_run_dir = Path(source_run_dir)
     candidates_jsonl = Path(candidates_jsonl)
@@ -1762,6 +2143,14 @@ def run_af2_initial_guess_complex_refolding(
             "alphafold_models_dir": str(ALPHAFOLD_MODELS_DIR),
         },
     )
+    if internal_parent_run_dir is not None:
+        mark_internal_job(
+            job.run_dir,
+            parent_run_dir=Path(internal_parent_run_dir),
+            parent_task_group="benchmark",
+            role="benchmark_engine_subrun",
+            engine="af2_initial_guess",
+        )
     raw_root = job.run_dir / "artifacts" / "raw" / "af2_initial_guess"
     input_dir = raw_root / "inputs"
     output_dir = raw_root / "output"
@@ -1887,6 +2276,8 @@ def run_boltz2_complex_refolding(
     sampling_steps: int = 200,
     diffusion_samples: int = 3,
     write_full_pae: bool = True,
+    internal_parent_run_dir: Path | None = None,
+    benchmark_run_csv: Path | None = None,
 ) -> Path:
     source_run_dir = Path(source_run_dir)
     candidates_jsonl = Path(candidates_jsonl)
@@ -1912,8 +2303,17 @@ def run_boltz2_complex_refolding(
             "sampling_steps": sampling_steps,
             "diffusion_samples": diffusion_samples,
             "write_full_pae": write_full_pae,
+            "benchmark_run_csv": str(benchmark_run_csv) if benchmark_run_csv else None,
         },
     )
+    if internal_parent_run_dir is not None:
+        mark_internal_job(
+            job.run_dir,
+            parent_run_dir=Path(internal_parent_run_dir),
+            parent_task_group="benchmark",
+            role="benchmark_engine_subrun",
+            engine="boltz2",
+        )
     raw_root = job.run_dir / "artifacts" / "raw" / "boltz2_initial_guess"
     input_pdb_dir = raw_root / "input_pdbs"
     yaml_dir = raw_root / "yaml_inputs"
@@ -2014,10 +2414,22 @@ def run_boltz2_complex_refolding(
         job.run_dir,
         [
             {"name": "boltz2-prepare-inputs", "command": prep_command},
-            {"name": "boltz2-clean-template-pdb", "command": cleanup_command},
-            {"name": "boltz2-initial-guess", "command": predict_command},
         ],
     )
+    msa_metrics = {}
+    if rc == 0:
+        msa_metrics = _inject_boltz_yaml_msas(
+            yaml_dir=yaml_dir,
+            raw_root=raw_root,
+            benchmark_run_csv=benchmark_run_csv,
+        )
+        rc = _run_shell_steps(
+            job.run_dir,
+            [
+                {"name": "boltz2-clean-template-pdb", "command": cleanup_command},
+                {"name": "boltz2-initial-guess", "command": predict_command},
+            ],
+        )
     predictions_root = job.run_dir / "boltz_results_yaml_inputs" / "predictions"
     if predictions_root.exists():
         target_root = output_dir / "predictions"
@@ -2077,7 +2489,12 @@ def run_boltz2_complex_refolding(
         rc == 0 and bool(normalized),
         {
             "outputs": {"artifacts": artifacts, "candidates": normalized},
-            "metrics": {"return_code": rc, "candidate_count": len(normalized), "artifact_count": len(artifacts)},
+            "metrics": {
+                "return_code": rc,
+                "candidate_count": len(normalized),
+                "artifact_count": len(artifacts),
+                **msa_metrics,
+            },
             "downstream_artifacts": {
                 "candidates_jsonl": "artifacts/normalized_candidates/candidates.jsonl",
                 "campaign_result": "artifacts/normalized_candidates/campaign_result.json",
@@ -2085,3 +2502,574 @@ def run_boltz2_complex_refolding(
         },
     )
     return job.run_dir
+
+
+def _first_prediction_file(output_dir: Path, safe_id: str) -> Path | None:
+    for pattern in (
+        f"**/{safe_id}*_model.cif",
+        f"**/{safe_id}*.cif",
+        f"**/{safe_id}*.pdb",
+        "**/*_model.cif",
+        "**/*.cif",
+        "**/*.pdb",
+    ):
+        matches = sorted(output_dir.glob(pattern))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _prediction_summary_metrics(output_dir: Path, prefix: str) -> dict[str, Any]:
+    summary_paths: list[Path] = []
+    for pattern in ("**/*summary_confidence*.json", "**/*summary_confidences*.json", "**/confidence*.json"):
+        summary_paths = sorted(output_dir.glob(pattern))
+        if summary_paths:
+            break
+    if not summary_paths:
+        npz_paths = sorted(output_dir.glob("**/*.npz"))
+        if not npz_paths:
+            return {}
+        try:
+            payload = np.load(npz_paths[0])
+            return {
+                f"{prefix}_{key}": float(np.asarray(payload[key]).mean())
+                for key in payload.files
+                if np.asarray(payload[key]).dtype.kind in "biuf" and np.asarray(payload[key]).size
+            }
+        except (OSError, ValueError):
+            return {}
+    try:
+        payload = json.loads(summary_paths[0].read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if isinstance(payload, list) and payload:
+        payload = payload[0]
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        f"{prefix}_{key}": value
+        for key, value in payload.items()
+        if isinstance(value, (str, int, float, bool)) or value is None
+    }
+
+
+def _prediction_pae_file(output_dir: Path, prefix: str) -> Path | None:
+    patterns = {
+        "rf3": ("**/*_confidences.json", "**/*confidences.json"),
+        "protenix": ("**/*_full_data_sample_*.json", "**/*full_data*.json"),
+        "boltzgen_fold": ("**/*.npz",),
+    }.get(prefix, ("**/*pae*.json", "**/*confidences.json", "**/*.npz"))
+    for pattern in patterns:
+        for path in sorted(output_dir.glob(pattern)):
+            name = path.name.lower()
+            if "summary" in name:
+                continue
+            if prefix == "boltzgen_fold":
+                try:
+                    payload = np.load(path)
+                    if any(np.asarray(payload[key]).ndim >= 2 and "pae" in key.lower() for key in payload.files):
+                        return path
+                except (OSError, ValueError):
+                    continue
+                continue
+            return path
+    return None
+
+
+def _standard_pae_json_path(pae_source: Path, output_dir: Path, safe_id: str, prefix: str) -> Path | None:
+    if pae_source.suffix.lower() == ".npz":
+        try:
+            payload = np.load(pae_source)
+            matrix_array = None
+            for key in ("predicted_aligned_error", "pae", "token_pair_pae"):
+                if key in payload.files:
+                    matrix_array = np.asarray(payload[key])
+                    break
+            if matrix_array is None or matrix_array.ndim < 2:
+                return None
+            if matrix_array.ndim == 3:
+                matrix_array = matrix_array[0]
+            matrix = np.asarray(matrix_array, dtype=float).tolist()
+            plddt = None
+            for key in ("plddt", "atom_plddt", "token_plddt"):
+                if key in payload.files:
+                    plddt_array = np.asarray(payload[key])
+                    if plddt_array.ndim > 1:
+                        plddt_array = plddt_array[0]
+                    plddt = np.asarray(plddt_array, dtype=float).tolist()
+                    break
+        except (OSError, ValueError, KeyError):
+            return None
+    else:
+        if pae_source.suffix.lower() != ".json":
+            return None
+        try:
+            payload = json.loads(pae_source.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        matrix = payload.get("predicted_aligned_error") or payload.get("pae") or payload.get("token_pair_pae")
+        plddt = payload.get("plddt")
+        if plddt is None:
+            plddt = payload.get("atom_plddts") or payload.get("atom_plddt") or payload.get("token_plddt")
+    if matrix is None:
+        return None
+    target = output_dir / f"{safe_id}_{prefix}_pae.json"
+    target.write_text(
+        json.dumps(
+            {
+                "predicted_aligned_error": matrix,
+                "pae": matrix,
+                "plddt": plddt,
+                "source_pae_file": str(pae_source.name),
+            }
+        )
+    )
+    return target
+
+
+def _finish_external_complex_refolding(
+    *,
+    job_run_dir: Path,
+    source_run_dir: Path,
+    source_candidates: list[dict[str, Any]],
+    staged: dict[str, Path],
+    output_root: Path,
+    tool: str,
+    rc: int,
+    extra_metrics: dict[str, Any] | None = None,
+) -> Path:
+    candidates: list[dict[str, Any]] = []
+    if rc == 0:
+        for safe_id, staged_path in staged.items():
+            source = next(item for item in source_candidates if safe_id == _safe_id(item.get("candidate_id")))
+            candidate_output = output_root / safe_id
+            prediction = _first_prediction_file(candidate_output, safe_id)
+            pae_source = _prediction_pae_file(candidate_output, tool)
+            pae_path = _standard_pae_json_path(pae_source, candidate_output, safe_id, tool) if pae_source else None
+            binder_chains, target_chains = _infer_chain_roles(source_run_dir, source, prediction or staged_path)
+            metrics = dict(source.get("metrics") or {})
+            metrics.update(_prediction_summary_metrics(candidate_output, tool))
+            metrics["complex_refolding_backend"] = tool
+            metrics[f"{tool}_has_full_pae"] = pae_path is not None
+            candidates.append(
+                {
+                    **source,
+                    "candidate_id": _complex_candidate_id(
+                        source,
+                        tool,
+                        "target_template" if tool == "boltzgen_fold" else "sequence",
+                    ),
+                    "stage": STAGE_COMPLEX_REFOLDING,
+                    "source_tool": tool,
+                    "tool": tool,
+                    "binder_chains": binder_chains,
+                    "target_chains": target_chains,
+                    "complex_pdb": _rel_path(job_run_dir, prediction) if prediction else _rel_path(job_run_dir, staged_path),
+                    "metrics": metrics,
+                    "parents": [str(source.get("candidate_id") or "")],
+                    "raw_metadata": {
+                        **dict(source.get("raw_metadata") or {}),
+                        "source_candidate": source,
+                        "input_complex": _rel_path(job_run_dir, staged_path),
+                        "prediction_dir": _rel_path(job_run_dir, candidate_output),
+                        "pae_source_path": _rel_path(job_run_dir, pae_source) if pae_source else None,
+                        "pae_path": _rel_path(job_run_dir, pae_path) if pae_path else None,
+                    },
+                }
+            )
+    normalized = write_candidates(job_run_dir, tool, candidates) if candidates else []
+    artifacts = _collect_refolding_artifacts(job_run_dir)
+    finish_job(
+        job_run_dir,
+        rc == 0 and bool(normalized),
+        {
+            "outputs": {"artifacts": artifacts, "candidates": normalized},
+            "metrics": {
+                "return_code": rc,
+                "candidate_count": len(normalized),
+                "artifact_count": len(artifacts),
+                **(extra_metrics or {}),
+            },
+            "downstream_artifacts": {
+                "candidates_jsonl": "artifacts/normalized_candidates/candidates.jsonl",
+                "campaign_result": "artifacts/normalized_candidates/campaign_result.json",
+            },
+        },
+    )
+    return job_run_dir
+
+
+def run_rf3_complex_refolding(
+    source_run_dir: Path,
+    candidates_jsonl: Path,
+    require_monomer_success: bool = True,
+    checkpoint_path: Path = RF3_CHECKPOINT,
+    use_target_msa: bool = True,
+    n_recycles: int = 10,
+    num_steps: int = 50,
+    diffusion_batch_size: int = 5,
+    seed: int = 0,
+    benchmark_run_csv: Path | None = None,
+    internal_parent_run_dir: Path | None = None,
+) -> Path:
+    source_run_dir = Path(source_run_dir)
+    allowed = {STAGE_MONOMER_REFOLDING} if require_monomer_success else {
+        STAGE_MONOMER_REFOLDING,
+        STAGE_SEQUENCE_DESIGN,
+        STAGE_GENERATION_BACKBONE_SEQUENCE,
+        STAGE_COMPLEX_REFOLDING,
+    }
+    source_candidates = _source_candidates(Path(candidates_jsonl), allowed)
+    job = create_job(
+        REFOLDING_GROUP,
+        "complex_refolding",
+        "rf3",
+        {"source_run_dir": str(source_run_dir), "candidates_jsonl": str(candidates_jsonl)},
+        {
+            "image": RF3_IMAGE,
+            "checkpoint_path": str(checkpoint_path),
+            "initial_guess_supported": False,
+            "target_msa_supported": True,
+            "use_target_msa": use_target_msa,
+            "n_recycles": n_recycles,
+            "num_steps": num_steps,
+            "diffusion_batch_size": diffusion_batch_size,
+            "seed": seed,
+            "benchmark_run_csv": str(benchmark_run_csv) if benchmark_run_csv else None,
+        },
+    )
+    if internal_parent_run_dir is not None:
+        mark_internal_job(
+            job.run_dir,
+            parent_run_dir=Path(internal_parent_run_dir),
+            parent_task_group="benchmark",
+            role="benchmark_engine_subrun",
+            engine="rf3",
+        )
+    raw_root = job.run_dir / "artifacts" / "raw" / "rf3"
+    input_dir = raw_root / "inputs"
+    staged = _stage_complex_inputs(source_run_dir, source_candidates, input_dir)
+    rf3_inputs, msa_metrics = _write_rf3_json_inputs(
+        source_run_dir=source_run_dir,
+        source_candidates=source_candidates,
+        staged=staged,
+        input_dir=input_dir,
+        benchmark_run_csv=benchmark_run_csv,
+        use_target_msa=use_target_msa,
+    )
+    output_root = raw_root / "output"
+    steps: list[dict[str, Any]] = []
+    for safe_id, rf3_input in rf3_inputs.items():
+        (output_root / safe_id).mkdir(parents=True, exist_ok=True)
+        steps.append(
+            {
+                "name": f"rf3-{safe_id}",
+                "command": [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--gpus",
+                    "all",
+                    "--shm-size=32G",
+                    "-v",
+                    f"{job.run_dir}:/work",
+                    "-v",
+                    f"{checkpoint_path.parent}:/weights:ro",
+                    "-w",
+                    "/work",
+                    RF3_IMAGE,
+                    "rf3",
+                    "fold",
+                    f"inputs=/work/{rf3_input.relative_to(job.run_dir)}",
+                    f"ckpt_path=/weights/{checkpoint_path.name}",
+                    f"out_dir=/work/artifacts/raw/rf3/output/{safe_id}",
+                    f"n_recycles={int(n_recycles)}",
+                    f"num_steps={int(num_steps)}",
+                    f"diffusion_batch_size={int(diffusion_batch_size)}",
+                    f"seed={int(seed)}",
+                    "raise_if_missing_msa_for_protein_of_length_n=10000",
+                ],
+            }
+        )
+    rc = _run_shell_steps(job.run_dir, steps)
+    return _finish_external_complex_refolding(
+        job_run_dir=job.run_dir,
+        source_run_dir=source_run_dir,
+        source_candidates=source_candidates,
+        staged=staged,
+        output_root=output_root,
+        tool="rf3",
+        rc=rc,
+        extra_metrics={
+            "initial_guess_supported": False,
+            "target_msa_supported": True,
+            "use_target_msa": use_target_msa,
+            "n_recycles": n_recycles,
+            "num_steps": num_steps,
+            "diffusion_batch_size": diffusion_batch_size,
+            "seed": seed,
+            **msa_metrics,
+        },
+    )
+
+
+def run_protenix_complex_refolding(
+    source_run_dir: Path,
+    candidates_jsonl: Path,
+    require_monomer_success: bool = True,
+    use_msa: bool = True,
+    benchmark_run_csv: Path | None = None,
+    cycle: int = 10,
+    diffusion_steps: int = 200,
+    samples: int = 5,
+    internal_parent_run_dir: Path | None = None,
+) -> Path:
+    source_run_dir = Path(source_run_dir)
+    allowed = {STAGE_MONOMER_REFOLDING} if require_monomer_success else {
+        STAGE_MONOMER_REFOLDING,
+        STAGE_SEQUENCE_DESIGN,
+        STAGE_GENERATION_BACKBONE_SEQUENCE,
+        STAGE_COMPLEX_REFOLDING,
+    }
+    source_candidates = _source_candidates(Path(candidates_jsonl), allowed)
+    job = create_job(
+        REFOLDING_GROUP,
+        "complex_refolding",
+        "protenix",
+        {"source_run_dir": str(source_run_dir), "candidates_jsonl": str(candidates_jsonl)},
+        {
+            "image": PROTENIX_IMAGE,
+            "reference_dir": str(PROTENIX_REFERENCE_DIR),
+            "use_msa": use_msa,
+            "benchmark_run_csv": str(benchmark_run_csv) if benchmark_run_csv else None,
+            "cycle": cycle,
+            "diffusion_steps": diffusion_steps,
+            "samples": samples,
+            "initial_guess_supported": False,
+        },
+    )
+    if internal_parent_run_dir is not None:
+        mark_internal_job(
+            job.run_dir,
+            parent_run_dir=Path(internal_parent_run_dir),
+            parent_task_group="benchmark",
+            role="benchmark_engine_subrun",
+            engine="protenix",
+        )
+    raw_root = job.run_dir / "artifacts" / "raw" / "protenix"
+    staged = _stage_complex_inputs(source_run_dir, source_candidates, raw_root / "inputs")
+    protenix_inputs, msa_metrics = _write_protenix_json_inputs(
+        source_run_dir=source_run_dir,
+        source_candidates=source_candidates,
+        staged=staged,
+        json_root=raw_root / "json",
+        msa_root=raw_root / "msas",
+        benchmark_run_csv=benchmark_run_csv,
+        use_target_msa=use_msa,
+    )
+    output_root = raw_root / "output"
+    steps: list[dict[str, Any]] = []
+    for safe_id, protenix_input_dir in protenix_inputs.items():
+        (output_root / safe_id).mkdir(parents=True, exist_ok=True)
+        protenix_code = "\n".join(
+            [
+                "import copy, os",
+                "from pathlib import Path",
+                "from protenix.utils.file_io import save_json",
+                "from protenix.utils.torch_utils import round_values",
+                "from runner.batch_inference import get_default_runner",
+                "from runner.msa_search import update_infer_json",
+                "from runner.inference import infer_predict",
+                "from runner import dumper as pxd_dumper",
+                f"input_dir = Path('/work/{protenix_input_dir.relative_to(job.run_dir)}')",
+                f"out_dir = '/work/artifacts/raw/protenix/output/{safe_id}'",
+                "files = sorted(str(path) for path in input_dir.rglob('*.json'))",
+                "orig_save_confidence = pxd_dumper.DataDumper._save_confidence",
+                "",
+                "def save_full_confidence(self, data, prediction_save_dir, sample_name, **kwargs):",
+                "    orig_save_confidence(self, data, prediction_save_dir, sample_name, **kwargs)",
+                "    full = data.get('full_confidence') or data.get('full_data')",
+                "    n = len(full) if full is not None else 0",
+                "    for idx in range(n):",
+                "        payload = {",
+                "            key: value",
+                "            for key, value in copy.deepcopy(full[idx]).items()",
+                "            if key not in {'atom_coordinate', 'atom_is_polymer'}",
+                "        }",
+                "        save_json(",
+                "            round_values(payload),",
+                "            os.path.join(prediction_save_dir, f'{sample_name}_full_data_sample_{idx}.json'),",
+                "            indent=4,",
+                "        )",
+                "",
+                "pxd_dumper.DataDumper._save_confidence = save_full_confidence",
+                "",
+                "for path in files:",
+                f"    updated = update_infer_json(path, out_dir=out_dir, use_msa={bool(use_msa)!r})",
+                f"    runner = get_default_runner(seeds=(101,), n_cycle={int(cycle)}, n_step={int(diffusion_steps)}, n_sample={int(samples)}, model_name='protenix_base_default_v0.5.0', use_msa={bool(use_msa)!r})",
+                "    runner.configs.dump_dir = out_dir",
+                "    runner.configs.input_json_path = updated",
+                "    runner.configs.need_atom_confidence = True",
+                "    runner.dumper.need_atom_confidence = True",
+                "    runner.dumper.base_dir = out_dir",
+                "    infer_predict(runner, runner.configs)",
+            ]
+        )
+        steps.append(
+                {
+                    "name": f"protenix-predict-{safe_id}",
+                    "command": [
+                        "docker",
+                        "run",
+                        "--rm",
+                        "--gpus",
+                        "all",
+                        "--shm-size=32G",
+                        "-v",
+                        f"{job.run_dir}:/work",
+                        "-v",
+                        f"{PROTENIX_REFERENCE_DIR}:/ref/pxdesign:ro",
+                        "-v",
+                        f"{PROTENIX_REFERENCE_DIR / 'release_data'}:/opt/conda/lib/python3.11/site-packages/release_data:ro",
+                        "-e",
+                        "PROTENIX_DATA_ROOT_DIR=/ref/pxdesign/release_data/ccd_cache",
+                        "-e",
+                        "TOOL_WEIGHTS_ROOT=/ref/pxdesign/tool_weights",
+                        PROTENIX_IMAGE,
+                        "python",
+                        "-c",
+                        protenix_code,
+                    ],
+                },
+        )
+    rc = _run_shell_steps(job.run_dir, steps)
+    return _finish_external_complex_refolding(
+        job_run_dir=job.run_dir,
+        source_run_dir=source_run_dir,
+        source_candidates=source_candidates,
+        staged=staged,
+        output_root=output_root,
+        tool="protenix",
+        rc=rc,
+        extra_metrics={
+            "initial_guess_supported": False,
+            "target_msa_supported": True,
+            "use_msa": use_msa,
+            **msa_metrics,
+        },
+    )
+
+
+def run_boltzgen_fold_complex_refolding(
+    source_run_dir: Path,
+    candidates_jsonl: Path,
+    require_monomer_success: bool = True,
+    recycling_steps: int = 3,
+    sampling_steps: int = 200,
+    diffusion_samples: int = 5,
+    internal_parent_run_dir: Path | None = None,
+) -> Path:
+    """Run BoltzGen's template-conditioned folding stage on existing complexes."""
+    source_run_dir = Path(source_run_dir)
+    allowed = {STAGE_MONOMER_REFOLDING} if require_monomer_success else {
+        STAGE_MONOMER_REFOLDING,
+        STAGE_SEQUENCE_DESIGN,
+        STAGE_GENERATION_BACKBONE_SEQUENCE,
+        STAGE_COMPLEX_REFOLDING,
+    }
+    source_candidates = _source_candidates(Path(candidates_jsonl), allowed)
+    job = create_job(
+        REFOLDING_GROUP,
+        "complex_refolding",
+        "boltzgen_fold",
+        {"source_run_dir": str(source_run_dir), "candidates_jsonl": str(candidates_jsonl)},
+        {
+            "image": BOLTZGEN_IMAGE,
+            "mode": "target_template_folding",
+            "target_templates": True,
+            "use_msa": False,
+            "recycling_steps": recycling_steps,
+            "sampling_steps": sampling_steps,
+            "diffusion_samples": diffusion_samples,
+        },
+    )
+    if internal_parent_run_dir is not None:
+        mark_internal_job(
+            job.run_dir,
+            parent_run_dir=Path(internal_parent_run_dir),
+            parent_task_group="benchmark",
+            role="benchmark_engine_subrun",
+            engine="boltzgen_fold",
+        )
+    raw_root = job.run_dir / "artifacts" / "raw" / "boltzgen_fold"
+    input_dir = raw_root / "inputs"
+    staged = _stage_complex_inputs(source_run_dir, source_candidates, input_dir)
+    for safe_id, staged_path in staged.items():
+        source = next(item for item in source_candidates if safe_id == _safe_id(item.get("candidate_id")))
+        binder_chains, _target_chains = _infer_chain_roles(source_run_dir, source, staged_path)
+        sequences = _pdb_sequences_by_chain(staged_path)
+        design_mask = np.asarray(
+            [chain in set(binder_chains) for chain, sequence in sequences.items() for _residue in sequence],
+            dtype=bool,
+        )
+        np.savez(input_dir / f"{safe_id}.npz", design_mask=design_mask)
+    output_root = raw_root / "output"
+    output_root.mkdir(parents=True, exist_ok=True)
+    hot_patch_mounts: list[str] = []
+    if BOLTZGEN_LOCAL_SOURCE.exists():
+        hot_patch_mounts.extend(["-v", f"{BOLTZGEN_LOCAL_SOURCE}:/app/src/boltzgen:ro"])
+    boltzgen_config_path = "/app/config/fold.yaml"
+    if BOLTZGEN_BENCHMARK_PAE_CONFIG.exists():
+        boltzgen_config_path = "/app/config/fold_benchmark_pae.yaml"
+        hot_patch_mounts.extend(["-v", f"{BOLTZGEN_BENCHMARK_PAE_CONFIG}:{boltzgen_config_path}:ro"])
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--gpus",
+        "all",
+        "--shm-size=32G",
+        "-v",
+        f"{job.run_dir}:/work",
+        *hot_patch_mounts,
+        "-w",
+        "/work",
+        "--entrypoint",
+        "python",
+        BOLTZGEN_IMAGE,
+        "/app/src/boltzgen/resources/main.py",
+        boltzgen_config_path,
+        "data.design_dir=/work/artifacts/raw/boltzgen_fold/inputs",
+        "data.cfg.suffix=.pdb",
+        "data.cfg.num_workers=1",
+        "data.cfg.moldir=/cache/datasets--boltzgen--inference-data/snapshots/c3d36fd276e9caf098c75d4113c6d5eb320b1a4c/mols.zip",
+        "output=/work/artifacts/raw/boltzgen_fold/output",
+        "checkpoint=/cache/models--boltzgen--boltzgen-1/snapshots/c1be29e1f82ffcc72264f64b993c43fb4e0d17f0/boltz2_conf_final.ckpt",
+        f"recycling_steps={int(recycling_steps)}",
+        f"sampling_steps={int(sampling_steps)}",
+        f"diffusion_samples={int(diffusion_samples)}",
+        "trainer.devices=1",
+    ]
+    rc = _run_shell_steps(job.run_dir, [{"name": "boltzgen-target-template-fold", "command": command}])
+    # BoltzGen writes folded files beside the staged designs.
+    for safe_id in staged:
+        candidate_output = output_root / safe_id
+        candidate_output.mkdir(parents=True, exist_ok=True)
+        for path in sorted((input_dir / "refold_cif").glob(f"{safe_id}*.cif")):
+            shutil.copy2(path, candidate_output / path.name)
+        for path in sorted((input_dir / "fold_out_npz").glob(f"{safe_id}*.npz")):
+            shutil.copy2(path, candidate_output / path.name)
+    return _finish_external_complex_refolding(
+        job_run_dir=job.run_dir,
+        source_run_dir=source_run_dir,
+        source_candidates=source_candidates,
+        staged=staged,
+        output_root=output_root,
+        tool="boltzgen_fold",
+        rc=rc,
+        extra_metrics={
+            "initial_guess_supported": True,
+            "initial_guess_mode": "target template from non-designed chains",
+            "target_msa_supported": False,
+        },
+    )

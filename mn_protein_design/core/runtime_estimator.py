@@ -17,6 +17,9 @@ ENGINE_LABELS = {
     "af2_initial_guess": "AF2 initial guess",
     "boltz2_initial_guess": "Boltz-2",
     "esmfold2": "ESMFold2",
+    "rf3": "RF3",
+    "protenix": "Protenix",
+    "boltzgen_fold": "BoltzGen target-template fold",
     "postprocessing": "Metric postprocessing",
 }
 
@@ -28,6 +31,9 @@ FALLBACK_SECONDS_PER_CANDIDATE = {
     "alphafast_af3": 55.0,
     "alphafast_msa": 15.0,
     "postprocessing": 8.0,
+    "rf3": 30.0,
+    "protenix": 45.0,
+    "boltzgen_fold": 25.0,
 }
 
 TOOL_TO_ENGINE = {
@@ -36,6 +42,9 @@ TOOL_TO_ENGINE = {
     "esmfold2_initial_guess_validation": "esmfold2",
     "af2_initial_guess": "af2_initial_guess",
     "boltz2_initial_guess": "boltz2_initial_guess",
+    "rf3": "rf3",
+    "protenix": "protenix",
+    "boltzgen_fold": "boltzgen_fold",
 }
 
 

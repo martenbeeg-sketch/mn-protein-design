@@ -225,6 +225,26 @@ def create_job(task_group: str, job_type: str, tool: str, inputs: dict, params: 
     return JobPaths(task_group=task_group, run_id=run_id, run_dir=run_dir)
 
 
+def mark_internal_job(
+    run_dir: Path,
+    *,
+    parent_run_dir: Path,
+    parent_task_group: str,
+    role: str,
+    engine: str | None = None,
+) -> None:
+    metadata = read_json(run_dir / "metadata.json")
+    metadata["hidden"] = True
+    metadata["parent_task_group"] = parent_task_group
+    metadata["parent_run_id"] = parent_run_dir.name
+    metadata["parent_run_dir"] = str(parent_run_dir)
+    metadata["parent_role"] = role
+    if engine:
+        metadata["benchmark_engine"] = engine
+    metadata["updated_at"] = utc_now()
+    write_json(run_dir / "metadata.json", metadata)
+
+
 def update_status(run_dir: Path, status: str, **extra: object) -> None:
     metadata = read_json(run_dir / "metadata.json")
     if status == "running":

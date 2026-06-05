@@ -524,9 +524,14 @@ def _chain_ca_coordinates(structure_path: Path) -> dict[str, list[tuple[float, f
 
 
 def _chain_roles(candidate: dict[str, Any]) -> tuple[str, str]:
+    binder_chains, target_chains = _chain_role_groups(candidate)
+    return (binder_chains[0], target_chains[0])
+
+
+def _chain_role_groups(candidate: dict[str, Any]) -> tuple[list[str], list[str]]:
     binder_chains = [str(chain) for chain in candidate.get("binder_chains") or [] if str(chain)]
     target_chains = [str(chain) for chain in candidate.get("target_chains") or [] if str(chain)]
-    return (binder_chains[0] if binder_chains else "A", target_chains[0] if target_chains else "B")
+    return (binder_chains or ["A"], target_chains or ["B"])
 
 
 def _distance(left: tuple[float, float, float], right: tuple[float, float, float]) -> float:
@@ -538,6 +543,7 @@ def _interface_pae_scores(
     pae_path: Path | None,
     binder_chain: str = "A",
     target_chain: str = "B",
+    target_chains: list[str] | None = None,
     dist_cutoff: float = 10.0,
 ) -> dict[str, Any]:
     if not structure_path or not structure_path.exists() or not pae_path or not pae_path.exists() or pae_path.suffix.lower() != ".json":
@@ -547,10 +553,14 @@ def _interface_pae_scores(
         return {}
     chains = _chain_ca_coordinates(structure_path)
     binder = chains.get(binder_chain) or []
-    target = chains.get(target_chain) or []
-    if not binder or not target:
+    target_group = [
+        chain
+        for chain in (target_chains or [target_chain])
+        if chain != binder_chain and chains.get(chain)
+    ]
+    if not binder or not target_group:
         return {}
-    if len(matrix) < len(binder) + len(target):
+    if len(matrix) < sum(len(coords) for coords in chains.values()):
         return {}
 
     offsets: dict[str, int] = {}
@@ -559,20 +569,24 @@ def _interface_pae_scores(
         offsets[chain] = offset
         offset += len(coords)
     binder_offset = offsets.get(binder_chain, 0)
-    target_offset = offsets.get(target_chain, len(binder))
     pairs: list[tuple[int, int]] = []
-    for binder_index, binder_coord in enumerate(binder):
-        for target_index, target_coord in enumerate(target):
-            if _distance(binder_coord, target_coord) <= dist_cutoff:
-                pairs.append((binder_index, target_index))
+    for current_target_chain in target_group:
+        target = chains[current_target_chain]
+        target_offset = offsets[current_target_chain]
+        for binder_index, binder_coord in enumerate(binder):
+            for target_index, target_coord in enumerate(target):
+                if _distance(binder_coord, target_coord) <= dist_cutoff:
+                    pairs.append((binder_offset + binder_index, target_offset + target_index))
     if not pairs:
         return {}
 
-    binder_to_target = [matrix[binder_offset + binder_index][target_offset + target_index] for binder_index, target_index in pairs]
-    target_to_binder = [matrix[target_offset + target_index][binder_offset + binder_index] for binder_index, target_index in pairs]
+    binder_to_target = [matrix[binder_index][target_index] for binder_index, target_index in pairs]
+    target_to_binder = [matrix[target_index][binder_index] for binder_index, target_index in pairs]
     combined = binder_to_target + target_to_binder
     return {
         "ipae": sum(combined) / len(combined),
+        "ipae_target_chain_count": len(target_group),
+        "ipae_interface_contact_count": len(pairs),
         "ipae_binder_to_target": sum(binder_to_target) / len(binder_to_target),
         "ipae_target_to_binder": sum(target_to_binder) / len(target_to_binder),
         "ipae_contact_pairs": len(pairs),
@@ -703,12 +717,13 @@ def _run_ipsae(source_run_dir: Path, run_dir: Path, candidates: list[dict[str, A
                 binder_chain, target_chain = _chain_roles(candidate)
                 summary_metrics = _parse_ipsae_summary_scores(summary_path, focus_chain=binder_chain)
         if row_metrics or summary_metrics:
-            binder_chain, target_chain = _chain_roles(candidate)
+            binder_chains, target_chains = _chain_role_groups(candidate)
             pae_metrics = _interface_pae_scores(
                 structure_path,
                 pae_path,
-                binder_chain=binder_chain,
-                target_chain=target_chain,
+                binder_chain=binder_chains[0],
+                target_chain=target_chains[0],
+                target_chains=target_chains,
                 dist_cutoff=dist_cutoff,
             )
             merged_metrics = dict(candidate.get("metrics") or {})
