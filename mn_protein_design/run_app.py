@@ -36,11 +36,13 @@ def main() -> None:
                 _page(package_root, "app/pages/ppi_detection.py", "PPI / Hotspot Detection", "ppi-hotspot-detection"),
                 _page(package_root, "app/pages/target_cropping.py", "Target Cropping", "target-cropping"),
                 _page(package_root, "app/pages/design.py", "Design", "design"),
+                _page(package_root, "app/pages/design_campaigns.py", "Design Campaigns", "design-campaigns"),
                 _page(package_root, "app/pages/sequence_design.py", "Sequence Design", "sequence-design"),
                 _page(package_root, "app/pages/candidate_sets.py", "Candidate Sets", "candidate-sets"),
                 _page(package_root, "app/pages/refolding.py", "Refolding / Validation", "refolding-validation"),
                 _page(package_root, "app/pages/analysis.py", "Analysis", "analysis"),
                 _page(package_root, "app/pages/benchmark.py", "Binder Benchmark", "binder-benchmark"),
+                _page(package_root, "app/pages/capacity_benchmark.py", "Capacity Benchmark", "capacity-benchmark"),
             ],
             "": [
                 _page(package_root, "app/pages/results.py", "Result Details", "results", hidden=True),

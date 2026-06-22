@@ -21,6 +21,22 @@ ENGINE_LABELS = {
     "protenix": "Protenix",
     "boltzgen_fold": "BoltzGen target-template fold",
     "postprocessing": "Metric postprocessing",
+    "design_campaign": "Design campaign",
+    "rfdiffusion_classic": "RFdiffusion classic",
+    "bindcraft": "BindCraft",
+    "rfdiffusion3_foundry": "RFdiffusion3 / Foundry",
+    "boltzgen": "BoltzGen",
+    "pxdesign": "PXDesign",
+    "genie3": "Genie3",
+    "esmfold2_binder_design": "ESMFold2 binder design",
+    "protpardelle_1c": "Protpardelle-1c",
+    "proteina_complexa": "Proteina-Complexa",
+    "protein_mpnn": "ProteinMPNN",
+    "ligand_mpnn": "LigandMPNN",
+    "soluble_mpnn": "Soluble ProteinMPNN",
+    "scannet": "ScanNet",
+    "surf2spot": "Surf2Spot",
+    "masif_seed": "MaSIF-seed",
 }
 
 FALLBACK_SECONDS_PER_CANDIDATE = {
@@ -34,7 +50,26 @@ FALLBACK_SECONDS_PER_CANDIDATE = {
     "rf3": 30.0,
     "protenix": 45.0,
     "boltzgen_fold": 25.0,
+    "rfdiffusion_classic": 180.0,
+    "bindcraft": 1800.0,
+    "rfdiffusion3_foundry": 240.0,
+    "boltzgen": 300.0,
+    "pxdesign": 240.0,
+    "genie3": 180.0,
+    "esmfold2_binder_design": 1800.0,
+    "protpardelle_1c": 300.0,
+    "proteina_complexa": 300.0,
+    "protein_mpnn": 10.0,
+    "ligand_mpnn": 12.0,
+    "soluble_mpnn": 10.0,
+    "scannet": 300.0,
+    "surf2spot": 180.0,
+    "masif_seed": 600.0,
+    "design_campaign": 600.0,
 }
+
+ESMFOLD2_BASELINE_LOOPS = 10
+ESMFOLD2_BASELINE_SAMPLING_STEPS = 68
 
 TOOL_TO_ENGINE = {
     "esmfold2_benchmark": "esmfold2",
@@ -45,6 +80,12 @@ TOOL_TO_ENGINE = {
     "rf3": "rf3",
     "protenix": "protenix",
     "boltzgen_fold": "boltzgen_fold",
+    "design_campaign": "design_campaign",
+    "multi_engine_design_campaign": "design_campaign",
+    "sequence_design": "protein_mpnn",
+    "scannet": "scannet",
+    "surf2spot": "surf2spot",
+    "masif_seed": "masif_seed",
 }
 
 
@@ -145,9 +186,11 @@ def estimate_engines(
     engines: list[str],
     candidate_count: int,
     total_residues: int | None = None,
+    engine_params: dict[str, dict[str, Any]] | None = None,
     observations: list[RuntimeObservation] | None = None,
 ) -> dict[str, Any]:
     observations = observations if observations is not None else collect_runtime_observations()
+    engine_params = engine_params or {}
     candidate_count = max(0, int(candidate_count or 0))
     rows: list[dict[str, Any]] = []
     total_seconds = 0.0
@@ -167,6 +210,10 @@ def estimate_engines(
         else:
             rate = FALLBACK_SECONDS_PER_CANDIDATE.get(engine, 30.0)
             estimated_seconds = float(candidate_count) * rate
+        multiplier = _engine_runtime_multiplier(engine, engine_params.get(engine) or {})
+        if multiplier != 1.0:
+            estimated_seconds *= multiplier
+            basis = f"{basis} x{multiplier:.2f}"
         total_seconds += estimated_seconds
         rows.append(
             {
@@ -186,6 +233,78 @@ def estimate_engines(
         "total_time": format_duration(total_seconds),
         "rows": rows,
     }
+
+
+def estimate_job_runtime(row: dict[str, Any], input_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return estimate_job_runtime_with_observations(row, input_payload=input_payload, observations=None)
+
+
+def estimate_job_runtime_with_observations(
+    row: dict[str, Any],
+    input_payload: dict[str, Any] | None = None,
+    observations: list[RuntimeObservation] | None = None,
+) -> dict[str, Any]:
+    input_payload = input_payload or {}
+    params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+    tool = str(row.get("tool") or input_payload.get("tool") or "")
+    job_type = str(row.get("job_type") or input_payload.get("job_type") or "")
+    if tool == "design_campaign" or job_type == "multi_engine_design_campaign":
+        engines = [str(engine) for engine in params.get("engines") or []]
+        template_enabled = bool((params.get("template_redesign") or {}).get("enabled")) if isinstance(params.get("template_redesign"), dict) else False
+        if template_enabled:
+            engines = ["protein_mpnn", *engines]
+        attempts = max(1, _int_or_none(params.get("design_attempts")) or 1)
+        sequences = max(1, _int_or_none(params.get("sequences_per_backbone")) or 1)
+        common_validation = params.get("common_validation") if isinstance(params.get("common_validation"), dict) else {}
+        evaluation = params.get("evaluation") if isinstance(params.get("evaluation"), dict) else {}
+        estimate = estimate_engines(engines=engines, candidate_count=attempts * sequences, observations=observations)
+        extra_seconds = 0.0
+        if bool(common_validation.get("enabled", True)):
+            extra_seconds += attempts * max(1, len(engines)) * FALLBACK_SECONDS_PER_CANDIDATE["af2_initial_guess"]
+        if str(evaluation.get("mode") or "none") != "none":
+            extra_seconds += attempts * max(1, len(engines)) * FALLBACK_SECONDS_PER_CANDIDATE["postprocessing"]
+        total_seconds = float(estimate["total_seconds"]) + extra_seconds
+        return {
+            "estimated_seconds": total_seconds,
+            "estimated_time": format_duration(total_seconds),
+            "basis": "campaign engine fallbacks/history",
+        }
+    engine = TOOL_TO_ENGINE.get(tool) or TOOL_TO_ENGINE.get(job_type) or tool
+    candidate_count = (
+        _int_or_none(params.get("candidate_count"))
+        or _int_or_none(params.get("num_designs"))
+        or _int_or_none(params.get("num_samples"))
+        or _int_or_none(params.get("num_seq_per_target"))
+        or _int_or_none(params.get("design_attempts"))
+        or 1
+    )
+    estimate = estimate_engines(
+        engines=[engine],
+        candidate_count=max(1, candidate_count),
+        engine_params={engine: params},
+        observations=observations,
+    )
+    row_estimate = estimate["rows"][0] if estimate["rows"] else {}
+    return {
+        "estimated_seconds": row_estimate.get("estimated_seconds"),
+        "estimated_time": row_estimate.get("estimated_time", "n/a"),
+        "basis": row_estimate.get("basis", "fallback"),
+    }
+
+
+def _engine_runtime_multiplier(engine: str, params: dict[str, Any]) -> float:
+    if engine != "esmfold2":
+        return 1.0
+    loops = _int_or_none(params.get("num_loops"))
+    steps = _int_or_none(params.get("num_sampling_steps"))
+    if not loops and not steps:
+        return 1.0
+    loop_ratio = float(loops or ESMFOLD2_BASELINE_LOOPS) / float(ESMFOLD2_BASELINE_LOOPS)
+    step_ratio = float(steps or ESMFOLD2_BASELINE_SAMPLING_STEPS) / float(ESMFOLD2_BASELINE_SAMPLING_STEPS)
+    # ESMFold2 runtime is split between recurrent pair folding loops and diffusion sampling.
+    # This weighted model keeps the paper default (10 loops / 68 steps) at 1.0 while making
+    # preset changes visible in rough runtime estimates.
+    return max(0.05, (0.65 * loop_ratio) + (0.35 * step_ratio))
 
 
 def _read_json(path: Path) -> dict[str, Any]:

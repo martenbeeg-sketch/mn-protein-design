@@ -4,10 +4,14 @@ import os
 from io import StringIO
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
 from mn_protein_design.app.pages.common import (
+    esmfold2_preset_label,
+    esmfold2_preset_selector,
+    gpu_run_panel,
     result_link,
     selected_dataframe_rows,
     show_delete_jobs_dialog,
@@ -23,11 +27,17 @@ from mn_protein_design.workflows.benchmark import (
     MSA_REPOSITORY_DIR,
     PUBLISHED_DATASET,
     benchmark_engines_in_metrics,
+    benchmark_missing_pyrosetta_rows,
     create_benchmark_collection,
+    create_benchmark_matrix_workspace,
     enqueue_de_novo_binder_scoring_dataset,
+    enqueue_missing_pyrosetta_benchmark_metrics,
+    inspect_benchmark_run,
+    prepare_benchmark_run_resume,
     run_esmfold2_binder_benchmark,
     run_precomputed_metric_benchmark,
 )
+from mn_protein_design.workflows.capacity_benchmark import capacity_warnings
 from mn_protein_design.workflows.esm_binder import ESMFOLD2_MODEL_DIR
 from mn_protein_design.workflows.refolding import BOLTZ_MODELS_DIR, RF3_CHECKPOINT
 
@@ -35,6 +45,16 @@ from mn_protein_design.workflows.refolding import BOLTZ_MODELS_DIR, RF3_CHECKPOI
 KNOWN_BENCHMARK_ROOT = Path("/mnt/db/reference_files/de_novo_binder_scoring_overath_2025")
 KNOWN_BENCHMARK_CSV = KNOWN_BENCHMARK_ROOT / "final_dataset.csv"
 KNOWN_BENCHMARK_PDB_DIR = KNOWN_BENCHMARK_ROOT / "input_pdbs"
+BENCHMARK_MATRIX_ENGINE_ORDER = [
+    "AF3",
+    "AF2-IG",
+    "Boltz-2",
+    "BoltzGen Fold",
+    "ColabFold",
+    "ESMFold2",
+    "Protenix",
+    "RF3",
+]
 
 
 def _safe_sort_token(value: object) -> str:
@@ -75,16 +95,20 @@ def _known_benchmark_subset(csv_path: str, targets: tuple[str, ...], max_per_tar
 
 def _dataset_runtime_size(df: pd.DataFrame | None, fallback_count: int = 0) -> dict[str, int | None]:
     if df is None or df.empty:
-        return {"candidate_count": int(fallback_count or 0), "total_residues": None}
+        return {"candidate_count": int(fallback_count or 0), "total_residues": None, "max_system_residues": None}
     candidate_count = int(len(df))
     length_columns = [column for column in ["A_length", "B_length"] if column in df.columns]
     total_residues = None
+    max_system_residues = None
     if length_columns:
-        total = 0
+        total_series = pd.Series([0] * len(df), index=df.index, dtype="float64")
         for column in length_columns:
-            total += int(pd.to_numeric(df[column], errors="coerce").fillna(0).sum())
+            values = pd.to_numeric(df[column], errors="coerce").fillna(0)
+            total_series = total_series + values
+        total = int(total_series.sum())
         total_residues = total or None
-    return {"candidate_count": candidate_count, "total_residues": total_residues}
+        max_system_residues = int(total_series.max()) if not total_series.empty and total_series.max() > 0 else None
+    return {"candidate_count": candidate_count, "total_residues": total_residues, "max_system_residues": max_system_residues}
 
 
 def _estimate_rows_dataframe(estimate: dict) -> pd.DataFrame:
@@ -100,6 +124,34 @@ def _estimate_rows_dataframe(estimate: dict) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _show_capacity_warnings(warnings: list[dict[str, object]]) -> None:
+    relevant = [row for row in warnings if row.get("severity") in {"error", "warning"}]
+    unknown = [row for row in warnings if row.get("severity") == "info"]
+    if relevant:
+        st.warning("Capacity benchmark warning: at least one selected engine is outside known successful limits.")
+        st.dataframe(
+            pd.DataFrame(relevant),
+            hide_index=True,
+            width="stretch",
+            column_order=[
+                "engine",
+                "severity",
+                "evidence_scope",
+                "message",
+                "max_success_total_length",
+                "min_failed_total_length",
+                "min_oom_total_length",
+                "preset",
+                "gpu_device",
+            ],
+        )
+    elif warnings and all(row.get("severity") == "ok" for row in warnings):
+        st.success("Largest selected system is within the matching capacity benchmark range.")
+    if unknown:
+        with st.expander("Capacity evidence not available for some engines", expanded=False):
+            st.dataframe(pd.DataFrame(unknown), hide_index=True, width="stretch")
 
 
 def _enabled_engines(params: dict) -> str:
@@ -130,6 +182,75 @@ def _enabled_engines(params: dict) -> str:
     if not engines and params.get("modes"):
         engines.append("ESMFold2")
     return ", ".join(engines) or "metrics only"
+
+
+def _short_bool(value: object) -> str:
+    return "yes" if bool(value) else "no"
+
+
+def _benchmark_engine_settings(input_payload: dict, worker_kwargs: dict, engine: str) -> str:
+    params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+
+    def get_value(*names: str, default: object = "") -> object:
+        for name in names:
+            if name in params and params.get(name) not in (None, ""):
+                return params.get(name)
+            if name in worker_kwargs and worker_kwargs.get(name) not in (None, ""):
+                return worker_kwargs.get(name)
+        return default
+
+    def add(parts: list[str], label: str, value: object) -> None:
+        if value not in (None, "", []):
+            parts.append(f"{label}={value}")
+
+    parts: list[str] = []
+    if engine == "ESMFold2":
+        loops = get_value("num_loops", default="")
+        steps = get_value("num_sampling_steps", default="")
+        add(parts, "preset", esmfold2_preset_label(loops, steps))
+        add(parts, "modes", ",".join(str(item) for item in get_value("esmfold2_modes", "modes", default=[]) or []))
+        add(parts, "target_msa", _short_bool(get_value("esmfold2_use_target_msa", default=False)))
+        add(parts, "seed", get_value("seed", default=""))
+    elif engine == "AF2-IG":
+        add(parts, "recycles", get_value("af2_num_recycles", default=""))
+        add(parts, "multimer", _short_bool(get_value("af2_multimer", default=True)))
+        add(parts, "target_ig", "yes")
+        add(parts, "complex_ig", _short_bool(get_value("af2_use_initial_guess", default=False)))
+        add(parts, "binder_template", _short_bool(get_value("af2_use_binder_template", default=False)))
+        add(parts, "interface_template", _short_bool(get_value("af2_use_interface_template", default=False)))
+    elif engine == "Boltz-2":
+        add(parts, "target_template", _short_bool(get_value("boltz2_use_target_template", default=True)))
+        add(parts, "target_msa", _short_bool(get_value("boltz2_use_target_msa", default=True)))
+        add(parts, "recycles", get_value("boltz2_recycling_steps", default=""))
+        add(parts, "sampling", get_value("boltz2_sampling_steps", default=""))
+        add(parts, "samples", get_value("boltz2_diffusion_samples", default=""))
+    elif engine == "BoltzGen Fold":
+        add(parts, "recycles", get_value("boltzgen_recycling_steps", default=""))
+        add(parts, "sampling", get_value("boltzgen_sampling_steps", default=""))
+        add(parts, "samples", get_value("boltzgen_diffusion_samples", default=""))
+    elif engine == "ColabFold":
+        add(parts, "msa", get_value("colabfold_msa_source", default=""))
+        add(parts, "recycles", get_value("colabfold_num_recycles", default=""))
+        add(parts, "models", get_value("colabfold_num_models", default=""))
+        add(parts, "templates", _short_bool(get_value("colabfold_use_target_templates", default=False)))
+        add(parts, "template_hits", get_value("colabfold_max_template_hits", default=""))
+    elif engine == "AF3":
+        add(parts, "recycles", get_value("alphafast_num_recycles", default=""))
+        add(parts, "batch", get_value("alphafast_batch_size", default=""))
+        add(parts, "gpu", get_value("alphafast_gpu_device", "gpu_device", default=""))
+    elif engine == "RF3":
+        add(parts, "target_msa", _short_bool(get_value("rf3_use_target_msa", default=True)))
+        add(parts, "recycles", get_value("rf3_recycles", default=""))
+        add(parts, "steps", get_value("rf3_num_steps", default=""))
+        add(parts, "batch", get_value("rf3_diffusion_batch_size", default=""))
+        checkpoint = str(get_value("rf3_checkpoint_path", default=""))
+        add(parts, "checkpoint", Path(checkpoint).name if checkpoint else "")
+    elif engine == "Protenix":
+        add(parts, "msa", _short_bool(get_value("protenix_use_msa", default=True)))
+        add(parts, "cycles", get_value("protenix_cycle", default=""))
+        add(parts, "steps", get_value("protenix_diffusion_steps", default=""))
+        add(parts, "samples", get_value("protenix_samples", default=""))
+    return "; ".join(parts)
 
 
 def _job_dataset_label(input_payload: dict) -> str:
@@ -195,9 +316,16 @@ def _benchmark_job_table(rows: list[dict]) -> pd.DataFrame:
         run_dir = Path(str(row.get("run_dir") or ""))
         input_payload = read_json(run_dir / "input.json")
         job_type = str(input_payload.get("job_type") or "")
+        if job_type == "refolding_evaluation":
+            continue
         result = read_json(run_dir / "result.json")
         feature_summary = _first_feature_summary(run_dir)
         params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+        worker_payload = read_json(run_dir / "worker_request.json")
+        worker_kwargs = worker_payload.get("kwargs") if isinstance(worker_payload.get("kwargs"), dict) else {}
+        esm_loops = params.get("num_loops", worker_kwargs.get("num_loops"))
+        esm_steps = params.get("num_sampling_steps", worker_kwargs.get("num_sampling_steps"))
+        esm_preset = esmfold2_preset_label(esm_loops, esm_steps)
         metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
         outputs = result.get("outputs") if isinstance(result.get("outputs"), dict) else {}
         top_ap = (
@@ -216,6 +344,14 @@ def _benchmark_job_table(rows: list[dict]) -> pd.DataFrame:
         ]
         if records:
             description_parts.append(f"{records} rows")
+        recovery = ""
+        if str(row.get("status") or "") in {"failed", "paused"} and (run_dir / "worker_request.json").exists():
+            try:
+                recovery_report = inspect_benchmark_run(run_dir)
+                if recovery_report.get("can_resume"):
+                    recovery = f"resumable: {recovery_report.get('first_incomplete_stage') or 'next incomplete stage'}"
+            except Exception:
+                recovery = ""
         enriched.append(
             {
                 "delete": False,
@@ -224,11 +360,15 @@ def _benchmark_job_table(rows: list[dict]) -> pd.DataFrame:
                 "description": " | ".join(description_parts),
                 "dataset": _job_dataset_label(input_payload),
                 "engines": _enabled_engines(params),
+                "esmfold2_preset": esm_preset,
+                "esmfold2_loops": esm_loops,
+                "esmfold2_steps": esm_steps,
                 "records": records,
                 "top_feature": top_feature,
                 "top_ap": top_ap,
                 "plots": _has_plot_outputs(run_dir),
                 "status": row.get("status"),
+                "recovery": recovery,
                 "created_at": row.get("created_at"),
                 "task_group": "benchmark",
                 "run_id": row.get("run_id"),
@@ -236,6 +376,318 @@ def _benchmark_job_table(rows: list[dict]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(enriched)
+
+
+def _available_benchmark_sources(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    source_rows: list[dict] = []
+    unavailable_rows: list[dict] = []
+    for row in rows:
+        run_dir = Path(str(row.get("run_dir") or ""))
+        input_payload = read_json(run_dir / "input.json")
+        if input_payload.get("job_type") == "benchmark_matrix_workspace":
+            continue
+        if input_payload.get("job_type") == "refolding_evaluation":
+            continue
+        metrics_path = run_dir / "artifacts" / "benchmark" / "merged_benchmark_metrics.csv"
+        unavailable_reason = ""
+        if str(row.get("status")) != "completed":
+            unavailable_reason = f"status: {row.get('status')}"
+        elif not metrics_path.exists():
+            unavailable_reason = "missing merged_benchmark_metrics.csv"
+        if unavailable_reason:
+            benchmark_dir = run_dir / "artifacts" / "benchmark"
+            partial_metrics = sorted(path.name for path in benchmark_dir.glob("*_metrics.csv")) if benchmark_dir.exists() else []
+            unavailable_rows.append(
+                {
+                    "job_code": str(row.get("job_code")),
+                    "description": " | ".join(
+                        part
+                        for part in [
+                            _job_dataset_label(input_payload),
+                            _enabled_engines(input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}),
+                        ]
+                        if part
+                    ),
+                    "status": row.get("status"),
+                    "current_phase": row.get("current_phase"),
+                    "current_engine": row.get("current_engine"),
+                    "reason": unavailable_reason,
+                    "partial_metric_tables": ", ".join(partial_metrics[:5]),
+                    "created_at": str(row.get("created_at") or ""),
+                    "run_id": str(row.get("run_id")),
+                }
+            )
+            continue
+        engines_available = benchmark_engines_in_metrics(metrics_path)
+        if not engines_available:
+            unavailable_rows.append(
+                {
+                    "job_code": str(row.get("job_code")),
+                    "description": " | ".join(
+                        part
+                        for part in [
+                            _job_dataset_label(input_payload),
+                            _enabled_engines(input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}),
+                        ]
+                        if part
+                    ),
+                    "status": row.get("status"),
+                    "current_phase": row.get("current_phase"),
+                    "current_engine": row.get("current_engine"),
+                    "reason": "merged metrics exist, but no recognized engine columns",
+                    "partial_metric_tables": "",
+                    "created_at": str(row.get("created_at") or ""),
+                    "run_id": str(row.get("run_id")),
+                }
+            )
+            continue
+        worker_payload = read_json(run_dir / "worker_request.json")
+        worker_kwargs = worker_payload.get("kwargs") if isinstance(worker_payload.get("kwargs"), dict) else {}
+        result = read_json(run_dir / "result.json")
+        metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+        job_type = str(input_payload.get("job_type") or "")
+        source_rows.append(
+            {
+                "run_id": str(row.get("run_id")),
+                "job_code": str(row.get("job_code")),
+                "kind": "collection" if job_type == "benchmark_collection" else "benchmark",
+                "created_at": str(row.get("created_at") or ""),
+                "description": " | ".join(
+                    part
+                    for part in [
+                        _job_dataset_label(input_payload),
+                        _enabled_engines(input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}),
+                        f"{metrics.get('record_count')} rows" if metrics.get("record_count") else "",
+                    ]
+                    if part
+                ),
+                "dataset": _job_dataset_label(input_payload),
+                "engines_available": engines_available,
+                "engine_settings": {
+                    engine: _benchmark_engine_settings(input_payload, worker_kwargs, engine)
+                    for engine in engines_available
+                },
+                "engine_text": ", ".join(engines_available),
+                "metrics_path": metrics_path,
+                "record_count": metrics.get("record_count"),
+            }
+        )
+    return source_rows, unavailable_rows
+
+
+def _benchmark_target_counts(metrics_path: Path) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(metrics_path, usecols=lambda col: col in {"target_id", "binder_id"})
+    except Exception:
+        return pd.DataFrame(columns=["target_id", "records"])
+    if "target_id" not in df.columns:
+        df["target_id"] = "all targets"
+    grouped = df.groupby("target_id", dropna=False).size().reset_index(name="records")
+    grouped["target_id"] = grouped["target_id"].astype(str)
+    return grouped
+
+
+def _benchmark_matrix_cells(source_rows: list[dict]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    engine_rank = {engine: index for index, engine in enumerate(BENCHMARK_MATRIX_ENGINE_ORDER)}
+    for source in source_rows:
+        target_counts = _benchmark_target_counts(Path(source["metrics_path"]))
+        if target_counts.empty:
+            continue
+        for _, target_row in target_counts.iterrows():
+            target_id = str(target_row.get("target_id") or "all targets")
+            for engine in source.get("engines_available") or []:
+                if engine == "Input":
+                    continue
+                rows.append(
+                    {
+                        "select": False,
+                        "engine": engine,
+                        "engine_rank": engine_rank.get(engine, len(engine_rank)),
+                        "target_id": target_id,
+                        "status": "completed",
+                        "records": int(target_row.get("records") or 0),
+                        "run_id": source["run_id"],
+                        "job_code": source["job_code"],
+                        "kind": source.get("kind") or "benchmark",
+                        "dataset": source.get("dataset") or "",
+                        "settings": (source.get("engine_settings") or {}).get(engine, ""),
+                        "description": source.get("description") or "",
+                        "created_at": source.get("created_at") or "",
+                        "result": result_link("benchmark", str(source["run_id"]), "Open"),
+                    }
+                )
+    if not rows:
+        return pd.DataFrame()
+    cells = pd.DataFrame(rows)
+    cells["created_sort"] = cells["created_at"].astype(str)
+    cells["kind_rank"] = cells["kind"].map({"benchmark": 0, "collection": 1}).fillna(2)
+    cells = cells.sort_values(["engine_rank", "target_id", "kind_rank", "created_sort"], ascending=[True, True, True, False])
+    return cells
+
+
+def _canonical_benchmark_cells(cells: pd.DataFrame) -> pd.DataFrame:
+    if cells.empty:
+        return cells.copy()
+    return cells.drop_duplicates(["engine", "target_id"], keep="first").copy()
+
+
+def _clean_checkbox_series(values: pd.Series) -> pd.Series:
+    def coerce(value: object) -> bool:
+        if value is None:
+            return False
+        try:
+            if pd.isna(value):
+                return False
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
+    return values.map(coerce).astype(bool)
+
+
+def _installed_overath_targets() -> list[str]:
+    if not KNOWN_BENCHMARK_CSV.exists():
+        return []
+    try:
+        summary = _known_benchmark_summary(str(KNOWN_BENCHMARK_CSV))
+    except Exception:
+        return []
+    return sorted(
+        target
+        for target in summary["target_id"].dropna().astype(str).tolist()
+        if target.strip() and target.strip().lower() != "nan"
+    )
+
+
+def _benchmark_matrix_with_missing(
+    cells: pd.DataFrame,
+    *,
+    target_options: list[str],
+    engine_options: list[str],
+) -> pd.DataFrame:
+    engine_rank = {engine: index for index, engine in enumerate(BENCHMARK_MATRIX_ENGINE_ORDER)}
+    base = cells.copy()
+    existing = set()
+    if not base.empty:
+        existing = set(zip(base["engine"].astype(str), base["target_id"].astype(str), strict=False))
+    missing_rows: list[dict[str, object]] = []
+    for engine in engine_options:
+        for target_id in target_options:
+            if (engine, target_id) in existing:
+                continue
+            missing_rows.append(
+                {
+                    "select": False,
+                    "engine": engine,
+                    "engine_rank": engine_rank.get(engine, len(engine_rank)),
+                    "target_id": target_id,
+                    "status": "missing",
+                    "records": 0,
+                    "run_id": "",
+                    "job_code": "",
+                    "kind": "",
+                    "dataset": "",
+                    "settings": "",
+                    "description": "No completed benchmark result for this target and engine.",
+                    "created_at": "",
+                    "result": "",
+                    "available_runs": 0,
+                }
+            )
+    if missing_rows:
+        base = pd.concat([base, pd.DataFrame(missing_rows)], ignore_index=True)
+    if base.empty:
+        return base
+    base["engine_rank"] = base["engine"].map(engine_rank).fillna(len(engine_rank)).astype(int)
+    return base.sort_values(["engine_rank", "target_id", "status"], ascending=[True, True, True]).copy()
+
+
+def _matrix_collection_selections(selected_cells: pd.DataFrame) -> tuple[list[dict[str, object]], list[str]]:
+    selections_by_run: dict[str, dict[str, object]] = {}
+    all_targets: set[str] = set()
+    for row in selected_cells.to_dict(orient="records"):
+        run_id = str(row.get("run_id") or "")
+        engine = str(row.get("engine") or "")
+        target_id = str(row.get("target_id") or "")
+        if not run_id or not engine or not target_id:
+            continue
+        all_targets.add(target_id)
+        selection = selections_by_run.setdefault(run_id, {"run_id": run_id, "engines": [], "engine_targets": {}})
+        engines = selection["engines"]
+        if isinstance(engines, list) and engine not in engines:
+            engines.append(engine)
+        engine_targets = selection["engine_targets"]
+        if isinstance(engine_targets, dict):
+            engine_targets.setdefault(engine, [])
+            if target_id not in engine_targets[engine]:
+                engine_targets[engine].append(target_id)
+    selections = list(selections_by_run.values())
+    for selection in selections:
+        if isinstance(selection.get("engine_targets"), dict):
+            selection["engine_targets"] = {
+                engine: sorted(targets)
+                for engine, targets in selection["engine_targets"].items()
+            }
+    return selections, sorted(all_targets)
+
+
+def _benchmark_matrix_workspace_jobs(rows: list[dict]) -> list[dict[str, object]]:
+    workspaces: list[dict[str, object]] = []
+    for row in rows:
+        run_dir = Path(str(row.get("run_dir") or ""))
+        input_payload = read_json(run_dir / "input.json")
+        if input_payload.get("job_type") != "benchmark_matrix_workspace":
+            continue
+        result = read_json(run_dir / "result.json")
+        metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+        workspace_payload = read_json(run_dir / "artifacts" / "benchmark" / "matrix_workspace.json")
+        name = str(workspace_payload.get("name") or metrics.get("workspace_name") or row.get("campaign_name") or "Benchmark matrix workspace")
+        workspaces.append(
+            {
+                "run_id": str(row.get("run_id")),
+                "run_dir": run_dir,
+                "name": name,
+                "status": row.get("status"),
+                "cell_count": metrics.get("cell_count"),
+                "engine_count": metrics.get("engine_count"),
+                "target_count": metrics.get("target_count"),
+                "created_at": str(row.get("created_at") or ""),
+                "job_code": str(row.get("job_code") or ""),
+            }
+        )
+    return sorted(workspaces, key=lambda item: str(item.get("created_at") or ""), reverse=True)
+
+
+def _benchmark_matrix_workspace_cells(workspace: dict[str, object] | None, cells: pd.DataFrame) -> pd.DataFrame:
+    if workspace is None or cells.empty:
+        return cells.iloc[0:0].copy() if not cells.empty else pd.DataFrame()
+    sources_path = Path(str(workspace.get("run_dir") or "")) / "artifacts" / "benchmark" / "benchmark_matrix_workspace_sources.csv"
+    if not sources_path.exists():
+        return cells.iloc[0:0].copy()
+    try:
+        selected = pd.read_csv(sources_path)
+    except Exception:
+        return cells.iloc[0:0].copy()
+    if selected.empty or not {"run_id", "engine", "target_id"}.issubset(selected.columns):
+        return cells.iloc[0:0].copy()
+    selected_keys = set(
+        zip(
+            selected["run_id"].fillna("").astype(str),
+            selected["engine"].fillna("").astype(str),
+            selected["target_id"].fillna("").astype(str),
+            strict=False,
+        )
+    )
+    selected_cells = cells[
+        cells.apply(
+            lambda row: (str(row.get("run_id") or ""), str(row.get("engine") or ""), str(row.get("target_id") or "")) in selected_keys,
+            axis=1,
+        )
+    ].copy()
+    return selected_cells
 
 
 st.title("Binder Benchmark")
@@ -281,6 +733,7 @@ repo_loops = 3
 repo_seed = 0
 af2_recycles = 3
 af2_multimer = True
+af2_legacy_initial_guess = False
 af2_binder_template = False
 af2_interface_template = False
 boltz2_target_template = True
@@ -310,14 +763,15 @@ colabfold_use_target_templates = bool(st.session_state.get("benchmark_colabfold_
 colabfold_max_template_hits = 4
 colabfold_msa_source = "msa_repository_then_alphafast_mmseqs_gpu"
 msa_repository_dir = str(MSA_REPOSITORY_DIR)
+require_real_target_msa = bool(st.session_state.get("benchmark_require_real_target_msa", True))
 alphafast_db_dir = str(ALPHAFAST_DB_DIR)
 alphafast_weights_dir = str(ALPHAFAST_WEIGHTS_DIR)
 alphafast_batch_size = 0
 alphafast_recycles = 10
-gpu_device = 0
+gpu_device = "0"
 simple_modes = ["sequence", "initial_guess"]
 simple_max_records = 0
-simple_sampling_steps = 32
+simple_sampling_steps = 68
 simple_recycling_loops = 3
 simple_seed = 0
 simple_contact_cutoff = 8.0
@@ -325,11 +779,11 @@ simple_device = "cuda"
 label_column = "binder"
 metric_max_rows = 0
 metric_max_cols = 500
-runtime_size = {"candidate_count": 0, "total_residues": None}
+runtime_size = {"candidate_count": 0, "total_residues": None, "max_system_residues": None}
 selected_targets: list[str] = []
 selected_known_count = 0
 
-tabs = st.tabs(["Dataset", "Engines", "Metrics", "Run", "Results", "Collections"])
+tabs = st.tabs(["Dataset", "Engines", "Metrics", "Run", "Results", "Matrix", "Collections"])
 
 with tabs[0]:
     st.subheader("Dataset")
@@ -528,7 +982,7 @@ with tabs[0]:
             try:
                 runtime_size = _dataset_runtime_size(pd.read_csv(StringIO(simple_csv_text)).head(int(simple_max_records)))
             except Exception:
-                runtime_size = {"candidate_count": int(simple_max_records), "total_residues": None}
+                runtime_size = {"candidate_count": int(simple_max_records), "total_residues": None, "max_system_residues": None}
         with st.expander("Accepted simple CSV columns", expanded=False):
             st.markdown(
                 "Use one row per candidate. Accepted columns include `candidate_id`, `target_pdb`, "
@@ -556,26 +1010,60 @@ with tabs[1]:
     st.subheader("Prediction / Refolding Engines")
     st.caption("These generate structures or confidence outputs. Shared interface metrics are configured separately.")
 
+    engine_disabled = dataset_source in {"Simple ESMFold2 CSV", "Metric table only"}
+    benchmark_engine_state = {
+        "benchmark_run_alphafast_af3": engine_disabled,
+        "benchmark_run_colabfold": engine_disabled,
+        "benchmark_run_af2ig": engine_disabled,
+        "benchmark_run_esmfold2": dataset_source == "Metric table only",
+        "benchmark_run_boltz2": engine_disabled,
+        "benchmark_run_rf3": engine_disabled,
+        "benchmark_run_protenix": engine_disabled,
+        "benchmark_run_boltzgen_fold": engine_disabled,
+    }
+    if "benchmark_engine_defaults_all_selected_v1" not in st.session_state:
+        for engine_key, disabled in benchmark_engine_state.items():
+            st.session_state[engine_key] = not disabled
+        st.session_state["benchmark_engine_defaults_all_selected_v1"] = True
+    for engine_key, disabled in benchmark_engine_state.items():
+        if engine_key not in st.session_state:
+            st.session_state[engine_key] = not disabled
+        if disabled:
+            st.session_state[engine_key] = False
+
+    bulk_cols = st.columns([1, 1, 6])
+    if bulk_cols[0].button("Select all engines", key="benchmark_select_all_engines"):
+        for engine_key, disabled in benchmark_engine_state.items():
+            if not disabled:
+                st.session_state[engine_key] = True
+        st.rerun()
+    if bulk_cols[1].button("Deselect all engines", key="benchmark_deselect_all_engines"):
+        for engine_key, disabled in benchmark_engine_state.items():
+            if not disabled:
+                st.session_state[engine_key] = False
+        st.rerun()
+
     engine_cols = st.columns(8)
     with engine_cols[0]:
-        run_alphafast_af3 = st.checkbox("AlphaFast AF3", value=True, disabled=dataset_source in {"Simple ESMFold2 CSV", "Metric table only"})
+        run_alphafast_af3 = st.checkbox("AlphaFast AF3", value=True, disabled=engine_disabled, key="benchmark_run_alphafast_af3")
     with engine_cols[1]:
-        run_colabfold = st.checkbox("ColabFold", value=True, disabled=dataset_source in {"Simple ESMFold2 CSV", "Metric table only"})
+        run_colabfold = st.checkbox("ColabFold", value=True, disabled=engine_disabled, key="benchmark_run_colabfold")
     with engine_cols[2]:
-        run_repo_af2ig = st.checkbox("AF2 initial guess", value=True, disabled=dataset_source in {"Simple ESMFold2 CSV", "Metric table only"})
+        run_repo_af2ig = st.checkbox("AF2 initial guess", value=True, disabled=engine_disabled, key="benchmark_run_af2ig")
     with engine_cols[3]:
-        run_repo_esm = st.checkbox("ESMFold2", value=True, disabled=dataset_source == "Metric table only")
+        run_repo_esm = st.checkbox("ESMFold2", value=True, disabled=dataset_source == "Metric table only", key="benchmark_run_esmfold2")
     with engine_cols[4]:
-        run_boltz2_ig = st.checkbox("Boltz-2", value=True, disabled=dataset_source in {"Simple ESMFold2 CSV", "Metric table only"})
+        run_boltz2_ig = st.checkbox("Boltz-2", value=True, disabled=engine_disabled, key="benchmark_run_boltz2")
     with engine_cols[5]:
-        run_rf3 = st.checkbox("RF3", value=False, disabled=dataset_source in {"Simple ESMFold2 CSV", "Metric table only"})
+        run_rf3 = st.checkbox("RF3", value=True, disabled=engine_disabled, key="benchmark_run_rf3")
     with engine_cols[6]:
-        run_protenix = st.checkbox("Protenix", value=False, disabled=dataset_source in {"Simple ESMFold2 CSV", "Metric table only"})
+        run_protenix = st.checkbox("Protenix", value=True, disabled=engine_disabled, key="benchmark_run_protenix")
     with engine_cols[7]:
         run_boltzgen_fold = st.checkbox(
             "BoltzGen fold",
-            value=False,
-            disabled=dataset_source in {"Simple ESMFold2 CSV", "Metric table only"},
+            value=True,
+            disabled=engine_disabled,
+            key="benchmark_run_boltzgen_fold",
             help="Runs BoltzGen's target-template-conditioned folding stage. This is not MSA-based sequence-only refolding.",
         )
 
@@ -585,17 +1073,6 @@ with tabs[1]:
         if selected_record_count:
             st.caption(f"Prediction engines will process all {selected_record_count:,} checked records.")
         generate_inputs = True
-
-        with st.expander("Compute", expanded=True):
-            gpu_device = st.number_input(
-                "GPU device",
-                min_value=0,
-                max_value=15,
-                value=0,
-                step=1,
-                key="benchmark_gpu_device",
-                help="Used by GPU-backed benchmark engines that expose device selection, currently AlphaFast AF3 and ColabFold.",
-            )
 
         with st.expander("MSA Reference Data", expanded=True):
             msa_consuming_engine_selected = bool(
@@ -644,6 +1121,17 @@ with tabs[1]:
                     "preparation; it is not the number of AF3 structures predicted at once."
                 ),
             )
+            require_real_target_msa = st.checkbox(
+                "Require real target MSAs before prediction",
+                value=True,
+                key="benchmark_require_real_target_msa",
+                disabled=not msa_consuming_engine_selected,
+                help=(
+                    "When enabled, every selected target chain must have an A3M with more than the query sequence. "
+                    "Repository hits that are query-only are regenerated with AlphaFast/MMseqs when that source is enabled; "
+                    "if a real MSA still cannot be produced, the job stops before GPU prediction."
+                ),
+            )
         default_models = []
         if run_alphafast_af3 or run_colabfold:
             default_models.append("af3")
@@ -680,12 +1168,31 @@ with tabs[1]:
                 disabled=not run_colabfold or not colabfold_use_target_templates,
             )
 
-        with st.expander("AF2 Initial Guess Settings", expanded=run_repo_af2ig):
+        with st.expander("AF2 Target-Only Initial Guess Settings", expanded=run_repo_af2ig):
             af2_cols = st.columns(4)
             af2_recycles = af2_cols[0].number_input("AF2-IG recycles", min_value=1, max_value=24, value=3, step=1, key="benchmark_af2ig_recycles", disabled=not run_repo_af2ig)
             af2_multimer = af2_cols[1].checkbox("AF2 multimer", value=True, disabled=not run_repo_af2ig)
-            af2_binder_template = af2_cols[2].checkbox("Binder template", value=False, disabled=not run_repo_af2ig)
-            af2_interface_template = af2_cols[3].checkbox("Interface template", value=False, disabled=not run_repo_af2ig or not af2_binder_template)
+            af2_legacy_initial_guess = af2_cols[2].checkbox(
+                "Whole-complex initial guess (legacy)",
+                value=False,
+                key="benchmark_af2ig_legacy_initial_guess",
+                disabled=not run_repo_af2ig,
+                help="Opt-in compatibility mode. This consumes the staged binder-target coordinates. Leave off for binder sequence plus selected target template only.",
+            )
+            af2_binder_template = af2_cols[3].checkbox(
+                "Binder template (legacy)",
+                value=False,
+                key="benchmark_af2ig_binder_template",
+                disabled=not run_repo_af2ig or not af2_legacy_initial_guess,
+            )
+            af2_interface_template = st.checkbox(
+                "Preserve template interface geometry (legacy)",
+                value=False,
+                key="benchmark_af2ig_interface_template",
+                disabled=not run_repo_af2ig or not af2_legacy_initial_guess or not af2_binder_template,
+            )
+            if not af2_legacy_initial_guess:
+                st.caption("Default: the selected target PDB is the target-only initial guess. Binder coordinates and the original input complex interface are not supplied to prediction.")
 
         with st.expander("ESMFold2 Settings", expanded=run_repo_esm):
             repo_esm_modes = st.multiselect(
@@ -694,6 +1201,12 @@ with tabs[1]:
                 default=["initial_guess"],
                 disabled=not run_repo_esm,
                 format_func={"sequence": "Sequence only", "initial_guess": "Initial guess"}.get,
+            )
+            esmfold2_preset_selector(
+                key="benchmark_repo",
+                steps_key="benchmark_esmfold2_sampling_steps",
+                loops_key="benchmark_esmfold2_recycling_loops",
+                disabled=not run_repo_esm,
             )
             esm_cols = st.columns(5)
             esm_cols[0].text_input("ESMFold2 model dir", value=str(ESMFOLD2_MODEL_DIR), disabled=True)
@@ -704,8 +1217,8 @@ with tabs[1]:
                 disabled=not run_repo_esm,
                 help="Default off. Enable to pass prepared per-target-chain A3M files into ESMFold2 ProteinInput objects.",
             )
-            repo_sampling = esm_cols[2].number_input("ESMFold2 sampling steps", min_value=1, max_value=256, value=32, step=1, key="benchmark_esmfold2_sampling_steps", disabled=not run_repo_esm)
-            repo_loops = esm_cols[3].number_input("ESMFold2 recycling loops", min_value=1, max_value=16, value=3, step=1, key="benchmark_esmfold2_recycling_loops", disabled=not run_repo_esm)
+            repo_sampling = esm_cols[2].number_input("ESMFold2 sampling steps", min_value=1, max_value=256, value=68, step=1, key="benchmark_esmfold2_sampling_steps", disabled=not run_repo_esm)
+            repo_loops = esm_cols[3].number_input("ESMFold2 recycling loops", min_value=1, max_value=64, value=10, step=1, key="benchmark_esmfold2_recycling_loops", disabled=not run_repo_esm)
             repo_seed = esm_cols[4].number_input("ESMFold2 seed", min_value=0, max_value=999999, value=0, step=1, key="benchmark_esmfold2_seed", disabled=not run_repo_esm)
 
         with st.expander("Boltz-2 Settings", expanded=run_boltz2_ig):
@@ -772,6 +1285,11 @@ with tabs[1]:
                 default=["sequence", "initial_guess"],
                 format_func={"sequence": "Sequence only", "initial_guess": "Initial guess"}.get,
             )
+            esmfold2_preset_selector(
+                key="benchmark_simple",
+                steps_key="benchmark_simple_sampling_steps",
+                loops_key="benchmark_simple_recycling_loops",
+            )
             simple_cols = st.columns(6)
             simple_max_records = simple_cols[0].number_input(
                 "Max records",
@@ -782,8 +1300,8 @@ with tabs[1]:
                 key="benchmark_simple_max_records",
                 help="0 runs every record in the input CSV.",
             )
-            simple_sampling_steps = simple_cols[1].number_input("Sampling steps", min_value=1, max_value=256, value=32, step=1, key="benchmark_simple_sampling_steps")
-            simple_recycling_loops = simple_cols[2].number_input("Recycling loops", min_value=1, max_value=16, value=3, step=1, key="benchmark_simple_recycling_loops")
+            simple_sampling_steps = simple_cols[1].number_input("Sampling steps", min_value=1, max_value=256, value=68, step=1, key="benchmark_simple_sampling_steps")
+            simple_recycling_loops = simple_cols[2].number_input("Recycling loops", min_value=1, max_value=64, value=10, step=1, key="benchmark_simple_recycling_loops")
             simple_seed = simple_cols[3].number_input("Seed", min_value=0, max_value=999999, value=0, step=1, key="benchmark_simple_seed")
             simple_contact_cutoff = simple_cols[4].number_input("Contact cutoff", min_value=2.0, max_value=20.0, value=8.0, step=0.5, key="benchmark_simple_contact_cutoff")
             simple_device = simple_cols[5].selectbox("Device", ["cuda", "auto", "cpu"], index=0)
@@ -838,6 +1356,9 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Run")
+    with st.expander("Compute", expanded=True):
+        gpu_device = gpu_run_panel(key="benchmark", default="0")
+
     selected_engines = []
     if run_alphafast_af3:
         selected_engines.append("AlphaFast AF3")
@@ -889,11 +1410,18 @@ with tabs[3]:
 
     estimate_count = int(runtime_size.get("candidate_count") or 0)
     estimate_total_residues = runtime_size.get("total_residues")
+    estimate_engine_params: dict[str, dict[str, int]] = {}
+    if "esmfold2" in estimate_engine_keys:
+        estimate_engine_params["esmfold2"] = {
+            "num_loops": int(simple_recycling_loops if dataset_source == "Simple ESMFold2 CSV" else repo_loops),
+            "num_sampling_steps": int(simple_sampling_steps if dataset_source == "Simple ESMFold2 CSV" else repo_sampling),
+        }
     if estimate_engine_keys and estimate_count:
         estimate = estimate_engines(
             engines=estimate_engine_keys,
             candidate_count=estimate_count,
             total_residues=int(estimate_total_residues) if estimate_total_residues else None,
+            engine_params=estimate_engine_params,
         )
         with st.expander("Runtime estimate", expanded=True):
             runtime_cols = st.columns(4)
@@ -917,6 +1445,30 @@ with tabs[3]:
             )
     elif estimate_engine_keys:
         st.caption("Runtime estimate needs a candidate count. Select a target or provide a previewable CSV.")
+    capacity_engine_keys = [engine for engine in estimate_engine_keys if engine != "postprocessing"]
+    estimate_max_system_residues = runtime_size.get("max_system_residues")
+    capacity_preset = (
+        "full_workflow"
+        if (run_common_interface_metrics or run_pyrosetta_input or run_predicted_rosetta_metrics or run_pymol_metrics)
+        else "practical"
+    )
+    if capacity_engine_keys and estimate_max_system_residues:
+        with st.expander("Capacity warning", expanded=True):
+            st.caption(
+                f"Largest selected system: {int(estimate_max_system_residues):,} residues. "
+                "Warnings use completed Capacity Benchmark runs with the same GPU and comparable run depth."
+            )
+            _show_capacity_warnings(
+                capacity_warnings(
+                    engine_keys=capacity_engine_keys,
+                    total_length=int(estimate_max_system_residues),
+                    matrix_mode="sequence_copy_multimer",
+                    preset=capacity_preset,
+                    gpu_device=str(gpu_device),
+                )
+            )
+    elif capacity_engine_keys and estimate_count:
+        st.caption("Capacity warning needs per-record lengths. Installed benchmark records provide this automatically.")
 
     if dataset_source == "Metric table only":
         metric_disabled = not use_published_metrics and not metric_text and not metric_path.strip()
@@ -972,6 +1524,7 @@ with tabs[3]:
                         num_sampling_steps=int(simple_sampling_steps),
                         seed=int(simple_seed),
                         device=str(simple_device or "cuda"),
+                        gpu_device=gpu_device,
                         contact_cutoff=float(simple_contact_cutoff),
                         use_docker=True,
                     )
@@ -1013,8 +1566,13 @@ with tabs[3]:
                     run_af2_initial_guess=bool(run_repo_af2ig),
                     af2_num_recycles=int(af2_recycles),
                     af2_multimer=bool(af2_multimer),
-                    af2_use_binder_template=bool(af2_binder_template),
-                    af2_use_interface_template=bool(af2_interface_template and af2_binder_template),
+                    af2_use_initial_guess=bool(af2_legacy_initial_guess),
+                    af2_use_binder_template=bool(af2_legacy_initial_guess and af2_binder_template),
+                    af2_use_interface_template=bool(
+                        af2_legacy_initial_guess
+                        and af2_binder_template
+                        and af2_interface_template
+                    ),
                     run_boltz2_initial_guess=bool(run_boltz2_ig),
                     boltz2_use_target_template=bool(boltz2_target_template),
                     boltz2_use_target_msa=bool(boltz2_use_target_msa),
@@ -1042,17 +1600,19 @@ with tabs[3]:
                     colabfold_cache_dir=Path(colabfold_cache_dir).expanduser(),
                     colabfold_msa_source=str(colabfold_msa_source or "msa_repository_then_alphafast_mmseqs_gpu"),
                     msa_repository_dir=Path(msa_repository_dir).expanduser(),
+                    require_real_target_msa=bool(require_real_target_msa),
                     colabfold_num_recycles=int(colabfold_recycles),
                     colabfold_num_models=int(colabfold_models),
                     colabfold_use_target_templates=bool(colabfold_use_target_templates),
                     colabfold_max_template_hits=int(colabfold_max_template_hits),
-                    colabfold_gpu_device=int(gpu_device),
+                    colabfold_gpu_device=gpu_device,
                     run_alphafast_af3=bool(run_alphafast_af3),
                     alphafast_db_dir=Path(alphafast_db_dir).expanduser(),
                     alphafast_weights_dir=Path(alphafast_weights_dir).expanduser(),
                     alphafast_batch_size=int(alphafast_batch_size),
                     alphafast_num_recycles=int(alphafast_recycles),
-                    alphafast_gpu_device=int(gpu_device),
+                    alphafast_gpu_device=gpu_device,
+                    gpu_device=gpu_device,
                     max_records=int(repo_max_records),
                     num_loops=int(repo_loops),
                     num_sampling_steps=int(repo_sampling),
@@ -1072,73 +1632,550 @@ with tabs[4]:
         st.info("No benchmark jobs yet.")
     else:
         df = _benchmark_job_table(rows)
-        display_cols = [
-            "result",
-            "kind",
-            "description",
-            "status",
-            "records",
-            "top_feature",
-            "top_ap",
-            "plots",
-            "created_at",
-            "job_code",
-            "run_id",
-        ]
-        display_df = df[[col for col in display_cols if col in df.columns]].copy()
-        table_key = "benchmark_results"
-        event = st.dataframe(
-            display_df,
-            width="stretch",
-            hide_index=True,
-            key=f"{table_key}_jobs_table",
-            on_select="rerun",
-            selection_mode="multi-row",
-            column_config={
-                "result": st.column_config.LinkColumn("result", display_text="Open"),
-                "top_ap": st.column_config.NumberColumn("top AP", format="%.3f"),
-            },
-        )
-        delete_result = st.session_state.pop(f"{table_key}_delete_result", None)
-        if delete_result:
-            level, message = delete_result
-            if level == "success":
-                st.success(str(message))
-            else:
-                st.error(str(message))
-
-        table_widget_key = f"{table_key}_jobs_table"
-        selected_indices = [idx for idx in selected_dataframe_rows(event, table_widget_key) if 0 <= idx < len(display_df)]
-        selected_rows = display_df.iloc[selected_indices].copy() if selected_indices else display_df.iloc[0:0].copy()
-        active_selected = selected_rows[selected_rows["status"].isin(ACTIVE_STATUSES)]
-        if not active_selected.empty:
-            st.warning("Running, queued, or preparing jobs cannot be deleted.")
-        selected_rows = selected_rows[~selected_rows["status"].isin(ACTIVE_STATUSES)]
-        selected_refs = [
-            ("benchmark", str(row["run_id"]))
-            for row in selected_rows.to_dict(orient="records")
-        ]
-        selected_refs_key = f"{table_key}_selected_delete_refs"
-        if selected_refs:
-            st.session_state[selected_refs_key] = selected_refs
-        cached_selected_refs = st.session_state.get(selected_refs_key) or []
-        delete_clicked = st.button(
-            "Delete selected benchmark jobs",
-            type="primary",
-            disabled=not cached_selected_refs,
-            key=f"{table_key}_request_delete_jobs",
-        )
-        if delete_clicked and cached_selected_refs:
-            show_delete_jobs_dialog(
-                table_key=table_key,
-                pending_refs=cached_selected_refs,
-                selected_refs_key=selected_refs_key,
-                label="benchmark job",
-            )
+        if df.empty:
+            st.info("No benchmark jobs yet. Refolding evaluation runs are listed under Refolding / Validation.")
         else:
-            st.caption("Select finished benchmark rows in the table to enable deletion.")
+            display_cols = [
+                "result",
+                "kind",
+                "description",
+                "status",
+                "recovery",
+                "esmfold2_preset",
+                "esmfold2_loops",
+                "esmfold2_steps",
+                "records",
+                "top_feature",
+                "top_ap",
+                "plots",
+                "created_at",
+                "job_code",
+                "run_id",
+            ]
+            display_df = df[[col for col in display_cols if col in df.columns]].copy()
+            table_key = "benchmark_results"
+            event = st.dataframe(
+                display_df,
+                width="stretch",
+                hide_index=True,
+                key=f"{table_key}_jobs_table",
+                on_select="rerun",
+                selection_mode="multi-row",
+                column_config={
+                    "result": st.column_config.LinkColumn("result", display_text="Open"),
+                    "top_ap": st.column_config.NumberColumn("top AP", format="%.3f"),
+                },
+            )
+            delete_result = st.session_state.pop(f"{table_key}_delete_result", None)
+            if delete_result:
+                level, message = delete_result
+                if level == "success":
+                    st.success(str(message))
+                else:
+                    st.error(str(message))
+
+            table_widget_key = f"{table_key}_jobs_table"
+            selected_indices = [idx for idx in selected_dataframe_rows(event, table_widget_key) if 0 <= idx < len(display_df)]
+            selected_rows = display_df.iloc[selected_indices].copy() if selected_indices else display_df.iloc[0:0].copy()
+            run_dirs_by_id = {str(row.get("run_id")): Path(str(row.get("run_dir"))) for row in rows}
+            recovery_key = f"{table_key}_recovery_report"
+            if len(selected_rows) == 1:
+                selected_run_id = str(selected_rows.iloc[0]["run_id"])
+                selected_run_dir = run_dirs_by_id.get(selected_run_id)
+                if selected_run_dir is not None:
+                    if st.button("Check selected job completion", key=f"{table_key}_inspect_job"):
+                        try:
+                            st.session_state[recovery_key] = inspect_benchmark_run(selected_run_dir)
+                        except Exception as exc:
+                            st.error(f"Could not inspect the selected benchmark: {exc}")
+            elif len(selected_rows) > 1:
+                st.caption("Select one benchmark row to inspect or resume it.")
+
+            recovery_report = st.session_state.get(recovery_key)
+            selected_run_ids = set(selected_rows["run_id"].astype(str)) if not selected_rows.empty else set()
+            if recovery_report and str(recovery_report.get("run_id")) in selected_run_ids:
+                completed = int(recovery_report.get("completed_stage_count") or 0)
+                requested = int(recovery_report.get("requested_stage_count") or 0)
+                first_incomplete = recovery_report.get("first_incomplete_stage")
+                if recovery_report.get("finished_correctly"):
+                    st.success(f"Job {recovery_report.get('job_code')} finished correctly ({completed}/{requested} stages complete).")
+                else:
+                    state = "stopped/stale" if recovery_report.get("stale") else str(recovery_report.get("status") or "incomplete")
+                    st.warning(
+                        f"Job {recovery_report.get('job_code')} is {state}: {completed}/{requested} stages are complete. "
+                        f"Resume point: {first_incomplete or 'unknown'}."
+                    )
+                stage_rows = []
+                for stage in recovery_report.get("stages") or []:
+                    if not stage.get("requested"):
+                        continue
+                    stage_rows.append(
+                        {
+                            "stage": stage.get("stage"),
+                            "status": "complete" if stage.get("complete") else "missing/incomplete",
+                            "records": stage.get("records"),
+                            "expected": stage.get("expected_records"),
+                        }
+                    )
+                st.dataframe(pd.DataFrame(stage_rows), width="stretch", hide_index=True)
+                free_gib = float(recovery_report.get("free_bytes") or 0) / (1024**3)
+                required_gib = float(recovery_report.get("required_free_bytes") or 0) / (1024**3)
+                st.caption(
+                    f"Free disk space: {free_gib:.1f} GiB; conservative resume requirement: {required_gib:.1f} GiB. "
+                    "Existing completed engine outputs will be reused."
+                )
+                currently_active = str(recovery_report.get("status")) in ACTIVE_STATUSES and not recovery_report.get("stale")
+                resume_disabled = (
+                    not recovery_report.get("can_resume")
+                    or currently_active
+                    or free_gib < required_gib
+                )
+                if free_gib < required_gib:
+                    st.error(f"Free at least {required_gib:.1f} GiB before resuming this benchmark.")
+                resume_run_dir = run_dirs_by_id.get(str(recovery_report.get("run_id")))
+                resume_input = read_json(resume_run_dir / "input.json") if resume_run_dir is not None else {}
+                resume_params = resume_input.get("params") if isinstance(resume_input.get("params"), dict) else {}
+                resume_worker = read_json(resume_run_dir / "worker_request.json") if resume_run_dir is not None else {}
+                resume_kwargs = resume_worker.get("kwargs") if isinstance(resume_worker.get("kwargs"), dict) else {}
+                current_resume_gpu = str(
+                    resume_params.get("gpu_device")
+                    or resume_kwargs.get("gpu_device")
+                    or resume_kwargs.get("alphafast_gpu_device")
+                    or "0"
+                )
+                with st.expander("Resume compute", expanded=True):
+                    resume_gpu_device = gpu_run_panel(
+                        key=f"benchmark_resume_{recovery_report.get('run_id')}",
+                        default=current_resume_gpu,
+                    )
+                if st.button(
+                    f"Resume from {first_incomplete or 'incomplete stage'}",
+                    type="primary",
+                    disabled=resume_disabled,
+                    key=f"{table_key}_resume_job",
+                ):
+                    try:
+                        prepare_benchmark_run_resume(resume_run_dir, gpu_device=resume_gpu_device)
+                        spawn_worker_for_run(resume_run_dir)
+                        st.session_state.pop(recovery_key, None)
+                        st.success(f"Benchmark resume queued on GPU {resume_gpu_device}. Completed engine tables will be reused.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not resume the benchmark: {exc}")
+
+            active_selected = selected_rows[selected_rows["status"].isin(ACTIVE_STATUSES)]
+            if not active_selected.empty:
+                st.warning("Running, queued, or preparing jobs cannot be deleted.")
+            selected_rows = selected_rows[~selected_rows["status"].isin(ACTIVE_STATUSES)]
+            selected_refs = [
+                ("benchmark", str(row["run_id"]))
+                for row in selected_rows.to_dict(orient="records")
+            ]
+            selected_refs_key = f"{table_key}_selected_delete_refs"
+            if selected_refs:
+                st.session_state[selected_refs_key] = selected_refs
+            cached_selected_refs = st.session_state.get(selected_refs_key) or []
+            delete_clicked = st.button(
+                "Delete selected benchmark jobs",
+                type="primary",
+                disabled=not cached_selected_refs,
+                key=f"{table_key}_request_delete_jobs",
+            )
+            if delete_clicked and cached_selected_refs:
+                show_delete_jobs_dialog(
+                    table_key=table_key,
+                    pending_refs=cached_selected_refs,
+                    selected_refs_key=selected_refs_key,
+                    label="benchmark job",
+                )
+            else:
+                st.caption("Select finished benchmark rows in the table to enable deletion.")
 
 with tabs[5]:
+    st.subheader("Benchmark Matrix")
+    st.caption(
+        "Engines are rows and targets are columns. Use a matrix umbrella to decide which exact benchmark run contributes "
+        "to each engine-target cell; missing cells stay visible."
+    )
+    rows = collect_jobs("benchmark")
+    source_rows, unavailable_rows = _available_benchmark_sources(rows)
+    cells = _benchmark_matrix_cells(source_rows)
+    workspaces = _benchmark_matrix_workspace_jobs(rows)
+    workspace_options = ["__auto__"] + [str(row["run_id"]) for row in workspaces]
+    workspace_by_id = {str(row["run_id"]): row for row in workspaces}
+    selected_workspace_id = st.selectbox(
+        "Matrix umbrella",
+        workspace_options,
+        index=1 if workspaces else 0,
+        format_func=lambda value: (
+            "Auto from latest completed source runs"
+            if value == "__auto__"
+            else f"{workspace_by_id.get(str(value), {}).get('name', 'Benchmark matrix workspace')} | "
+            f"{workspace_by_id.get(str(value), {}).get('job_code', '')} | {value}"
+        ),
+        key="benchmark_matrix_workspace",
+    )
+    active_workspace = workspace_by_id.get(str(selected_workspace_id)) if selected_workspace_id != "__auto__" else None
+    if active_workspace is None:
+        st.caption("No umbrella is selected. The matrix uses the latest completed non-collection run for each engine-target cell.")
+    else:
+        st.caption(
+            f"Umbrella: {active_workspace.get('name')} | "
+            f"{active_workspace.get('cell_count') or 0} curated cells | {active_workspace.get('created_at')}"
+        )
+    overath_targets = _installed_overath_targets()
+    if cells.empty and not overath_targets:
+        st.info("No completed benchmark cells with merged metrics are available yet.")
+        if unavailable_rows:
+            with st.expander("Recent runs not ready for the matrix", expanded=True):
+                st.dataframe(pd.DataFrame(unavailable_rows).head(30), hide_index=True, width="stretch")
+    else:
+        cell_targets = [] if cells.empty else cells["target_id"].dropna().astype(str).unique().tolist()
+        engine_options = list(BENCHMARK_MATRIX_ENGINE_ORDER)
+        if active_workspace is None:
+            target_options = sorted(set(overath_targets) | set(cell_targets))
+            visible_source_cells = cells.copy()
+            if not visible_source_cells.empty:
+                visible_source_cells = visible_source_cells[visible_source_cells["kind"].astype(str) != "collection"].copy()
+            canonical_cells = _canonical_benchmark_cells(visible_source_cells)
+        else:
+            canonical_cells = _benchmark_matrix_workspace_cells(active_workspace, cells)
+            workspace_targets: list[str] = []
+            workspace_path = Path(str(active_workspace.get("run_dir") or "")) / "artifacts" / "benchmark" / "matrix_workspace.json"
+            if workspace_path.exists():
+                workspace_payload = read_json(workspace_path)
+                workspace_targets = [
+                    str(target)
+                    for target in (workspace_payload.get("targets") or [])
+                    if str(target).strip()
+                ]
+            if workspace_targets:
+                target_options = workspace_targets
+            else:
+                target_options = sorted(canonical_cells["target_id"].dropna().astype(str).unique().tolist())
+        plot_df = _benchmark_matrix_with_missing(
+            canonical_cells,
+            target_options=target_options,
+            engine_options=engine_options,
+        )
+        if plot_df.empty:
+            st.info("No matrix cells are available yet.")
+        else:
+            if cells.empty:
+                plot_df["available_runs"] = 0
+            else:
+                duplicate_counts = (
+                    cells.groupby(["engine", "target_id"], dropna=False)
+                    .size()
+                    .reset_index(name="available_runs")
+                )
+                plot_df = (
+                    plot_df.drop(columns=["available_runs"], errors="ignore")
+                    .merge(duplicate_counts, on=["engine", "target_id"], how="left")
+                )
+                plot_df["available_runs"] = plot_df["available_runs"].fillna(0).astype(int)
+            matrix_height = max(320, min(900, 72 * max(1, plot_df["engine"].nunique())))
+            matrix_width = max(520, min(1400, 90 * max(1, plot_df["target_id"].nunique())))
+            chart = (
+                alt.Chart(plot_df)
+                .mark_rect()
+                .encode(
+                    x=alt.X("target_id:N", title="target", sort=target_options),
+                    y=alt.Y("engine:N", title="engine", sort=BENCHMARK_MATRIX_ENGINE_ORDER),
+                    color=alt.Color(
+                        "status:N",
+                        title="status",
+                        scale=alt.Scale(
+                            domain=["completed", "running", "queued", "failed", "missing"],
+                            range=["#0B74C9", "#F5A3A6", "#FF2E34", "#7DBDEA", "#E5E7EB"],
+                        ),
+                    ),
+                    tooltip=[
+                        "engine",
+                        "target_id",
+                        "status",
+                        "records",
+                        "kind",
+                        "settings",
+                        "job_code",
+                        "run_id",
+                        "available_runs",
+                        "description",
+                    ],
+                )
+                .properties(width=matrix_width, height=matrix_height)
+            )
+            st.altair_chart(chart, width="content")
+
+            st.markdown("**Curate The Matrix Umbrella**")
+            st.caption(
+                "Each engine-target cell must have at most one checked source row. "
+                "Canonical rows are what the current matrix uses; uncheck that row when choosing a replacement."
+            )
+            if cells.empty:
+                selectable = pd.DataFrame()
+            elif active_workspace is not None:
+                selectable = canonical_cells[
+                    canonical_cells["status"].astype(str).eq("completed")
+                    & canonical_cells["kind"].astype(str).eq("benchmark")
+                ].copy()
+                st.caption("Loaded umbrella mode: the editor below shows only the curated source row for each matrix cell.")
+            else:
+                selectable = cells[
+                    cells["status"].astype(str).eq("completed")
+                    & cells["kind"].astype(str).eq("benchmark")
+                ].copy()
+            if selectable.empty:
+                st.caption("No completed source benchmark runs are available for the matrix yet.")
+                selected_cells = selectable.copy()
+            else:
+                canonical_keys = {
+                    f"{row.get('run_id')}::{row.get('engine')}::{row.get('target_id')}"
+                    for row in plot_df[plot_df["status"].astype(str).eq("completed")].to_dict(orient="records")
+                }
+                selectable["canonical"] = selectable.apply(
+                    lambda row: f"{row['run_id']}::{row['engine']}::{row['target_id']}" in canonical_keys,
+                    axis=1,
+                )
+                selectable["canonical"] = _clean_checkbox_series(selectable["canonical"])
+                selectable = selectable.sort_values(
+                    ["engine_rank", "target_id", "canonical", "created_at"],
+                    ascending=[True, True, False, False],
+                ).copy()
+                selected_state_key = f"benchmark_matrix_selected_cells_{selected_workspace_id}"
+                selected_state = st.session_state.get(selected_state_key)
+                selectable["select"] = selectable.apply(
+                    lambda row: bool(
+                        selected_state.get(f"{row['run_id']}::{row['engine']}::{row['target_id']}", False)
+                        if isinstance(selected_state, dict)
+                        else f"{row['run_id']}::{row['engine']}::{row['target_id']}" in canonical_keys
+                    ),
+                    axis=1,
+                )
+                selectable["select"] = _clean_checkbox_series(selectable["select"])
+                selectable["engine_target"] = selectable["engine"].astype(str) + " | " + selectable["target_id"].astype(str)
+            display_columns = [
+                "select",
+                "canonical",
+                "engine_target",
+                "settings",
+                "result",
+                "engine",
+                "target_id",
+                "records",
+                "kind",
+                "dataset",
+                "job_code",
+                "created_at",
+                "run_id",
+                "description",
+            ]
+            if not selectable.empty:
+                displayed_columns = [col for col in display_columns if col in selectable.columns]
+                edited = st.data_editor(
+                    selectable[displayed_columns],
+                    hide_index=True,
+                    width="stretch",
+                    key="benchmark_matrix_cell_editor",
+                    column_config={
+                        "select": st.column_config.CheckboxColumn("select"),
+                        "canonical": st.column_config.CheckboxColumn("canonical"),
+                        "result": st.column_config.LinkColumn("result", display_text="Open"),
+                    },
+                    disabled=[col for col in displayed_columns if col != "select"],
+                )
+                if "select" in edited.columns:
+                    edited["select"] = _clean_checkbox_series(edited["select"])
+                if "canonical" in edited.columns:
+                    edited["canonical"] = _clean_checkbox_series(edited["canonical"])
+                selected_cells = edited[edited["select"]].copy() if "select" in edited.columns else edited.iloc[0:0].copy()
+                st.session_state[selected_state_key] = {
+                    f"{row['run_id']}::{row['engine']}::{row['target_id']}": True
+                    for row in selected_cells.to_dict(orient="records")
+                }
+            if not selected_cells.empty:
+                duplicate_selection_rows = pd.DataFrame()
+                if {"engine", "target_id"}.issubset(selected_cells.columns):
+                    duplicate_mask = selected_cells.duplicated(["engine", "target_id"], keep=False)
+                    duplicate_selection_rows = selected_cells[duplicate_mask].copy()
+                duplicate_selection = not duplicate_selection_rows.empty
+                if duplicate_selection:
+                    st.error(
+                        "The umbrella has duplicate selected source runs for the same engine-target cell. "
+                        "Uncheck all but one row for each duplicate before saving."
+                    )
+                    duplicate_display = duplicate_selection_rows.sort_values(
+                        ["engine", "target_id", "created_at"],
+                        ascending=[True, True, False],
+                    )
+                    st.dataframe(
+                        duplicate_display[
+                            [
+                                col
+                                for col in [
+                                    "engine_target",
+                                    "settings",
+                                    "result",
+                                    "records",
+                                    "job_code",
+                                    "created_at",
+                                    "run_id",
+                                    "description",
+                                ]
+                                if col in duplicate_display.columns
+                            ]
+                        ],
+                        hide_index=True,
+                        width="stretch",
+                        column_config={"result": st.column_config.LinkColumn("result", display_text="Open")},
+                    )
+                selections, selected_targets_for_collection = _matrix_collection_selections(selected_cells)
+                st.info(
+                    f"Selected {len(selected_cells):,} umbrella cells across "
+                    f"{len(selected_targets_for_collection):,} target(s) and {len(selections):,} source run(s)."
+                )
+                workspace_name = st.text_input(
+                    "Umbrella name",
+                    value=str(active_workspace.get("name") if active_workspace else "Overath benchmark matrix"),
+                    key="benchmark_matrix_workspace_name",
+                )
+                with st.expander("Selected source mapping", expanded=False):
+                    st.json(selections)
+                if st.button(
+                    "Save matrix umbrella",
+                    type="primary",
+                    key="benchmark_matrix_save_workspace",
+                    disabled=duplicate_selection,
+                ):
+                    try:
+                        run_dir = create_benchmark_matrix_workspace(
+                            name=workspace_name,
+                            selections=selections,
+                        )
+                        st.success("Benchmark matrix umbrella saved.")
+                        show_pipeline_links(run_dir, [run_dir])
+                    except Exception as exc:
+                        st.error(str(exc))
+                with st.expander("Optional: create a merged benchmark collection from this umbrella", expanded=False):
+                    include_input_columns = st.checkbox(
+                        "Input metrics",
+                        value=False,
+                        key="benchmark_matrix_include_input_metrics",
+                    )
+                    matrix_collection_name = st.text_input(
+                        "Collection name",
+                        value=f"{workspace_name} collection",
+                        key="benchmark_matrix_collection_name",
+                    )
+                    if st.button(
+                        "Create collection from selected umbrella cells",
+                        key="benchmark_matrix_create_collection",
+                        disabled=duplicate_selection,
+                    ):
+                        try:
+                            run_dir = create_benchmark_collection(
+                                name=matrix_collection_name,
+                                selections=selections,
+                                target_ids=selected_targets_for_collection,
+                                include_input_columns=bool(include_input_columns),
+                            )
+                            st.success("Benchmark collection created from selected umbrella cells.")
+                            show_pipeline_links(run_dir, [run_dir])
+                        except Exception as exc:
+                            st.error(str(exc))
+                with st.expander("Maintenance: recalculate missing PyRosetta metrics", expanded=False):
+                    st.caption(
+                        "Checks the selected umbrella/source rows for missing predicted Rosetta columns, "
+                        "then queues a CPU-only backfill job against the original source benchmark runs."
+                    )
+                    try:
+                        missing_pyrosetta = pd.DataFrame(
+                            benchmark_missing_pyrosetta_rows(selected_cells.to_dict(orient="records"))
+                        )
+                    except Exception as exc:
+                        missing_pyrosetta = pd.DataFrame()
+                        st.error(f"Could not inspect selected rows: {exc}")
+                    if missing_pyrosetta.empty:
+                        st.caption("No selected source rows could be inspected.")
+                    else:
+                        missing_display = missing_pyrosetta.copy()
+                        if "status" in missing_display.columns:
+                            missing_display = missing_display.sort_values(
+                                ["status", "engine", "targets", "job_code"],
+                                ascending=[False, True, True, True],
+                            )
+                        st.dataframe(
+                            missing_display[
+                                [
+                                    col
+                                    for col in [
+                                        "status",
+                                        "engine",
+                                        "targets",
+                                        "records",
+                                        "existing_rosetta_records",
+                                        "missing_rosetta_records",
+                                        "targets_missing",
+                                        "job_code",
+                                        "run_id",
+                                        "metric_column",
+                                    ]
+                                    if col in missing_display.columns
+                                ]
+                            ],
+                            hide_index=True,
+                            width="stretch",
+                        )
+                        missing_only = missing_pyrosetta[
+                            pd.to_numeric(
+                                missing_pyrosetta.get("missing_rosetta_records", pd.Series(dtype=int)),
+                                errors="coerce",
+                            ).fillna(0)
+                            > 0
+                        ].copy()
+                        total_missing = int(
+                            pd.to_numeric(
+                                missing_only.get("missing_rosetta_records", pd.Series(dtype=int)),
+                                errors="coerce",
+                            )
+                            .fillna(0)
+                            .sum()
+                        )
+                        st.info(
+                            f"{len(missing_only):,} selected engine-target cell(s) have "
+                            f"{total_missing:,} missing PyRosetta record(s)."
+                        )
+                        pyrosetta_nprocs_backfill = st.number_input(
+                            "PyRosetta CPU workers",
+                            min_value=1,
+                            max_value=max(1, int(os.cpu_count() or 1)),
+                            value=min(32, max(1, int(os.cpu_count() or 1))),
+                            step=1,
+                            key="benchmark_matrix_pyrosetta_backfill_nprocs",
+                        )
+                        if st.button(
+                            "Recalculate missing PyRosetta metrics for selected source runs",
+                            key="benchmark_matrix_pyrosetta_backfill",
+                            disabled=duplicate_selection or missing_only.empty,
+                        ):
+                            try:
+                                run_dir = enqueue_missing_pyrosetta_benchmark_metrics(
+                                    missing_rows=missing_only.to_dict(orient="records"),
+                                    pyrosetta_nprocs=int(pyrosetta_nprocs_backfill),
+                                )
+                                spawn_worker_for_run(run_dir)
+                                st.success("PyRosetta backfill job queued.")
+                                show_pipeline_links(run_dir, [run_dir])
+                            except Exception as exc:
+                                st.error(str(exc))
+            else:
+                st.caption("Tick one or more exact source rows to save a matrix umbrella.")
+
+        if unavailable_rows:
+            with st.expander("Runs not currently represented in the matrix", expanded=False):
+                st.dataframe(pd.DataFrame(unavailable_rows).head(40), hide_index=True, width="stretch")
+
+with tabs[6]:
     st.subheader("Benchmark Collections")
     st.caption(
         "Combine engine outputs from multiple completed benchmark jobs without modifying the original runs. "
@@ -1150,7 +2187,7 @@ with tabs[5]:
     for row in rows:
         run_dir = Path(str(row.get("run_dir") or ""))
         input_payload = read_json(run_dir / "input.json")
-        if input_payload.get("job_type") == "benchmark_collection":
+        if input_payload.get("job_type") in {"benchmark_collection", "benchmark_matrix_workspace"}:
             continue
         metrics_path = run_dir / "artifacts" / "benchmark" / "merged_benchmark_metrics.csv"
         unavailable_reason = ""

@@ -62,6 +62,26 @@ def download_pdb(pdb_id: str) -> str:
     return data
 
 
+def download_alphafold_db_pdb(uniprot_id_or_url: str) -> str:
+    text = str(uniprot_id_or_url or "").strip()
+    if not text:
+        raise ValueError("Provide a UniProt accession or an AlphaFold DB PDB URL.")
+    if text.startswith(("http://", "https://")):
+        url = text
+        label = Path(url.rstrip("/")).name or "AlphaFold DB structure"
+    else:
+        accession = text.upper()
+        if not accession.replace("-", "").isalnum():
+            raise ValueError("UniProt accession should contain only letters, numbers, or hyphens.")
+        url = f"https://alphafold.ebi.ac.uk/files/AF-{accession}-F1-model_v4.pdb"
+        label = accession
+    with urllib.request.urlopen(url, timeout=60) as response:
+        data = response.read().decode("utf-8")
+    if "ATOM" not in data[:20000]:
+        raise ValueError(f"Downloaded response for {label} does not look like a PDB file.")
+    return data
+
+
 def pdb_summary(pdb_text: str) -> dict:
     residues_by_chain: dict[str, set[int]] = {}
     atom_count = 0

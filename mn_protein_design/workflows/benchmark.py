@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import time
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,7 +18,18 @@ import numpy as np
 import pandas as pd
 
 from mn_protein_design.core.candidates import STAGE_COMPLEX_REFOLDING, STAGE_BENCHMARK, read_candidates, write_candidates
-from mn_protein_design.core.jobs import JobPaths, create_job, finish_job, mark_internal_job, read_json, update_status, write_json
+from mn_protein_design.core.gpu import docker_gpu_args, gpu_queue_resource, normalize_gpu_device
+from mn_protein_design.core.jobs import (
+    JobPaths,
+    create_job,
+    finish_job,
+    mark_internal_job,
+    prepare_job_for_resume,
+    read_json,
+    update_status,
+    utc_now,
+    write_json,
+)
 from mn_protein_design.core.structures import filter_pdb_text
 from mn_protein_design.runtime import runs_root
 from mn_protein_design.workflows import esm_binder as esm_binder_workflow
@@ -41,6 +54,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BIOHUB_ESM_ROOT = Path("/mnt/db/reference_files/biohub-esm")
 DE_NOVO_BINDER_SCORING_DIR = REPO_ROOT / "tools_to_implement" / "de_novo_binder_scoring"
 PUBLISHED_DATASET = DE_NOVO_BINDER_SCORING_DIR / "analysis" / "data" / "prepared_training_dataset.csv"
+TARGET_MSA_REQUIRED_MIN_LENGTH = 30
 FEATURE_RANKING_COLUMNS = [
     "feature",
     "direction",
@@ -93,6 +107,223 @@ BENCHMARK_DATASET_PATH_KWARGS = {
     "alphafast_db_dir",
     "alphafast_weights_dir",
 }
+
+BENCHMARK_RESUME_STAGES: tuple[tuple[str, str, str], ...] = (
+    ("run_esmfold2", "ESMFold2", "esmfold2_metrics.csv"),
+    ("run_af2_initial_guess", "AF2 initial guess", "af2_initial_guess_metrics.csv"),
+    ("run_boltz2_initial_guess", "Boltz-2", "boltz2_initial_guess_metrics.csv"),
+    ("run_rf3", "RF3", "rf3_metrics.csv"),
+    ("run_protenix", "Protenix", "protenix_metrics.csv"),
+    ("run_boltzgen_fold", "BoltzGen target-template fold", "boltzgen_fold_metrics.csv"),
+    ("run_colabfold", "ColabFold", "colabfold_metrics.csv"),
+    ("run_alphafast_af3", "AlphaFast AF3", "alphafast_af3_metrics.csv"),
+)
+
+
+def _repo_and_runs_mounts() -> list[str]:
+    """Mount the repo plus the active run root when it lives outside the repo."""
+    mounts = ["-v", f"{REPO_ROOT}:{REPO_ROOT}"]
+    try:
+        run_root = runs_root().resolve()
+        repo_root = REPO_ROOT.resolve()
+    except Exception:
+        return mounts
+    try:
+        run_root.relative_to(repo_root)
+    except ValueError:
+        mounts.extend(["-v", f"{run_root}:{run_root}"])
+    return mounts
+
+
+def _csv_data_row_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        with path.open(newline="") as handle:
+            return max(0, sum(1 for _ in csv.reader(handle)) - 1)
+    except OSError:
+        return 0
+
+
+def _completed_benchmark_child_runs(parent_run_dir: Path, engine: str) -> list[str]:
+    matches: list[tuple[str, str]] = []
+    root = runs_root()
+    for metadata_path in root.glob("*/*/metadata.json"):
+        metadata = read_json(metadata_path)
+        if str(metadata.get("parent_run_id") or "") != parent_run_dir.name:
+            continue
+        if str(metadata.get("benchmark_engine") or "") != engine:
+            continue
+        if str(metadata.get("status") or "") != "completed":
+            continue
+        matches.append((str(metadata.get("updated_at") or ""), str(metadata_path.parent)))
+    return [run_dir for _, run_dir in sorted(matches)]
+
+
+def _recoverable_benchmark_child_job(parent_run_dir: Path, engine: str) -> JobPaths | None:
+    matches: list[tuple[str, Path]] = []
+    for metadata_path in runs_root().glob("*/*/metadata.json"):
+        metadata = read_json(metadata_path)
+        if str(metadata.get("parent_run_id") or "") != parent_run_dir.name:
+            continue
+        if str(metadata.get("benchmark_engine") or "") != engine:
+            continue
+        if str(metadata.get("status") or "") == "completed":
+            continue
+        matches.append((str(metadata.get("updated_at") or ""), metadata_path.parent))
+    if not matches:
+        return None
+    run_dir = sorted(matches)[-1][1]
+    return JobPaths(task_group=run_dir.parent.name, run_id=run_dir.name, run_dir=run_dir)
+
+
+def inspect_benchmark_run(run_dir: Path) -> dict[str, Any]:
+    """Inspect durable artifacts and report the earliest incomplete benchmark stage."""
+    run_dir = Path(run_dir).expanduser().resolve()
+    metadata = read_json(run_dir / "metadata.json")
+    result = read_json(run_dir / "result.json")
+    request = read_json(run_dir / "worker_request.json")
+    kwargs = request.get("kwargs") if isinstance(request.get("kwargs"), dict) else {}
+    benchmark_dir = run_dir / "artifacts" / "benchmark"
+    run_csv = run_dir / "artifacts" / "raw" / "de_novo_binder_scoring" / "output" / "run.csv"
+    record_count = _csv_data_row_count(run_csv)
+    stages: list[dict[str, Any]] = [
+        {
+            "stage": "Prepared inputs",
+            "requested": True,
+            "complete": record_count > 0,
+            "records": record_count,
+            "expected_records": record_count or None,
+            "artifact": str(run_csv),
+        }
+    ]
+    first_incomplete = ""
+    for option, label, filename in BENCHMARK_RESUME_STAGES:
+        requested = bool(kwargs.get(option))
+        path = benchmark_dir / filename
+        rows = _csv_data_row_count(path)
+        complete = bool(requested and record_count > 0 and rows == record_count)
+        if not requested:
+            complete = True
+        stages.append(
+            {
+                "stage": label,
+                "requested": requested,
+                "complete": complete,
+                "records": rows,
+                "expected_records": record_count or None,
+                "artifact": str(path),
+            }
+        )
+        if requested and not complete and not first_incomplete:
+            first_incomplete = label
+    merged_metrics = benchmark_dir / "merged_benchmark_metrics.csv"
+    merged_ranking = benchmark_dir / "merged_benchmark_feature_ranking.csv"
+    postprocess_complete = (
+        record_count > 0
+        and _csv_data_row_count(merged_metrics) == record_count
+        and merged_ranking.exists()
+    )
+    stages.append(
+        {
+            "stage": "Final metric postprocessing",
+            "requested": True,
+            "complete": postprocess_complete,
+            "records": _csv_data_row_count(merged_metrics),
+            "expected_records": record_count or None,
+            "artifact": str(merged_metrics),
+        }
+    )
+    if not postprocess_complete and not first_incomplete:
+        first_incomplete = "Final metric postprocessing"
+    updated_at = str(metadata.get("updated_at") or metadata.get("created_at") or "")
+    age_seconds: float | None = None
+    if updated_at:
+        try:
+            age_seconds = (datetime.now(timezone.utc) - datetime.fromisoformat(updated_at)).total_seconds()
+        except ValueError:
+            pass
+    free_bytes = shutil.disk_usage(run_dir).free
+    required_free_bytes = max(20 * 1024**3, int(record_count) * 120 * 1024**2)
+    requested_stages = [stage for stage in stages if stage["requested"]]
+    status_text = str(metadata.get("status") or "")
+    failed_result_while_active = bool(status_text in {"running", "preparing", "queued"} and result.get("success") is False)
+    stale = bool(
+        status_text in {"running", "preparing", "queued"}
+        and (failed_result_while_active or (age_seconds or 0) > 6 * 3600)
+    )
+    return {
+        "run_id": run_dir.name,
+        "job_code": metadata.get("job_code"),
+        "status": metadata.get("status"),
+        "updated_at": updated_at,
+        "age_seconds": age_seconds,
+        "stale": stale,
+        "stale_reason": "active metadata still has failed result" if failed_result_while_active else "",
+        "record_count": record_count,
+        "completed_stage_count": sum(1 for stage in requested_stages if stage["complete"]),
+        "requested_stage_count": len(requested_stages),
+        "first_incomplete_stage": first_incomplete or None,
+        "finished_correctly": bool(requested_stages and all(stage["complete"] for stage in requested_stages)),
+        "can_resume": bool(record_count > 0 and first_incomplete),
+        "free_bytes": free_bytes,
+        "required_free_bytes": required_free_bytes,
+        "stages": stages,
+    }
+
+
+def prepare_benchmark_run_resume(run_dir: Path, gpu_device: object | None = None) -> dict[str, Any]:
+    """Mark a benchmark for artifact-aware resumption by the durable worker."""
+    report = inspect_benchmark_run(run_dir)
+    if not report["can_resume"]:
+        raise ValueError("This benchmark has no resumable prepared dataset or is already complete.")
+    request_path = Path(run_dir) / "worker_request.json"
+    request = read_json(request_path)
+    if not request:
+        raise ValueError("worker_request.json is missing; the original benchmark settings cannot be restored.")
+    kwargs = request.get("kwargs") if isinstance(request.get("kwargs"), dict) else {}
+    kwargs["resume"] = True
+    normalized_gpu = normalize_gpu_device(gpu_device) if gpu_device is not None else ""
+    if normalized_gpu:
+        kwargs["gpu_device"] = normalized_gpu
+        kwargs["alphafast_gpu_device"] = normalized_gpu
+        kwargs["colabfold_gpu_device"] = normalized_gpu
+    request["kwargs"] = kwargs
+    write_json(request_path, request)
+    if normalized_gpu:
+        input_path = Path(run_dir) / "input.json"
+        input_payload = read_json(input_path)
+        params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+        params["gpu_device"] = normalized_gpu
+        params["alphafast_gpu_device"] = normalized_gpu
+        params["colabfold_gpu_device"] = normalized_gpu
+        params.pop("queue_resource", None)
+        input_payload["params"] = params
+        write_json(input_path, input_payload)
+    for metadata_path in runs_root().glob("*/*/metadata.json"):
+        child_metadata = read_json(metadata_path)
+        if str(child_metadata.get("parent_run_id") or "") != Path(run_dir).name:
+            continue
+        if str(child_metadata.get("status") or "") not in {"running", "preparing", "queued"}:
+            continue
+        update_status(
+            metadata_path.parent,
+            "failed",
+            worker_error="Parent benchmark was recovered after its worker stopped.",
+            recovery_superseded=True,
+        )
+    prepare_job_for_resume(Path(run_dir))
+    if normalized_gpu:
+        metadata_path = Path(run_dir) / "metadata.json"
+        metadata = read_json(metadata_path)
+        queue_resource = gpu_queue_resource(normalized_gpu)
+        if queue_resource:
+            metadata["queue_resource"] = queue_resource
+        else:
+            metadata.pop("queue_resource", None)
+        metadata["updated_at"] = utc_now()
+        write_json(metadata_path, metadata)
+    return report
 
 
 def _jsonable_worker_value(value: Any) -> Any:
@@ -177,16 +408,20 @@ def enqueue_de_novo_binder_scoring_dataset(**kwargs: Any) -> Path:
             "input_pdb_dir": str(kwargs.get("input_pdb_dir")) if kwargs.get("input_pdb_dir") else None,
         },
         params_payload={
-            "queue_resource": "gpu",
             "queued_worker": "local",
             "mode": kwargs.get("mode", "pdb_only"),
             "models": list(kwargs.get("models") or []),
             "max_records": int(kwargs.get("max_records") or 0),
+            "gpu_device": normalize_gpu_device(kwargs.get("gpu_device", kwargs.get("alphafast_gpu_device", "0"))),
             "run_alphafast_af3": bool(kwargs.get("run_alphafast_af3")),
             "run_colabfold": bool(kwargs.get("run_colabfold")),
             "run_af2_initial_guess": bool(kwargs.get("run_af2_initial_guess")),
             "run_boltz2_initial_guess": bool(kwargs.get("run_boltz2_initial_guess")),
             "run_esmfold2": bool(kwargs.get("run_esmfold2")),
+            "num_loops": int(kwargs.get("num_loops") or 0),
+            "num_sampling_steps": int(kwargs.get("num_sampling_steps") or 0),
+            "esmfold2_modes": list(kwargs.get("esmfold2_modes") or []),
+            "esmfold2_use_target_msa": bool(kwargs.get("esmfold2_use_target_msa")),
             "run_rf3": bool(kwargs.get("run_rf3")),
             "run_protenix": bool(kwargs.get("run_protenix")),
             "run_boltzgen_fold": bool(kwargs.get("run_boltzgen_fold")),
@@ -207,6 +442,29 @@ def _safe_int(value: object) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _json_clean(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(key): _json_clean(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_clean(item) for item in value]
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        if pd.isna(value):
+            return None
+        return float(value)
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
 
 
 def _truthy_label(value: object) -> int | None:
@@ -282,55 +540,460 @@ def _relative_candidate_path(source_run_dir: Path, value: object) -> Path | None
     return path if path.exists() else None
 
 
+def _parse_structure_for_alignment(path: Path):
+    from Bio.PDB import MMCIFParser, PDBParser
+
+    if path.suffix.lower() in {".cif", ".mmcif"}:
+        return MMCIFParser(QUIET=True).get_structure(path.stem, str(path))
+    return PDBParser(QUIET=True).get_structure(path.stem, str(path))
+
+
+def _ca_atoms_for_alignment(structure: object, chains: list[str]) -> list[object]:
+    atoms: list[object] = []
+    wanted = {str(chain) for chain in chains}
+    for model in structure:
+        for chain in model:
+            if chain.id not in wanted:
+                continue
+            for residue in chain:
+                residue_id = residue.id
+                if residue_id[0] != " " or "CA" not in residue:
+                    continue
+                atoms.append(residue["CA"])
+        break
+    return atoms
+
+
+def _chain_ca_sequence_atoms_for_alignment(chain: object) -> tuple[str, list[object]]:
+    from Bio.SeqUtils import seq1
+
+    sequence = ""
+    atoms: list[object] = []
+    for residue in chain:
+        residue_id = residue.id
+        if residue_id[0] != " " or "CA" not in residue:
+            continue
+        try:
+            sequence += seq1(residue.resname)
+        except Exception:  # noqa: BLE001 - unknown residues still keep alignment positions.
+            sequence += "X"
+        atoms.append(residue["CA"])
+    return sequence, atoms
+
+
+def _sequence_aligned_ca_atoms_for_alignment(
+    fixed_structure: object,
+    moving_structure: object,
+    fixed_chains: list[str],
+    moving_chains: list[str],
+) -> tuple[list[object], list[object], str]:
+    from Bio.Align import PairwiseAligner
+
+    fixed_model = next(fixed_structure.get_models(), None)
+    moving_model = next(moving_structure.get_models(), None)
+    if fixed_model is None or moving_model is None:
+        return [], [], "missing model"
+
+    aligner = PairwiseAligner()
+    aligner.mode = "global"
+    aligner.match_score = 2.0
+    aligner.mismatch_score = -0.5
+    aligner.open_gap_score = -5.0
+    aligner.extend_gap_score = -0.5
+
+    fixed_atoms: list[object] = []
+    moving_atoms: list[object] = []
+    notes: list[str] = []
+    for fixed_chain_id, moving_chain_id in zip(fixed_chains, moving_chains):
+        if fixed_chain_id not in fixed_model or moving_chain_id not in moving_model:
+            notes.append(f"{moving_chain_id}->{fixed_chain_id}: missing chain")
+            continue
+        fixed_seq, fixed_chain_atoms = _chain_ca_sequence_atoms_for_alignment(fixed_model[fixed_chain_id])
+        moving_seq, moving_chain_atoms = _chain_ca_sequence_atoms_for_alignment(moving_model[moving_chain_id])
+        if not fixed_seq or not moving_seq:
+            notes.append(f"{moving_chain_id}->{fixed_chain_id}: no CA sequence")
+            continue
+        alignment = aligner.align(fixed_seq, moving_seq)[0]
+        before = len(fixed_atoms)
+        for fixed_block, moving_block in zip(alignment.aligned[0], alignment.aligned[1]):
+            fixed_start, fixed_end = int(fixed_block[0]), int(fixed_block[1])
+            moving_start, moving_end = int(moving_block[0]), int(moving_block[1])
+            count = min(fixed_end - fixed_start, moving_end - moving_start)
+            for offset in range(count):
+                fixed_atoms.append(fixed_chain_atoms[fixed_start + offset])
+                moving_atoms.append(moving_chain_atoms[moving_start + offset])
+        notes.append(f"{moving_chain_id}->{fixed_chain_id}: {len(fixed_atoms) - before} sequence-matched CA")
+    return fixed_atoms, moving_atoms, "; ".join(notes)
+
+
+def _align_target_override_to_candidate_frame(
+    *,
+    source_complex: Path,
+    source_target_chains: list[str],
+    target_pdb: Path,
+    target_chains: list[str],
+    output_path: Path,
+) -> tuple[Path, str]:
+    """Place a target override in the same coordinate frame as the candidate target."""
+
+    if not source_target_chains or not target_chains:
+        return target_pdb, "target override alignment skipped: missing source or override target chains"
+    try:
+        from Bio.PDB import PDBIO, Superimposer
+
+        fixed_structure = _parse_structure_for_alignment(source_complex)
+        moving_structure = _parse_structure_for_alignment(target_pdb)
+        fixed_atoms, moving_atoms, pairing_note = _sequence_aligned_ca_atoms_for_alignment(
+            fixed_structure,
+            moving_structure,
+            source_target_chains,
+            target_chains,
+        )
+        if not fixed_atoms or not moving_atoms:
+            fixed_atoms = _ca_atoms_for_alignment(fixed_structure, source_target_chains)
+            moving_atoms = _ca_atoms_for_alignment(moving_structure, target_chains)
+            pairing_note = "positional CA fallback"
+        common_count = min(len(fixed_atoms), len(moving_atoms))
+        if common_count < 3:
+            return (
+                target_pdb,
+                f"target override alignment skipped: only {common_count} common CA atoms",
+            )
+        superimposer = Superimposer()
+        superimposer.set_atoms(fixed_atoms[:common_count], moving_atoms[:common_count])
+        superimposer.apply(moving_structure.get_atoms())
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = PDBIO()
+        writer.set_structure(moving_structure)
+        writer.save(str(output_path))
+        return (
+            output_path,
+            (
+                f"target override aligned to candidate target on {common_count} CA atoms "
+                f"({pairing_note}); RMSD {superimposer.rms:.3f} A"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - keep staging usable and record why alignment was skipped.
+        return target_pdb, f"target override alignment skipped: {exc}"
+
+
+def _complex_chain_contact_summary(
+    path: Path,
+    binder_chains: list[str],
+    target_chains: list[str],
+    *,
+    cutoff: float = 8.0,
+) -> tuple[bool, float | None]:
+    from Bio.PDB import NeighborSearch
+
+    structure = _parse_structure_for_alignment(path)
+    model = next(structure.get_models(), None)
+    if model is None:
+        return False, None
+    binder_atoms = [
+        atom
+        for chain_id in binder_chains
+        if chain_id in model
+        for atom in model[chain_id].get_atoms()
+        if str(getattr(atom, "element", "")).upper() != "H"
+    ]
+    target_atoms = [
+        atom
+        for chain_id in target_chains
+        if chain_id in model
+        for atom in model[chain_id].get_atoms()
+        if str(getattr(atom, "element", "")).upper() != "H"
+    ]
+    if not binder_atoms or not target_atoms:
+        return False, None
+    neighbor_search = NeighborSearch(target_atoms)
+    for binder_atom in binder_atoms:
+        if neighbor_search.search(binder_atom.coord, cutoff, level="A"):
+            return True, 0.0
+    return False, None
+
+
 def _stage_candidate_set_as_repo_dataset(
     *,
     source_run_dir: Path,
     candidates_jsonl: Path,
     staged_dir: Path,
     max_candidates: int = 0,
+    selected_candidate_ids: list[str] | None = None,
+    target_override_pdb: Path | None = None,
+    target_override_chains: list[str] | None = None,
 ) -> tuple[Path, Path, dict[str, Any]]:
     source_run_dir = Path(source_run_dir).expanduser().resolve()
     candidates = read_candidates(Path(candidates_jsonl).expanduser())
+    selected_set = {str(candidate_id) for candidate_id in (selected_candidate_ids or []) if str(candidate_id).strip()}
+    if selected_set:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate.get("candidate_id") or "").strip() in selected_set
+        ]
     if max_candidates and int(max_candidates) > 0:
         candidates = candidates[: int(max_candidates)]
     if not candidates:
         raise ValueError("No candidates are available for refolding evaluation.")
 
     input_pdb_dir = staged_dir / "input_pdbs"
+    target_pdb_dir = staged_dir / "target_pdbs"
+    aligned_target_dir = staged_dir / "aligned_target_overrides"
+    job_run_dir = staged_dir.parents[2]
     input_pdb_dir.mkdir(parents=True, exist_ok=True)
+    target_pdb_dir.mkdir(parents=True, exist_ok=True)
     csv_path = staged_dir / "input.csv"
     rows: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for index, candidate in enumerate(candidates, start=1):
         candidate_id = str(candidate.get("candidate_id") or f"candidate_{index}").strip()
-        binder_id = _safe_id(candidate_id, fallback=f"candidate_{index}")
-        complex_pdb = _relative_candidate_path(source_run_dir, candidate.get("complex_pdb") or candidate.get("binder_pdb"))
-        if complex_pdb is None:
-            skipped.append({"candidate_id": candidate_id, "reason": "missing_complex_pdb"})
+        binder_id = re.sub(
+            r"[^a-z0-9_]",
+            "_",
+            _safe_id(candidate_id, fallback=f"candidate_{index}").lower(),
+        )
+        target_pdb = Path(target_override_pdb).expanduser().resolve() if target_override_pdb else refolding_workflow._target_pdb_for_candidate(source_run_dir, candidate)
+        if target_pdb is None or not target_pdb.exists():
+            skipped.append({"candidate_id": candidate_id, "reason": "missing_target_pdb"})
             continue
-        staged_pdb = input_pdb_dir / f"{binder_id}.pdb"
-        shutil.copy2(complex_pdb, staged_pdb)
-        target_chains = _split_list(candidate.get("target_chains"))
-        binder_chains = _split_list(candidate.get("binder_chains"))
+        binder_sequence = str(candidate.get("binder_sequence") or "").strip()
+        if not binder_sequence:
+            try:
+                binder_sequence = refolding_workflow._candidate_binder_sequence(source_run_dir, candidate)
+            except ValueError:
+                binder_sequence = ""
+        if not binder_sequence:
+            skipped.append({"candidate_id": candidate_id, "reason": "missing_binder_sequence"})
+            continue
+        source_complex = _relative_candidate_path(
+            source_run_dir,
+            candidate.get("complex_pdb") or candidate.get("binder_pdb"),
+        )
+        declared_binder_chains = _split_list(candidate.get("binder_chains"))
+        has_source_binder_structure = source_complex is not None and source_complex.exists() and bool(declared_binder_chains)
+        if has_source_binder_structure:
+            source_complex_sequences = refolding_workflow._sequences_by_chain(source_complex)
+            source_binder_sequence = "".join(
+                source_complex_sequences.get(chain, "")
+                for chain in declared_binder_chains
+            )
+            if source_binder_sequence != binder_sequence:
+                skipped.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "reason": "binder_structure_sequence_does_not_match_csv",
+                        "csv_length": len(binder_sequence),
+                        "structure_length": len(source_binder_sequence),
+                    }
+                )
+                continue
+
         metrics = dict(candidate.get("metrics") or {})
         raw_metadata = dict(candidate.get("raw_metadata") or {})
-        rows.append(
-            {
+        capacity_target_only = bool(raw_metadata.get("capacity_target_only"))
+        if capacity_target_only and source_complex is not None:
+            binder_lines, next_atom = refolding_workflow._renumber_structure_chain(
+                source_complex,
+                "A",
+                1,
+                set(declared_binder_chains),
+            )
+            if not binder_lines:
+                skipped.append({"candidate_id": candidate_id, "reason": "target_only_chain_staging_failed"})
+                continue
+            canonical_complex_pdb = input_pdb_dir / f"{binder_id}.pdb"
+            canonical_complex_pdb.write_text("\n".join(binder_lines + ["TER", "END", ""]))
+            refolding_workflow._write_engine_chain_map(
+                input_pdb_dir,
+                binder_id,
+                binder_source_chains=declared_binder_chains,
+                target_source_chains=[],
+                target_engine_chains=[],
+            )
+            row = {
                 "binder_id": binder_id,
                 "original_binder_id": candidate_id,
-                "target_id": str(raw_metadata.get("target_id") or metrics.get("target_id") or Path(str(candidate.get("target_pdb") or "target")).stem),
+                "target_id": str(raw_metadata.get("target_id") or metrics.get("target_id") or source_complex.stem),
+                "target_source": "capacity_target_only",
+                "capacity_target_only": True,
                 "binder": "",
                 "label": "",
                 "source": str(candidate.get("source_tool") or raw_metadata.get("import_name") or "candidate_set"),
-                "binder_chain": ",".join(binder_chains),
-                "target_chains": json.dumps(target_chains),
-                "complex_pdb": str(staged_pdb),
-                "target_pdb": str(_relative_candidate_path(source_run_dir, candidate.get("target_pdb")) or ""),
-                "binder_sequence": str(candidate.get("binder_sequence") or ""),
+                "binder_chain": "A",
+                "binder_chains": json.dumps(["A"]),
+                "target_chains": json.dumps([]),
+                "segment_ids": json.dumps([]),
+                "target_chain_range": json.dumps([]),
+                "msa_info": json.dumps(["A:run_msa"]),
+                "complex_pdb": str(canonical_complex_pdb),
+                "target_pdb": str(canonical_complex_pdb),
+                "source_target_pdb": str(target_pdb),
+                "source_input_run_dir": os.path.relpath(source_run_dir, job_run_dir),
+                "source_input_complex_pdb": os.path.relpath(source_complex, job_run_dir),
+                "source_input_binder_chains": json.dumps(declared_binder_chains),
+                "source_input_target_chains": json.dumps([]),
+                "refolding_target_source_chains": json.dumps([]),
+                "engine_target_chains": json.dumps([]),
+                "aligned_target_pdb": "",
+                "target_alignment": "capacity target-only monomer",
+                "target_alignment_reference_pdb": "",
+                "target_alignment_reference_chains": json.dumps([]),
+                "source_target_chains": json.dumps([]),
+                "binder_sequence": binder_sequence,
+                "A_seq": binder_sequence,
+                "A_length": len(binder_sequence),
             }
+            rows.append(row)
+            continue
+
+        candidate_target_chains = _split_list(candidate.get("target_chains"))
+        available_target_chains = refolding_workflow._structure_chains(target_pdb)
+        declared_target_chains = list(target_override_chains or []) or candidate_target_chains
+        source_target_chains = [
+            chain for chain in declared_target_chains if chain in available_target_chains
+        ] or available_target_chains
+        if not source_target_chains:
+            skipped.append({"candidate_id": candidate_id, "reason": "target_pdb_has_no_protein_chains"})
+            continue
+        target_staging_pdb = target_pdb
+        target_alignment_note = ""
+        if target_override_pdb and source_complex is not None and candidate_target_chains:
+            target_staging_pdb, target_alignment_note = _align_target_override_to_candidate_frame(
+                source_complex=source_complex,
+                source_target_chains=candidate_target_chains,
+                target_pdb=target_pdb,
+                target_chains=source_target_chains,
+                output_path=aligned_target_dir / f"{binder_id}.pdb",
+            )
+        elif target_override_pdb:
+            target_alignment_note = "target override used without input-complex alignment"
+
+        engine_target_chains = [
+            chr(ord("B") + chain_index)
+            for chain_index in range(len(source_target_chains))
+        ]
+        staged_target_pdb = target_pdb_dir / f"{binder_id}.pdb"
+        target_lines: list[str] = []
+        next_atom = 1
+        for source_chain, engine_chain in zip(source_target_chains, engine_target_chains):
+            chain_lines, next_atom = refolding_workflow._renumber_structure_chain(
+                target_staging_pdb,
+                engine_chain,
+                next_atom,
+                {source_chain},
+            )
+            if chain_lines:
+                target_lines.extend(chain_lines + ["TER"])
+        if not target_lines:
+            skipped.append({"candidate_id": candidate_id, "reason": "target_chain_staging_failed"})
+            continue
+        staged_target_pdb.write_text("\n".join(target_lines + ["END", ""]))
+
+        source_target_sequences = refolding_workflow._sequences_by_chain(target_staging_pdb)
+        target_sequences = {
+            engine_chain: source_target_sequences.get(source_chain, "")
+            for source_chain, engine_chain in zip(source_target_chains, engine_target_chains)
+        }
+        if any(not sequence for sequence in target_sequences.values()):
+            skipped.append({"candidate_id": candidate_id, "reason": "target_sequence_extraction_failed"})
+            staged_target_pdb.unlink(missing_ok=True)
+            continue
+
+        canonical_complex_pdb = input_pdb_dir / f"{binder_id}.pdb"
+        binder_lines: list[str] = []
+        if has_source_binder_structure and source_complex is not None:
+            binder_lines, next_atom = refolding_workflow._renumber_structure_chain(
+                source_complex,
+                "A",
+                1,
+                set(declared_binder_chains),
+            )
+            if not binder_lines:
+                skipped.append({"candidate_id": candidate_id, "reason": "binder_chain_staging_failed"})
+                staged_target_pdb.unlink(missing_ok=True)
+                continue
+        else:
+            next_atom = 1
+        canonical_target_lines: list[str] = []
+        for source_chain, engine_chain in zip(source_target_chains, engine_target_chains):
+            chain_lines, next_atom = refolding_workflow._renumber_structure_chain(
+                target_staging_pdb,
+                engine_chain,
+                next_atom,
+                {source_chain},
+            )
+            if chain_lines:
+                canonical_target_lines.extend(chain_lines + ["TER"])
+        canonical_lines = binder_lines + (["TER"] if binder_lines else []) + canonical_target_lines + ["END", ""]
+        canonical_complex_pdb.write_text("\n".join(canonical_lines))
+        has_target_contact, minimum_target_distance = (True, None)
+        if has_source_binder_structure:
+            has_target_contact, minimum_target_distance = _complex_chain_contact_summary(
+                canonical_complex_pdb,
+                ["A"],
+                engine_target_chains,
+            )
+        if target_override_pdb and has_source_binder_structure and not has_target_contact:
+            skipped.append(
+                {
+                    "candidate_id": candidate_id,
+                    "reason": "override_target_not_in_contact_with_input_binder_after_alignment",
+                    "minimum_atom_distance": minimum_target_distance,
+                    "target_alignment": target_alignment_note,
+                }
+            )
+            canonical_complex_pdb.unlink(missing_ok=True)
+            staged_target_pdb.unlink(missing_ok=True)
+            continue
+
+        refolding_workflow._write_engine_chain_map(
+            input_pdb_dir,
+            binder_id,
+            binder_source_chains=declared_binder_chains if has_source_binder_structure else ["sequence"],
+            target_source_chains=source_target_chains,
+            target_engine_chains=engine_target_chains,
         )
+        row = {
+            "binder_id": binder_id,
+            "original_binder_id": candidate_id,
+            "target_id": str(raw_metadata.get("target_id") or metrics.get("target_id") or target_pdb.stem),
+            "target_source": "override" if target_override_pdb else "candidate",
+            "binder": "",
+            "label": "",
+            "source": str(candidate.get("source_tool") or raw_metadata.get("import_name") or "candidate_set"),
+            "binder_chain": "A",
+            "binder_chains": json.dumps(["A"]),
+            "target_chains": json.dumps(engine_target_chains),
+            "segment_ids": json.dumps(engine_target_chains),
+            "target_chain_range": json.dumps(
+                [f"1:{len(target_sequences[chain])}" for chain in engine_target_chains]
+            ),
+            "msa_info": json.dumps(["A:no_msa"] + [f"{chain}:run_msa" for chain in engine_target_chains]),
+            "complex_pdb": str(canonical_complex_pdb),
+            "target_pdb": str(staged_target_pdb),
+            "source_target_pdb": str(target_pdb),
+            "source_input_run_dir": os.path.relpath(source_run_dir, job_run_dir),
+            "source_input_complex_pdb": os.path.relpath(source_complex, job_run_dir) if source_complex is not None else "",
+            "source_input_binder_chains": json.dumps(declared_binder_chains),
+            "source_input_target_chains": json.dumps(candidate_target_chains),
+            "refolding_target_source_chains": json.dumps(source_target_chains),
+            "engine_target_chains": json.dumps(engine_target_chains),
+            "aligned_target_pdb": str(target_staging_pdb) if target_staging_pdb != target_pdb else "",
+            "target_alignment": target_alignment_note,
+            "target_alignment_reference_pdb": str(source_complex) if target_override_pdb and source_complex is not None else "",
+            "target_alignment_reference_chains": json.dumps(candidate_target_chains) if target_override_pdb else "[]",
+            "source_target_chains": json.dumps(source_target_chains),
+            "binder_sequence": binder_sequence,
+            "A_seq": binder_sequence,
+            "A_length": len(binder_sequence),
+        }
+        for chain in engine_target_chains:
+            row[f"target_subchain_{chain}_seq"] = target_sequences[chain]
+            row[f"target_subchain_{chain}_len"] = len(target_sequences[chain])
+        rows.append(row)
     if not rows:
-        raise ValueError("None of the selected candidates had an existing complex PDB.")
+        raise ValueError("None of the selected candidates had a usable binder sequence and target PDB.")
     with csv_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
@@ -340,10 +1003,13 @@ def _stage_candidate_set_as_repo_dataset(
         {
             "source_run_dir": str(source_run_dir),
             "candidates_jsonl": str(candidates_jsonl),
+            "selected_candidate_ids": list(selected_set),
             "candidate_count": len(candidates),
             "staged_count": len(rows),
             "skipped_count": len(skipped),
             "skipped": skipped[:100],
+            "target_override_pdb": str(target_override_pdb) if target_override_pdb else None,
+            "target_override_chains": list(target_override_chains or []),
         },
     )
     return csv_path, input_pdb_dir, {"candidate_count": len(candidates), "staged_count": len(rows), "skipped_count": len(skipped)}
@@ -354,6 +1020,7 @@ def enqueue_candidate_refolding_evaluation(
     source_run_dir: Path,
     candidates_jsonl: Path,
     max_candidates: int = 0,
+    selected_candidate_ids: list[str] | None = None,
     evaluation_name: str = "Refolding evaluation",
     **kwargs: Any,
 ) -> Path:
@@ -363,29 +1030,42 @@ def enqueue_candidate_refolding_evaluation(
         "queued_worker_request": True,
         "source_run_dir": str(source_run_dir),
         "candidates_jsonl": str(candidates_jsonl),
+        "selected_candidate_ids": list(selected_candidate_ids or []),
+        "target_override_pdb": str(kwargs.get("target_override_pdb")) if kwargs.get("target_override_pdb") else None,
+        "target_override_chains": list(kwargs.get("target_override_chains") or []),
     }
     params_payload = {
-        "queue_resource": "gpu",
         "queued_worker": "local",
         "evaluation_name": evaluation_name,
         "evaluation_mode": "refolding_validation",
         "max_candidates": int(max_candidates or 0),
+        "selected_candidate_count": len(selected_candidate_ids or []),
+        "gpu_device": normalize_gpu_device(kwargs.get("gpu_device", kwargs.get("alphafast_gpu_device", "0"))),
+        "target_override_pdb": str(kwargs.get("target_override_pdb")) if kwargs.get("target_override_pdb") else None,
+        "target_override_chains": list(kwargs.get("target_override_chains") or []),
         "models": list(kwargs.get("models") or []),
         "run_alphafast_af3": bool(kwargs.get("run_alphafast_af3")),
         "run_colabfold": bool(kwargs.get("run_colabfold")),
         "run_af2_initial_guess": bool(kwargs.get("run_af2_initial_guess")),
+        "af2_use_initial_guess": bool(kwargs.get("af2_use_initial_guess")),
         "run_boltz2_initial_guess": bool(kwargs.get("run_boltz2_initial_guess")),
         "run_esmfold2": bool(kwargs.get("run_esmfold2")),
+        "num_loops": int(kwargs.get("num_loops") or 0),
+        "num_sampling_steps": int(kwargs.get("num_sampling_steps") or 0),
+        "esmfold2_modes": list(kwargs.get("esmfold2_modes") or []),
+        "esmfold2_use_target_msa": bool(kwargs.get("esmfold2_use_target_msa")),
         "run_rf3": bool(kwargs.get("run_rf3")),
         "run_protenix": bool(kwargs.get("run_protenix")),
         "run_boltzgen_fold": bool(kwargs.get("run_boltzgen_fold")),
+        "require_real_target_msa": bool(kwargs.get("require_real_target_msa", True)),
     }
     worker_kwargs = {
         **kwargs,
         "source_run_dir": Path(source_run_dir),
         "candidates_jsonl": Path(candidates_jsonl),
         "max_records": int(max_candidates or 0),
-        "mode": "pdb_only",
+        "selected_candidate_ids": list(selected_candidate_ids or []),
+        "mode": "seq_only_csv",
         "generate_inputs": True,
         "job_type": "refolding_evaluation",
         "tool_name": "refolding_evaluation_engines",
@@ -501,6 +1181,9 @@ def _prepare_benchmark_records(
                 "binder_pdb": str(binder_pdb) if binder_pdb else None,
                 "binder_chains": _split_list(_row_value(row, "binder_chains", "binder_chain")) or ["A"],
                 "target_chains": _split_list(_row_value(row, "target_chains", "target_chain")) or [],
+                "target_source": str(_row_value(row, "target_source") or ""),
+                "capacity_target_only": str(_row_value(row, "capacity_target_only") or "").strip().lower()
+                in {"1", "true", "yes", "y"},
                 "msa_paths": msa_paths,
                 "hotspots": _split_list(_row_value(row, "hotspots", "target_hotspots")),
                 "raw_input": row,
@@ -584,18 +1267,62 @@ def _benchmark_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def _metric_column_summary(df: pd.DataFrame, label_col: str, max_columns: int = 250) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if label_col not in df.columns:
         raise ValueError(f"Label column not found: {label_col}")
-    labels_raw = [_truthy_label(value) for value in df[label_col].tolist()]
+    label_values = df.loc[:, label_col]
+    if isinstance(label_values, pd.DataFrame):
+        label_values = label_values.iloc[:, 0]
+    if not isinstance(label_values, pd.Series):
+        label_values = pd.Series([label_values] * len(df), index=df.index)
+    labels_raw = [_truthy_label(value) for value in label_values.tolist()]
+    positive_count = sum(1 for label in labels_raw if label == 1)
+    negative_count = sum(1 for label in labels_raw if label == 0)
+    if positive_count == 0 or negative_count == 0:
+        return [], {
+            "record_count": int(len(df)),
+            "labeled_count": int(positive_count + negative_count),
+            "positive_count": int(positive_count),
+            "negative_count": int(negative_count),
+            "numeric_feature_count": 0,
+            "scored_feature_count": 0,
+            "top_feature": None,
+            "top_feature_average_precision": None,
+            "top_feature_auroc": None,
+        }
+
+    def _numeric_column_values(frame: pd.DataFrame, column: object) -> pd.Series:
+        extracted = frame.loc[:, column]
+        if isinstance(extracted, pd.DataFrame):
+            extracted = extracted.iloc[:, 0]
+        if not isinstance(extracted, pd.Series):
+            extracted = pd.Series([extracted] * len(frame), index=frame.index)
+        return pd.to_numeric(extracted, errors="coerce")
+
+    def _is_label_leakage_column(column: object) -> bool:
+        text = str(column)
+        if text in {"label", "binder", "is_binder", "binds"}:
+            return True
+        for prefixes in BENCHMARK_ENGINE_PREFIXES.values():
+            for prefix in prefixes:
+                if not text.startswith(prefix):
+                    continue
+                remainder = text[len(prefix) :]
+                if remainder == "binder":
+                    return True
+                parts = [part for part in remainder.split("_") if part]
+                if len(parts) == 2 and parts[1] == "binder":
+                    return True
+        return False
+
     numeric_cols: list[str] = []
     label_like_cols = {label_col, "label", "binder", "is_binder", "binds"}
     for column in df.columns:
-        if str(column) in label_like_cols:
+        if str(column) in label_like_cols or _is_label_leakage_column(column):
             continue
-        values = pd.to_numeric(df[column], errors="coerce")
+        values = _numeric_column_values(df, column)
         if values.notna().sum() >= 2:
-            numeric_cols.append(column)
+            numeric_cols.append(str(column))
     rows: list[dict[str, Any]] = []
     for column in numeric_cols[:max_columns]:
-        values = pd.to_numeric(df[column], errors="coerce")
+        values = _numeric_column_values(df, column)
         valid_labels: list[int] = []
         valid_scores: list[float] = []
         for label, score in zip(labels_raw, values.tolist()):
@@ -704,6 +1431,123 @@ def _benchmark_engine_for_column(column: str) -> str | None:
     return None
 
 
+ESMFOLD2_COLLECTION_VARIANTS: dict[tuple[int, int], str] = {
+    (3, 50): "fast",
+    (10, 68): "standard",
+    (20, 68): "careful",
+    (10, 200): "high_diffusion",
+    (3, 200): "design_rank",
+}
+
+
+def _collection_variant_token(text: object) -> str:
+    token = re.sub(r"[^A-Za-z0-9]+", "_", str(text or "").strip().lower()).strip("_")
+    return token or "variant"
+
+
+def _source_esmfold2_variant_token(source_run_dir: Path, metadata: dict[str, Any], order: int) -> str:
+    input_payload = read_json(source_run_dir / "input.json")
+    params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+    worker_payload = read_json(source_run_dir / "worker_request.json")
+    worker_kwargs = worker_payload.get("kwargs") if isinstance(worker_payload.get("kwargs"), dict) else {}
+    loops = _safe_int(params.get("num_loops", worker_kwargs.get("num_loops")))
+    steps = _safe_int(params.get("num_sampling_steps", worker_kwargs.get("num_sampling_steps")))
+    if loops is not None and steps is not None:
+        return ESMFOLD2_COLLECTION_VARIANTS.get((loops, steps), f"custom_{loops}_{steps}")
+    job_code = str(metadata.get("job_code") or "").strip()
+    return _collection_variant_token(job_code or f"run_{order}")
+
+
+def _source_engine_variant_token(source: dict[str, Any], engine: str) -> str:
+    metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+    order = int(source.get("order") or 0)
+    if engine == "ESMFold2":
+        return _source_esmfold2_variant_token(Path(str(source.get("source_run_dir") or "")), metadata, order)
+    source_run_dir = Path(str(source.get("source_run_dir") or ""))
+    input_payload = read_json(source_run_dir / "input.json")
+    params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+    worker_payload = read_json(source_run_dir / "worker_request.json")
+    worker_kwargs = worker_payload.get("kwargs") if isinstance(worker_payload.get("kwargs"), dict) else {}
+
+    def get_value(*names: str, default: object = "") -> object:
+        for name in names:
+            if name in params and params.get(name) not in (None, ""):
+                return params.get(name)
+            if name in worker_kwargs and worker_kwargs.get(name) not in (None, ""):
+                return worker_kwargs.get(name)
+        return default
+
+    setting_parts: list[str] = []
+    if engine == "AF2-IG":
+        setting_parts = [
+            f"recycles={get_value('af2_num_recycles')}",
+            f"multimer={bool(get_value('af2_multimer', default=True))}",
+            f"complex_ig={bool(get_value('af2_use_initial_guess', default=False))}",
+            f"binder_template={bool(get_value('af2_use_binder_template', default=False))}",
+            f"interface_template={bool(get_value('af2_use_interface_template', default=False))}",
+        ]
+    elif engine == "Boltz-2":
+        setting_parts = [
+            f"target_template={bool(get_value('boltz2_use_target_template', default=True))}",
+            f"target_msa={bool(get_value('boltz2_use_target_msa', default=True))}",
+            f"recycles={get_value('boltz2_recycling_steps')}",
+            f"sampling={get_value('boltz2_sampling_steps')}",
+            f"samples={get_value('boltz2_diffusion_samples')}",
+        ]
+    elif engine == "BoltzGen Fold":
+        setting_parts = [
+            f"recycles={get_value('boltzgen_recycling_steps')}",
+            f"sampling={get_value('boltzgen_sampling_steps')}",
+            f"samples={get_value('boltzgen_diffusion_samples')}",
+        ]
+    elif engine == "ColabFold":
+        setting_parts = [
+            f"msa={get_value('colabfold_msa_source')}",
+            f"recycles={get_value('colabfold_num_recycles')}",
+            f"models={get_value('colabfold_num_models')}",
+            f"templates={bool(get_value('colabfold_use_target_templates', default=False))}",
+        ]
+    elif engine == "AF3":
+        setting_parts = [
+            f"recycles={get_value('alphafast_num_recycles')}",
+            f"batch={get_value('alphafast_batch_size')}",
+        ]
+    elif engine == "RF3":
+        checkpoint = Path(str(get_value("rf3_checkpoint_path"))).name
+        setting_parts = [
+            f"target_msa={bool(get_value('rf3_use_target_msa', default=True))}",
+            f"recycles={get_value('rf3_recycles')}",
+            f"steps={get_value('rf3_num_steps')}",
+            f"batch={get_value('rf3_diffusion_batch_size')}",
+            f"checkpoint={checkpoint}",
+        ]
+    elif engine == "Protenix":
+        setting_parts = [
+            f"msa={bool(get_value('protenix_use_msa', default=True))}",
+            f"cycles={get_value('protenix_cycle')}",
+            f"steps={get_value('protenix_diffusion_steps')}",
+            f"samples={get_value('protenix_samples')}",
+        ]
+    token = _collection_variant_token(";".join(str(part) for part in setting_parts if str(part)))
+    return token or "settings"
+
+
+def _rename_collection_variant_columns(
+    columns: list[str],
+    *,
+    engine: str,
+    variant_token: str,
+) -> dict[str, str]:
+    prefixes = BENCHMARK_ENGINE_PREFIXES.get(engine, ())
+    renamed: dict[str, str] = {}
+    for column in columns:
+        for prefix in prefixes:
+            if column.startswith(prefix):
+                renamed[column] = f"{prefix}{variant_token}_{column[len(prefix):]}"
+                break
+    return renamed
+
+
 def benchmark_engines_in_metrics(metrics_csv: Path) -> list[str]:
     if not metrics_csv.exists():
         return []
@@ -722,6 +1566,444 @@ def benchmark_engines_in_metrics(metrics_csv: Path) -> list[str]:
 def _benchmark_run_metrics_path(run_id: str) -> Path | None:
     path = runs_root() / BENCHMARK_GROUP / str(run_id) / "artifacts" / "benchmark" / "merged_benchmark_metrics.csv"
     return path if path.exists() else None
+
+
+def _benchmark_sidecar_metric_paths(benchmark_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    for path in sorted(benchmark_dir.glob("*metrics.csv")):
+        if path.name == "merged_benchmark_metrics.csv":
+            continue
+        if path.name.endswith("_feature_ranking.csv"):
+            continue
+        paths.append(path)
+    return paths
+
+
+def _merge_metrics_sidecar(base: pd.DataFrame, sidecar: pd.DataFrame) -> pd.DataFrame:
+    if base.empty or sidecar.empty or "binder_id" not in base.columns or "binder_id" not in sidecar.columns:
+        return base
+    keys = ["binder_id"]
+    if "target_id" in base.columns and "target_id" in sidecar.columns:
+        keys = ["target_id", "binder_id"]
+    base = base.copy()
+    sidecar = sidecar.copy()
+    for key in keys:
+        base[key] = base[key].astype(str)
+        sidecar[key] = sidecar[key].astype(str)
+    sidecar = sidecar[
+        sidecar["binder_id"].notna()
+        & ~sidecar["binder_id"].isin({"", "nan", "None"})
+    ].copy()
+    if sidecar.empty:
+        return base
+    sidecar = sidecar.drop_duplicates(keys).copy()
+    value_columns = [col for col in sidecar.columns if col not in keys]
+    if not value_columns:
+        return base
+    duplicate_columns = [col for col in value_columns if col in base.columns]
+    if duplicate_columns:
+        sidecar = sidecar.rename(columns={col: f"{col}__sidecar" for col in duplicate_columns})
+    merged = base.merge(sidecar, on=keys, how="left")
+    for column in duplicate_columns:
+        sidecar_column = f"{column}__sidecar"
+        if sidecar_column not in merged.columns:
+            continue
+        merged[column] = merged[column].combine_first(merged[sidecar_column])
+        merged = merged.drop(columns=[sidecar_column])
+    return merged
+
+
+def _read_benchmark_metrics_with_sidecars(metrics_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(metrics_path)
+    benchmark_dir = metrics_path.parent
+    for sidecar_path in _benchmark_sidecar_metric_paths(benchmark_dir):
+        try:
+            sidecar = pd.read_csv(sidecar_path)
+        except Exception:
+            continue
+        df = _merge_metrics_sidecar(df, sidecar)
+    return df
+
+
+def _engine_metric_prefix(engine: str) -> str | None:
+    artifact_info = BENCHMARK_ENGINE_ARTIFACTS.get(str(engine))
+    return artifact_info[2] if artifact_info else None
+
+
+def benchmark_missing_pyrosetta_rows(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Report selected benchmark matrix cells missing predicted PyRosetta metrics."""
+
+    grouped: dict[str, dict[str, set[str]]] = {}
+    for cell in _json_clean(cells):
+        run_id = str(cell.get("run_id") or "").strip()
+        engine = str(cell.get("engine") or "").strip()
+        target = str(cell.get("target_id") or "").strip()
+        if not run_id or not engine:
+            continue
+        grouped.setdefault(run_id, {}).setdefault(engine, set())
+        if target:
+            grouped[run_id][engine].add(target)
+
+    rows: list[dict[str, Any]] = []
+    for run_id, engine_targets in sorted(grouped.items()):
+        metrics_path = _benchmark_run_metrics_path(run_id)
+        if metrics_path is None:
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "engine": "",
+                    "status": "missing_source_metrics",
+                    "records": 0,
+                    "existing_rosetta_records": 0,
+                    "missing_rosetta_records": 0,
+                    "targets_missing": "",
+                }
+            )
+            continue
+        source_run_dir = metrics_path.parents[2]
+        metadata = read_json(source_run_dir / "metadata.json")
+        try:
+            df = _read_benchmark_metrics_with_sidecars(metrics_path)
+        except Exception as exc:
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "job_code": str(metadata.get("job_code") or ""),
+                    "engine": "",
+                    "status": f"read_error:{exc}",
+                    "records": 0,
+                    "existing_rosetta_records": 0,
+                    "missing_rosetta_records": 0,
+                    "targets_missing": "",
+                }
+            )
+            continue
+        for engine, targets in sorted(engine_targets.items()):
+            prefix = _engine_metric_prefix(engine)
+            if not prefix:
+                continue
+            subset = df
+            if targets and "target_id" in df.columns:
+                subset = df[df["target_id"].astype(str).isin(targets)].copy()
+            records = int(len(subset))
+            rosetta_col = f"{prefix}_rosetta_interface_dG"
+            existing = int(subset[rosetta_col].notna().sum()) if rosetta_col in subset.columns else 0
+            missing = max(0, records - existing)
+            target_missing = ""
+            if missing and "target_id" in subset.columns:
+                missing_df = subset
+                if rosetta_col in missing_df.columns:
+                    missing_df = missing_df[missing_df[rosetta_col].isna()]
+                target_missing = ", ".join(sorted(missing_df["target_id"].dropna().astype(str).unique().tolist()))
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "job_code": str(metadata.get("job_code") or ""),
+                    "engine": engine,
+                    "metric_column": rosetta_col,
+                    "targets": ", ".join(sorted(targets)),
+                    "records": records,
+                    "existing_rosetta_records": existing,
+                    "missing_rosetta_records": missing,
+                    "targets_missing": target_missing,
+                    "status": "missing" if missing else "complete",
+                }
+            )
+    return rows
+
+
+def _combine_metric_tables_by_binder(existing_path: Path, update_path: Path) -> int:
+    if not update_path.exists():
+        return 0
+    update_df = pd.read_csv(update_path)
+    if update_df.empty or "binder_id" not in update_df.columns:
+        return 0
+    keys = ["binder_id"]
+    if existing_path.exists():
+        existing_df = pd.read_csv(existing_path)
+        if "binder_id" not in existing_df.columns:
+            existing_df = pd.DataFrame(columns=keys)
+        merged = existing_df.copy()
+    else:
+        merged = pd.DataFrame(columns=keys)
+    for key in keys:
+        if key not in merged.columns:
+            merged[key] = pd.Series(dtype=object)
+    merged = merged.drop_duplicates(keys).set_index(keys, drop=False)
+    update_df = update_df.drop_duplicates(keys).set_index(keys, drop=False)
+    for column in update_df.columns:
+        if column in keys:
+            continue
+        if column not in merged.columns:
+            merged[column] = np.nan
+        merged[column] = update_df[column].combine_first(merged[column])
+    missing_keys = update_df.index.difference(merged.index)
+    if len(missing_keys):
+        merged = pd.concat([merged, update_df.loc[missing_keys]], axis=0, sort=False)
+    out_df = merged.reset_index(drop=True)
+    existing_path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(existing_path, index=False)
+    return int(len(update_df))
+
+
+def _stage_predicted_metric_pdbs_for_engines(
+    *,
+    source_run_dir: Path,
+    engines: list[str],
+) -> tuple[list[tuple[str, Path]], dict[str, int]]:
+    run_csv = source_run_dir / "artifacts" / "raw" / "de_novo_binder_scoring" / "output" / "run.csv"
+    output_dir = source_run_dir / "artifacts" / "raw" / "de_novo_binder_scoring" / "output"
+    benchmark_dir = source_run_dir / "artifacts" / "benchmark"
+    group_roles = _benchmark_group_roles(run_csv)
+    predicted_pdb_dirs: list[tuple[str, Path]] = []
+    counts: dict[str, int] = {}
+    engine_set = {str(engine) for engine in engines}
+
+    def existing_metric_dir(metric_prefix: str) -> tuple[Path | None, int]:
+        folder = benchmark_dir / "predicted_metric_pdbs" / metric_prefix
+        if not folder.exists():
+            return None, 0
+        count = len(list(folder.glob("*.pdb")))
+        return (folder, count) if count else (None, 0)
+
+    if "AF3" in engine_set:
+        pdb_dir, count = _stage_alphafast_pdbs(
+            output_dir / "AF3" / "alphafast_output",
+            benchmark_dir / "predicted_metric_pdbs" / "af3",
+            group_roles,
+        )
+        if pdb_dir is None:
+            pdb_dir, count = existing_metric_dir("af3")
+        if pdb_dir is not None:
+            predicted_pdb_dirs.append(("af3", pdb_dir))
+            counts["AF3"] = count
+    if "ColabFold" in engine_set:
+        pdb_dir, count = _stage_colabfold_pdbs(
+            output_dir,
+            benchmark_dir / "predicted_metric_pdbs" / "colab",
+            group_roles,
+        )
+        if pdb_dir is None:
+            pdb_dir, count = existing_metric_dir("colab")
+        if pdb_dir is not None:
+            predicted_pdb_dirs.append(("colab", pdb_dir))
+            counts["ColabFold"] = count
+
+    child_engine_map = {
+        "AF2-IG": ("af2_initial_guess", "af2"),
+        "Boltz-2": ("boltz2", "boltz2"),
+        "BoltzGen Fold": ("boltzgen_fold", "boltzgen_fold"),
+        "ESMFold2": ("esmfold2", "esmfold2"),
+        "Protenix": ("protenix", "protenix"),
+        "RF3": ("rf3", "rf3"),
+    }
+    for engine, (child_key, metric_prefix) in child_engine_map.items():
+        if engine not in engine_set:
+            continue
+        child_runs = _completed_benchmark_child_runs(source_run_dir, child_key)
+        pdb_dir, count = _stage_child_candidate_pdbs(
+            child_runs,
+            benchmark_dir / "predicted_metric_pdbs" / metric_prefix,
+            source_label=metric_prefix,
+        )
+        if pdb_dir is None:
+            engine_dir = source_run_dir / "artifacts" / "engines" / child_key
+            pdb_dir, count = _stage_engine_artifact_candidate_pdbs(
+                source_run_dir,
+                engine_dir,
+                benchmark_dir / "predicted_metric_pdbs" / metric_prefix,
+                source_label=metric_prefix,
+            )
+        if pdb_dir is None:
+            pdb_dir, count = existing_metric_dir(metric_prefix)
+        if pdb_dir is not None:
+            predicted_pdb_dirs.append((metric_prefix, pdb_dir))
+            counts[engine] = count
+    return predicted_pdb_dirs, counts
+
+
+def _refresh_merged_benchmark_metrics(source_run_dir: Path) -> tuple[Path | None, Path | None]:
+    run_csv = source_run_dir / "artifacts" / "raw" / "de_novo_binder_scoring" / "output" / "run.csv"
+    benchmark_dir = source_run_dir / "artifacts" / "benchmark"
+    merged_path = benchmark_dir / "merged_benchmark_metrics.csv"
+    if not run_csv.exists() or not merged_path.exists():
+        return None, None
+    df = _read_benchmark_metrics_with_sidecars(merged_path)
+    df.to_csv(merged_path, index=False)
+    label_col = "binder" if "binder" in df.columns else "label" if "label" in df.columns else ""
+    ranking_path: Path | None = None
+    if label_col:
+        feature_rows, summary = _metric_column_summary(df, label_col, max_columns=2000)
+        summary_path = benchmark_dir / "merged_benchmark_feature_summary.json"
+        ranking_path = benchmark_dir / "merged_benchmark_feature_ranking.csv"
+        write_json(summary_path, summary)
+        _write_feature_ranking(ranking_path, feature_rows)
+    return merged_path, ranking_path
+
+
+def enqueue_missing_pyrosetta_benchmark_metrics(
+    *,
+    missing_rows: list[dict[str, Any]],
+    pyrosetta_nprocs: int = 32,
+) -> Path:
+    clean_rows = [
+        row
+        for row in _json_clean(missing_rows)
+        if int(row.get("missing_rosetta_records") or 0) > 0 and str(row.get("run_id") or "").strip()
+    ]
+    if not clean_rows:
+        raise ValueError("No selected benchmark cells are missing PyRosetta metrics.")
+    engines_by_run: dict[str, set[str]] = {}
+    for row in clean_rows:
+        engines_by_run.setdefault(str(row["run_id"]), set()).add(str(row.get("engine") or ""))
+    grouped = {
+        run_id: sorted(engine for engine in engines if engine)
+        for run_id, engines in sorted(engines_by_run.items())
+    }
+    job = create_job(
+        BENCHMARK_GROUP,
+        "benchmark_pyrosetta_backfill",
+        "benchmark_pyrosetta_backfill",
+        {
+            "source_runs": sorted(grouped),
+        },
+        {
+            "source_runs": sorted(grouped),
+            "engines_by_run": grouped,
+            "pyrosetta_nprocs": max(1, int(pyrosetta_nprocs)),
+            "missing_cells": clean_rows,
+        },
+    )
+    write_json(
+        job.run_dir / "worker_request.json",
+        {
+            "kind": "benchmark_pyrosetta_backfill",
+            "kwargs": {
+                "engines_by_run": grouped,
+                "pyrosetta_nprocs": max(1, int(pyrosetta_nprocs)),
+            },
+            "path_kwargs": [],
+        },
+    )
+    write_json(
+        job.run_dir / "command.json",
+        {
+            "mode": "local_worker",
+            "command": ["python", "-m", "mn_protein_design.core.local_worker", "--run-dir", str(job.run_dir)],
+        },
+    )
+    return job.run_dir
+
+
+def run_missing_pyrosetta_benchmark_metrics(
+    run_dir: Path,
+    *,
+    engines_by_run: dict[str, list[str]],
+    pyrosetta_nprocs: int = 32,
+) -> Path:
+    run_dir = Path(run_dir).expanduser().resolve()
+    update_status(run_dir, "running", current_phase="Recalculating missing PyRosetta metrics")
+    commands: list[list[str]] = []
+    source_summaries: list[dict[str, Any]] = []
+    total_scored = 0
+    job_artifacts = run_dir / "artifacts" / "benchmark"
+    job_artifacts.mkdir(parents=True, exist_ok=True)
+
+    for run_id, engines in sorted((engines_by_run or {}).items()):
+        source_run_dir = runs_root() / BENCHMARK_GROUP / str(run_id)
+        run_csv = source_run_dir / "artifacts" / "raw" / "de_novo_binder_scoring" / "output" / "run.csv"
+        benchmark_dir = source_run_dir / "artifacts" / "benchmark"
+        if not run_csv.exists():
+            source_summaries.append({"run_id": run_id, "status": "missing_run_csv", "engines": ", ".join(engines or [])})
+            continue
+        predicted_pdb_dirs, staged_counts = _stage_predicted_metric_pdbs_for_engines(
+            source_run_dir=source_run_dir,
+            engines=list(engines or []),
+        )
+        if not predicted_pdb_dirs:
+            source_summaries.append(
+                {
+                    "run_id": run_id,
+                    "status": "no_predicted_pdbs",
+                    "engines": ", ".join(engines or []),
+                    "staged_counts": staged_counts,
+                }
+            )
+            continue
+        update_csv = benchmark_dir / f"predicted_rosetta_metrics_backfill_{run_dir.name}.csv"
+        rosetta_cmd = [
+            "docker",
+            "run",
+            "--rm",
+            *_repo_and_runs_mounts(),
+            "-w",
+            str(DE_NOVO_BINDER_SCORING_DIR),
+            PYROSETTA_METRICS_IMAGE,
+            "python",
+            "./scripts/compute_rosetta_metrics.py",
+            "--run-csv",
+            str(run_csv),
+            "--out-csv",
+            str(update_csv),
+            "--nprocs",
+            str(max(1, int(pyrosetta_nprocs))),
+            "--dalphaball-path",
+            "./functions/DAlphaBall.gcc",
+        ]
+        for prefix, folder in predicted_pdb_dirs:
+            rosetta_cmd.extend(["--folder", f"{prefix}:{folder}"])
+        commands.append(rosetta_cmd)
+        update_status(
+            run_dir,
+            "running",
+            current_phase="Recalculating missing PyRosetta metrics",
+            current_engine=", ".join(engines or []),
+        )
+        rc = _run_docker_command(run_dir, rosetta_cmd)
+        canonical_rosetta = benchmark_dir / "predicted_rosetta_metrics.csv"
+        rows_scored = 0
+        if rc == 0 and update_csv.exists():
+            rows_scored = _combine_metric_tables_by_binder(canonical_rosetta, update_csv)
+            total_scored += rows_scored
+            merged_path, ranking_path = _refresh_merged_benchmark_metrics(source_run_dir)
+        else:
+            merged_path, ranking_path = None, None
+        source_summaries.append(
+            {
+                "run_id": run_id,
+                "engines": ", ".join(engines or []),
+                "return_code": rc,
+                "staged_counts": staged_counts,
+                "rows_scored": rows_scored,
+                "rosetta_metrics": str(canonical_rosetta) if canonical_rosetta.exists() else "",
+                "merged_metrics": str(merged_path) if merged_path else "",
+                "ranking": str(ranking_path) if ranking_path else "",
+                "status": "completed" if rc == 0 and rows_scored else "failed",
+            }
+        )
+
+    source_summary_path = job_artifacts / "pyrosetta_backfill_sources.csv"
+    pd.DataFrame(source_summaries).to_csv(source_summary_path, index=False)
+    write_json(run_dir / "command.json", {"mode": "docker", "commands": commands})
+    success = bool(source_summaries) and all(str(row.get("status")) == "completed" for row in source_summaries)
+    finish_job(
+        run_dir,
+        success,
+        {
+            "outputs": {
+                "pyrosetta_backfill_sources": str(source_summary_path.relative_to(run_dir)),
+            },
+            "metrics": {
+                "source_run_count": len(source_summaries),
+                "rows_scored": total_scored,
+                "pyrosetta_nprocs": max(1, int(pyrosetta_nprocs)),
+            },
+        },
+    )
+    if not success:
+        failed = [row for row in source_summaries if str(row.get("status")) != "completed"]
+        raise RuntimeError(f"PyRosetta backfill failed for {len(failed)} source run(s).")
+    return run_dir
 
 
 def _replace_path_with_link_or_copy(source_path: Path, target_path: Path) -> None:
@@ -768,6 +2050,12 @@ def _stage_collection_engine_artifacts(
                 source_metric_pdbs,
                 benchmark_dir / "predicted_metric_pdbs" / metric_pdb_key,
             )
+        source_viewer_structures = source_benchmark / "predicted_viewer_structures" / metric_pdb_key
+        if source_viewer_structures.exists():
+            _replace_path_with_link_or_copy(
+                source_viewer_structures,
+                benchmark_dir / "predicted_viewer_structures" / metric_pdb_key,
+            )
 
 
 def _stage_collection_reference_artifacts(source_run_dir: Path, collection_run_dir: Path) -> None:
@@ -788,6 +2076,8 @@ def create_benchmark_collection(
     include_input_columns: bool = True,
 ) -> Path:
     clean_name = str(name or "Benchmark collection").strip() or "Benchmark collection"
+    selections = _json_clean(selections)
+    include_input_columns = bool(_json_clean(include_input_columns))
     selected_targets = {str(target) for target in (target_ids or []) if str(target).strip()}
     job = create_job(
         BENCHMARK_GROUP,
@@ -817,6 +2107,11 @@ def create_benchmark_collection(
     for order, selection in enumerate(selections, start=1):
         run_id = str(selection.get("run_id") or "").strip()
         engines = [str(engine) for engine in (selection.get("engines") or []) if str(engine).strip()]
+        raw_engine_targets = selection.get("engine_targets") if isinstance(selection.get("engine_targets"), dict) else {}
+        engine_targets = {
+            str(engine): {str(target) for target in (targets or []) if str(target).strip()}
+            for engine, targets in raw_engine_targets.items()
+        }
         metrics_path = _benchmark_run_metrics_path(run_id)
         if metrics_path is None:
             source_rows.append({"order": order, "run_id": run_id, "status": "missing_metrics", "engines": ",".join(engines)})
@@ -825,12 +2120,17 @@ def create_benchmark_collection(
         metadata = read_json(source_run_dir / "metadata.json")
         result = read_json(source_run_dir / "result.json")
         try:
-            df = pd.read_csv(metrics_path)
+            raw_df = pd.read_csv(metrics_path)
+            df = _read_benchmark_metrics_with_sidecars(metrics_path)
         except Exception as exc:
             source_rows.append({"order": order, "run_id": run_id, "status": f"read_error:{exc}", "engines": ",".join(engines)})
             continue
-        if selected_targets and "target_id" in df.columns:
-            df = df[df["target_id"].astype(str).isin(selected_targets)].copy()
+        hydrated_column_count = max(0, len(df.columns) - len(raw_df.columns))
+        source_targets = set(selected_targets)
+        for targets in engine_targets.values():
+            source_targets.update(targets)
+        if source_targets and "target_id" in df.columns:
+            df = df[df["target_id"].astype(str).isin(source_targets)].copy()
         if df.empty:
             source_rows.append({"order": order, "run_id": run_id, "status": "empty_after_target_filter", "engines": ",".join(engines)})
             continue
@@ -844,7 +2144,10 @@ def create_benchmark_collection(
                 "metadata": metadata,
                 "result": result,
                 "df": df,
+                "raw_column_count": int(len(raw_df.columns)),
+                "hydrated_column_count": int(hydrated_column_count),
                 "keys": _collection_merge_keys(df),
+                "engine_targets": engine_targets,
             }
         )
 
@@ -852,11 +2155,49 @@ def create_benchmark_collection(
         base_source = max(loaded_sources, key=lambda item: int(len(item["df"])))
         keys = list(base_source["keys"])
         metadata_cols = _collection_metadata_columns(base_source["df"])
+        for source in loaded_sources:
+            if list(source["keys"]) != keys:
+                continue
+            for col in _collection_metadata_columns(source["df"]):
+                if col not in metadata_cols:
+                    metadata_cols.append(col)
         if not set(keys).issubset(metadata_cols):
             metadata_cols = [col for col in keys if col in base_source["df"].columns] + metadata_cols
             metadata_cols = list(dict.fromkeys(metadata_cols))
-        base = base_source["df"][metadata_cols].drop_duplicates(keys).copy()
+        base_frames: list[pd.DataFrame] = []
+        for source in loaded_sources:
+            if list(source["keys"]) != keys:
+                continue
+            source_df: pd.DataFrame = source["df"]
+            source_cols = [col for col in metadata_cols if col in source_df.columns]
+            if source_cols:
+                base_frames.append(source_df[source_cols].copy())
+        if base_frames:
+            base = pd.concat(base_frames, ignore_index=True, sort=False).drop_duplicates(keys).copy()
+        else:
+            base = base_source["df"][metadata_cols].drop_duplicates(keys).copy()
         _stage_collection_reference_artifacts(base_source["source_run_dir"], job.run_dir)
+
+    engine_counts: dict[str, int] = {}
+    engine_setting_tokens: dict[str, set[str]] = {}
+    for source in loaded_sources:
+        for engine in source["engines"]:
+            if engine == "Input":
+                continue
+            engine_counts[engine] = engine_counts.get(engine, 0) + 1
+            engine_setting_tokens.setdefault(engine, set()).add(_source_engine_variant_token(source, engine))
+    for source in loaded_sources:
+        engine_variants: dict[str, str] = {}
+        for engine in source["engines"]:
+            if engine == "Input" or engine_counts.get(engine, 0) <= 1:
+                continue
+            if engine == "ESMFold2":
+                continue
+            token = _source_engine_variant_token(source, engine)
+            if len(engine_setting_tokens.get(engine, set())) <= 1:
+                continue
+            engine_variants[engine] = token
+        source["engine_variants"] = engine_variants
 
     for source in loaded_sources:
         order = int(source["order"])
@@ -866,12 +2207,13 @@ def create_benchmark_collection(
         metadata: dict[str, Any] = source["metadata"]
         result: dict[str, Any] = source["result"]
         current_keys = list(source["keys"])
+        engine_targets = source.get("engine_targets") if isinstance(source.get("engine_targets"), dict) else {}
         if current_keys != keys:
             source_rows.append({"order": order, "run_id": run_id, "status": "incompatible_merge_keys", "engines": ",".join(engines)})
             continue
 
         selected_columns: list[str] = []
-        if include_input_columns and "Input" in engines:
+        if include_input_columns:
             selected_columns.extend(
                 col
                 for col in df.columns
@@ -890,7 +2232,34 @@ def create_benchmark_collection(
             source_rows.append({"order": order, "run_id": run_id, "status": "no_selected_engine_columns", "engines": ",".join(engines)})
             continue
         assert base is not None
-        incoming = df[keys + selected_columns].drop_duplicates(keys).copy()
+        source_columns = list(selected_columns)
+        column_renames: dict[str, str] = {}
+        engine_variants = source.get("engine_variants") if isinstance(source.get("engine_variants"), dict) else {}
+        for engine, variant_token in engine_variants.items():
+            engine_columns = [col for col in source_columns if _benchmark_engine_for_column(str(col)) == engine]
+            column_renames.update(
+                _rename_collection_variant_columns(
+                    engine_columns,
+                    engine=engine,
+                    variant_token=str(variant_token),
+                )
+            )
+        selected_columns = [column_renames.get(col, col) for col in source_columns]
+        incoming = df[keys + source_columns].drop_duplicates(keys).rename(columns=column_renames).copy()
+        if engine_targets and "target_id" in incoming.columns:
+            for engine, targets in engine_targets.items():
+                if not targets:
+                    continue
+                engine_columns = [
+                    column_renames.get(col, col)
+                    for col in source_columns
+                    if _benchmark_engine_for_column(str(col)) == engine
+                ]
+                engine_columns = [col for col in engine_columns if col in incoming.columns]
+                if engine_columns:
+                    incoming[engine_columns] = incoming[engine_columns].astype("object")
+                    outside_targets = ~incoming["target_id"].astype(str).isin(set(targets))
+                    incoming.loc[outside_targets, engine_columns] = np.nan
         source_key_index = set(tuple(row) for row in incoming[keys].itertuples(index=False, name=None))
         base_key_index = set(tuple(row) for row in base[keys].itertuples(index=False, name=None))
         records_not_in_base = len(source_key_index - base_key_index)
@@ -898,10 +2267,17 @@ def create_benchmark_collection(
         coverage_records = int(incoming[selected_columns].notna().any(axis=1).sum())
         replaced = [col for col in selected_columns if col in base.columns]
         if replaced:
-            base = base.drop(columns=replaced)
-            for column in replaced:
-                replacement_rows.append({"column": column, "replaced_by_run_id": run_id, "order": order})
+            incoming = incoming.rename(columns={column: f"{column}__incoming" for column in replaced})
         base = base.merge(incoming, on=keys, how="left")
+        for column in replaced:
+            incoming_column = f"{column}__incoming"
+            if incoming_column not in base.columns:
+                continue
+            existing = base[column] if column in base.columns else pd.Series([np.nan] * len(base), index=base.index)
+            base[column] = existing.combine_first(base[incoming_column])
+            filled_count = int(base[incoming_column].notna().sum())
+            replacement_rows.append({"column": column, "merged_from_run_id": run_id, "order": order, "filled_values": filled_count})
+            base = base.drop(columns=[incoming_column])
         _stage_collection_engine_artifacts(
             source_run_dir=source["source_run_dir"],
             collection_run_dir=job.run_dir,
@@ -919,6 +2295,7 @@ def create_benchmark_collection(
                     "source_status": metadata.get("status"),
                     "source_top_feature": (result.get("metrics") or {}).get("merged_benchmark_top_feature"),
                     "selection_order": order,
+                    "source_engine_variant": engine_variants.get(_benchmark_engine_for_column(column) or ""),
                 }
             )
         source_rows.append(
@@ -928,6 +2305,10 @@ def create_benchmark_collection(
                 "status": "included",
                 "engines": ",".join(engines),
                 "selected_feature_count": len(selected_columns),
+                "raw_column_count": int(source.get("raw_column_count") or 0),
+                "hydrated_column_count": int(source.get("hydrated_column_count") or 0),
+                "engine_variants": ",".join(f"{engine}:{variant}" for engine, variant in sorted(engine_variants.items())),
+                "engine_targets": json.dumps({engine: sorted(targets) for engine, targets in engine_targets.items()}),
                 "records": int(len(df)),
                 "collection_records": int(len(base)),
                 "matched_records": int(matched_records),
@@ -1014,6 +2395,96 @@ def create_benchmark_collection(
                 "benchmark_collection_sources": str(sources_path.relative_to(job.run_dir)),
                 "benchmark_collection_replacements": str(replacements_path.relative_to(job.run_dir)),
                 "collection": "artifacts/benchmark/collection.json",
+            },
+        },
+    )
+    return job.run_dir
+
+
+def create_benchmark_matrix_workspace(
+    *,
+    name: str,
+    selections: list[dict[str, Any]],
+) -> Path:
+    clean_name = str(name or "Benchmark matrix workspace").strip() or "Benchmark matrix workspace"
+    selections = _json_clean(selections)
+    source_rows: list[dict[str, Any]] = []
+    targets: set[str] = set()
+    engines: set[str] = set()
+    for order, selection in enumerate(selections, start=1):
+        run_id = str(selection.get("run_id") or "").strip()
+        selected_engines = [str(engine) for engine in (selection.get("engines") or []) if str(engine).strip()]
+        engine_targets = selection.get("engine_targets") if isinstance(selection.get("engine_targets"), dict) else {}
+        for engine in selected_engines:
+            target_values = [str(target) for target in (engine_targets.get(engine) or []) if str(target).strip()]
+            if not target_values:
+                source_rows.append(
+                    {
+                        "order": order,
+                        "run_id": run_id,
+                        "engine": engine,
+                        "target_id": "",
+                    }
+                )
+                engines.add(engine)
+                continue
+            for target_id in target_values:
+                source_rows.append(
+                    {
+                        "order": order,
+                        "run_id": run_id,
+                        "engine": engine,
+                        "target_id": target_id,
+                    }
+                )
+                engines.add(engine)
+                targets.add(target_id)
+
+    job = create_job(
+        BENCHMARK_GROUP,
+        "benchmark_matrix_workspace",
+        "benchmark_matrix_workspace",
+        {
+            "source_runs": sorted({str(row["run_id"]) for row in source_rows if str(row.get("run_id") or "")}),
+        },
+        {
+            "workspace_name": clean_name,
+            "selections": selections,
+        },
+    )
+    update_status(job.run_dir, "running")
+    benchmark_dir = job.run_dir / "artifacts" / "benchmark"
+    benchmark_dir.mkdir(parents=True, exist_ok=True)
+    sources_path = benchmark_dir / "benchmark_matrix_workspace_sources.csv"
+    pd.DataFrame(source_rows).to_csv(sources_path, index=False)
+    workspace_path = benchmark_dir / "matrix_workspace.json"
+    write_json(
+        workspace_path,
+        {
+            "name": clean_name,
+            "selections": selections,
+            "source_count": len({str(row["run_id"]) for row in source_rows if str(row.get("run_id") or "")}),
+            "cell_count": len(source_rows),
+            "engines": sorted(engines),
+            "targets": sorted(targets),
+        },
+    )
+    finish_job(
+        job.run_dir,
+        True,
+        {
+            "metrics": {
+                "workspace_name": clean_name,
+                "source_run_count": len({str(row["run_id"]) for row in source_rows if str(row.get("run_id") or "")}),
+                "cell_count": len(source_rows),
+                "engine_count": len(engines),
+                "target_count": len(targets),
+                "benchmark_matrix_workspace_sources": str(sources_path.relative_to(job.run_dir)),
+                "matrix_workspace": str(workspace_path.relative_to(job.run_dir)),
+            },
+            "outputs": {
+                "benchmark_matrix_workspace_sources": str(sources_path.relative_to(job.run_dir)),
+                "matrix_workspace": str(workspace_path.relative_to(job.run_dir)),
             },
         },
     )
@@ -1140,6 +2611,9 @@ def _stage_repo_format_inputs(
             pdb_sources = [pdb for pdb in pdb_sources if pdb.name in selected_names]
         for pdb in pdb_sources:
             shutil.copy2(pdb, staged_pdb_dir / pdb.name)
+            chain_map = pdb.with_suffix(".chain_map.json")
+            if chain_map.exists():
+                shutil.copy2(chain_map, staged_pdb_dir / chain_map.name)
     else:
         for candidate in [dataset_dir / "input_pdbs", *dataset_dir.glob("**/input_pdbs")]:
             if candidate.exists() and candidate.is_dir():
@@ -1203,6 +2677,40 @@ def _run_local_command(run_dir: Path, command: list[str], *, cwd: Path | None = 
     return int(proc.returncode)
 
 
+def _run_csv_chain_sequence(row: pd.Series, chain: str, binder_chain: str) -> str:
+    candidates: list[str] = []
+    if chain == binder_chain:
+        candidates.extend([f"{chain}_seq", f"target_subchain_{chain}_seq", "binder_sequence", "sequence"])
+        if chain == "A":
+            candidates.append("A_seq")
+    else:
+        candidates.extend([f"target_subchain_{chain}_seq", f"{chain}_seq"])
+    for column in candidates:
+        value = row.get(column)
+        if value is None or pd.isna(value):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _run_csv_is_capacity_target_only(row: pd.Series) -> bool:
+    target_source = str(row.get("target_source") or "").strip().lower()
+    if target_source == "capacity_target_only":
+        return True
+    raw = row.get("capacity_target_only")
+    if raw is None or pd.isna(raw):
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _run_csv_target_msa_chains(row: pd.Series, binder_chain: str) -> list[str]:
+    if _run_csv_is_capacity_target_only(row):
+        return [binder_chain]
+    return [chain for chain in _split_list(row.get("target_chains")) if chain and chain != binder_chain]
+
+
 def _repo_run_csv_to_esmfold2_csv(run_dir: Path, run_csv: Path) -> str:
     df = pd.read_csv(run_csv)
     rows: list[dict[str, Any]] = []
@@ -1215,14 +2723,20 @@ def _repo_run_csv_to_esmfold2_csv(run_dir: Path, run_csv: Path) -> str:
         if not complex_pdb.exists():
             continue
         target_chains = _split_list(row.get("target_chains"))
-        if not target_chains:
+        if not target_chains and not _run_csv_is_capacity_target_only(row):
             try:
                 parsed = json.loads(str(row.get("target_chains") or "[]"))
                 target_chains = [str(item) for item in parsed]
             except Exception:
                 target_chains = ["B"]
         binder_chain = str(row.get("binder_chain") or "A").strip() or "A"
-        binder_sequence = str(row.get(f"{binder_chain}_seq") or row.get("A_seq") or "").strip()
+        binder_sequence = _run_csv_chain_sequence(row, binder_chain, binder_chain)
+        target_pdb_value = str(row.get("target_pdb") or "").strip()
+        target_pdb = Path(target_pdb_value).expanduser() if target_pdb_value else complex_pdb
+        if not target_pdb.is_absolute():
+            target_pdb = (run_csv.parent / target_pdb).resolve()
+        if not target_pdb.exists():
+            target_pdb = complex_pdb
         msa_columns = {
             str(col): str(row.get(col) or "").strip()
             for col in df.columns
@@ -1234,11 +2748,13 @@ def _repo_run_csv_to_esmfold2_csv(run_dir: Path, run_csv: Path) -> str:
                 "target_id": row.get("target_id") or "",
                 "source": row.get("source") or "",
                 "label": row.get("binder") if "binder" in df.columns else row.get("label"),
-                "target_pdb": str(complex_pdb.resolve()),
+                "target_pdb": str(target_pdb.resolve()),
                 "complex_pdb": str(complex_pdb.resolve()),
                 "binder_sequence": binder_sequence,
                 "binder_chains": binder_chain,
                 "target_chains": ",".join(target_chains),
+                "target_source": row.get("target_source") or "",
+                "capacity_target_only": bool(_run_csv_is_capacity_target_only(row)),
                 **msa_columns,
             }
         )
@@ -1261,9 +2777,15 @@ def _repo_run_csv_to_candidates(run_dir: Path, run_csv: Path, max_records: int =
         complex_pdb = input_pdb_dir / f"{binder_id}.pdb"
         if not complex_pdb.exists():
             continue
+        target_pdb_value = str(row.get("target_pdb") or "").strip()
+        target_pdb = Path(target_pdb_value).expanduser() if target_pdb_value else None
+        if target_pdb is not None and not target_pdb.is_absolute():
+            target_pdb = (run_csv.parent / target_pdb).resolve()
+        if target_pdb is None or not target_pdb.exists():
+            target_pdb = complex_pdb
         binder_chain = str(row.get("binder_chain") or "A").strip() or "A"
         target_chains = _split_list(row.get("target_chains"))
-        if not target_chains:
+        if not target_chains and not _run_csv_is_capacity_target_only(row):
             try:
                 parsed = json.loads(str(row.get("target_chains") or "[]"))
                 target_chains = [str(item) for item in parsed if str(item)]
@@ -1275,9 +2797,9 @@ def _repo_run_csv_to_candidates(run_dir: Path, run_csv: Path, max_records: int =
                 "candidate_id": binder_id,
                 "stage": STAGE_COMPLEX_REFOLDING,
                 "source_tool": "de_novo_binder_scoring_dataset",
-                "target_pdb": str(complex_pdb.relative_to(run_dir)),
+                "target_pdb": str(target_pdb),
                 "complex_pdb": str(complex_pdb.relative_to(run_dir)),
-                "binder_sequence": str(row.get(f"{binder_chain}_seq") or row.get("A_seq") or "").strip(),
+                "binder_sequence": _run_csv_chain_sequence(row, binder_chain, binder_chain),
                 "binder_chains": [binder_chain],
                 "target_chains": target_chains,
                 "metrics": {
@@ -1286,7 +2808,10 @@ def _repo_run_csv_to_candidates(run_dir: Path, run_csv: Path, max_records: int =
                     "target_id": row.get("target_id") or "",
                     "source": row.get("source") or "",
                 },
-                "raw_metadata": {"repo_run_csv_row": {str(key): value for key, value in row.to_dict().items()}},
+                "raw_metadata": {
+                    "repo_run_csv_row": {str(key): value for key, value in row.to_dict().items()},
+                    "capacity_target_only": bool(_run_csv_is_capacity_target_only(row)),
+                },
             }
         )
     normalized = write_candidates(run_dir, "de_novo_binder_scoring_dataset", rows)
@@ -1491,6 +3016,19 @@ def _normalize_structure_for_group_metrics(
         return False
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text("\n".join(binder_lines + ["TER"] + target_lines + ["TER", "END", ""]))
+    write_json(
+        target_path.with_suffix(".chain_map.json"),
+        {
+            "source_structure": str(source_path),
+            "evaluation_contract": {
+                "binder_chain": "A",
+                "target_chain": "B",
+            },
+            "binder_source_chains": binder_group,
+            "target_source_chains": target_group,
+            "scope": "temporary PyRosetta/PyMOL evaluation copy",
+        },
+    )
     return True
 
 
@@ -1526,6 +3064,17 @@ def _strip_pdb_suffixes(name: str) -> str:
     return clean
 
 
+def _is_staged_input_structure_path(path: Path | str) -> bool:
+    """Return True for synthetic/input structures that must not count as predictions."""
+    text = str(path).replace("\\", "/")
+    staged_markers = (
+        "/input_pdbs/",
+        "/queued_inputs/",
+        "/de_novo_binder_scoring/output/input_pdbs/",
+    )
+    return any(marker in text for marker in staged_markers)
+
+
 def _stage_child_candidate_pdbs(
     child_runs: list[str],
     stage_dir: Path,
@@ -1550,13 +3099,16 @@ def _stage_child_candidate_pdbs(
             complex_rel = candidate.get("complex_pdb")
             if not binder_id or not complex_rel:
                 continue
-            complex_path = child_dir / str(complex_rel)
+            safe_id = _safe_id(binder_id)
+            viewer_prediction_path = _child_viewer_prediction_path(child_dir, source_label, safe_id)
+            if viewer_prediction_path is None and _is_staged_input_structure_path(complex_rel):
+                continue
+            complex_path = viewer_prediction_path or child_dir / str(complex_rel)
             if not complex_path.exists():
                 continue
-            target = stage_dir / f"{_safe_id(binder_id)}.pdb"
-            if target.exists():
-                count += 1
-                continue
+            target = stage_dir / f"{safe_id}.pdb"
+            if target.exists() or target.is_symlink():
+                target.unlink()
             binder_chains = [str(chain) for chain in candidate.get("binder_chains") or [] if str(chain)]
             target_chains = [str(chain) for chain in candidate.get("target_chains") or [] if str(chain)]
             if complex_path.suffix.lower() == ".pdb":
@@ -1566,7 +3118,7 @@ def _stage_child_candidate_pdbs(
                     binder_chains=binder_chains,
                     target_chains=target_chains,
                 ):
-                    _link_or_copy(complex_path, target)
+                    continue
             elif complex_path.suffix.lower() == ".cif" or complex_path.name.endswith(".cif.gz"):
                 tmp = stage_dir / f"{_safe_id(binder_id)}.{source_label}.raw.pdb"
                 refolding_workflow._cif_to_pdb(complex_path, tmp)
@@ -1578,9 +3130,255 @@ def _stage_child_candidate_pdbs(
                 ):
                     tmp.unlink(missing_ok=True)
                 else:
-                    tmp.replace(target)
+                    tmp.unlink(missing_ok=True)
+                    continue
             else:
                 continue
+            count += 1
+    return (stage_dir if count else None), count
+
+
+def _stage_engine_artifact_candidate_pdbs(
+    parent_run_dir: Path,
+    engine_dir: Path,
+    stage_dir: Path,
+    *,
+    source_label: str,
+) -> tuple[Path | None, int]:
+    candidates_path = engine_dir / "artifacts" / "normalized_candidates" / "candidates.jsonl"
+    if not candidates_path.exists():
+        return None, 0
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for line in candidates_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        parents = candidate.get("parents") or []
+        binder_id = str(parents[0]) if parents else str(candidate.get("candidate_id") or "")
+        raw_source = (candidate.get("raw_metadata") or {}).get("source_candidate") or {}
+        raw_record = (candidate.get("raw_metadata") or {}).get("benchmark_record") or {}
+        if isinstance(raw_source, dict) and raw_source.get("candidate_id"):
+            binder_id = str(raw_source.get("candidate_id"))
+        if isinstance(raw_record, dict) and raw_record.get("candidate_id"):
+            binder_id = str(raw_record.get("candidate_id"))
+        complex_rel = candidate.get("complex_pdb")
+        if not binder_id or not complex_rel:
+            continue
+        safe_id = _safe_id(binder_id)
+        complex_path = Path(str(complex_rel))
+        if not complex_path.is_absolute():
+            complex_path = parent_run_dir / complex_path
+        if not complex_path.exists():
+            fallback = _child_viewer_prediction_path(parent_run_dir, source_label, safe_id)
+            if fallback is not None:
+                complex_path = fallback
+        if not complex_path.exists():
+            continue
+        target = stage_dir / f"{safe_id}.pdb"
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        binder_chains = [str(chain) for chain in candidate.get("binder_chains") or [] if str(chain)]
+        target_chains = [str(chain) for chain in candidate.get("target_chains") or [] if str(chain)]
+        if complex_path.suffix.lower() == ".pdb":
+            if not _normalize_structure_for_group_metrics(
+                complex_path,
+                target,
+                binder_chains=binder_chains,
+                target_chains=target_chains,
+            ):
+                continue
+        elif complex_path.suffix.lower() == ".cif" or complex_path.name.endswith(".cif.gz"):
+            tmp = stage_dir / f"{safe_id}.{source_label}.raw.pdb"
+            refolding_workflow._cif_to_pdb(complex_path, tmp)
+            if _normalize_structure_for_group_metrics(
+                tmp,
+                target,
+                binder_chains=binder_chains,
+                target_chains=target_chains,
+            ):
+                tmp.unlink(missing_ok=True)
+            else:
+                tmp.unlink(missing_ok=True)
+                continue
+        else:
+            continue
+        count += 1
+    return (stage_dir if count else None), count
+
+
+def _child_viewer_prediction_path(child_dir: Path, source_label: str, safe_id: str) -> Path | None:
+    """Return an engine-native prediction structure when the candidate points to staged input."""
+    search_roots: list[Path] = []
+    if source_label in {"af3", "alphafast_af3"}:
+        search_roots.extend(
+            [
+                child_dir
+                / "artifacts"
+                / "engines"
+                / "alphafast_af3"
+                / "alphafast_output"
+                / safe_id,
+                child_dir / "artifacts" / "raw" / "alphafast_af3" / "alphafast_output" / safe_id,
+            ]
+        )
+    elif source_label == "af2":
+        search_roots.extend(
+            [
+                child_dir
+                / "artifacts"
+                / "engines"
+                / "af2_initial_guess"
+                / "artifacts"
+                / "raw"
+                / "af2_initial_guess"
+                / "output"
+                / "af2_initial_guess",
+                child_dir / "artifacts" / "raw" / "af2_initial_guess" / "output" / "af2_initial_guess",
+            ]
+        )
+    elif source_label in {"colab", "colabfold"}:
+        search_roots.extend(
+            [
+                child_dir / "artifacts" / "engines" / "colabfold" / "ptm_output",
+                child_dir / "artifacts" / "engines" / "colabfold" / "pdbs",
+                child_dir / "artifacts" / "raw" / "colabfold" / "ptm_output",
+                child_dir / "artifacts" / "raw" / "colabfold" / "pdbs",
+            ]
+        )
+    elif source_label == "boltz2":
+        search_roots.extend(
+            [
+                child_dir
+                / "artifacts"
+                / "engines"
+                / "boltz2"
+                / "artifacts"
+                / "raw"
+                / "boltz2_initial_guess"
+                / "output"
+                / "predictions"
+                / safe_id,
+                child_dir
+                / "artifacts"
+                / "raw"
+                / "boltz2_initial_guess"
+                / "output"
+                / "predictions"
+                / safe_id,
+            ]
+        )
+    elif source_label == "boltzgen_fold":
+        search_roots.extend(
+            [
+                child_dir
+                / "artifacts"
+                / "engines"
+                / "boltzgen_fold"
+                / "artifacts"
+                / "raw"
+                / "boltzgen_fold"
+                / "output"
+                / safe_id,
+                child_dir / "artifacts" / "raw" / "boltzgen_fold" / "output" / safe_id,
+            ]
+        )
+    elif source_label == "protenix":
+        search_roots.extend(
+            [
+                child_dir
+                / "artifacts"
+                / "engines"
+                / "protenix"
+                / "artifacts"
+                / "raw"
+                / "protenix"
+                / "output"
+                / safe_id,
+                child_dir / "artifacts" / "raw" / "protenix" / "output" / safe_id,
+            ]
+        )
+    for root in search_roots:
+        if not root.exists():
+            continue
+        matches = sorted(root.glob("*model_0.cif"))
+        if not matches and source_label in {"af3", "alphafast_af3"}:
+            matches = sorted(root.glob("*model.cif"))
+        if not matches and source_label == "af2":
+            matches = (
+                sorted(root.glob(f"{safe_id}_af2_initial_guess.pdb"))
+                or sorted(root.glob(f"{safe_id}_af2_initial_guess_model*.pdb"))
+                or sorted(root.glob(f"{safe_id}_af2ig_*.pdb"))
+                or sorted(root.glob(f"{safe_id}_af2_initial_guess_binder_model*.pdb"))
+            )
+        if not matches and source_label in {"colab", "colabfold"}:
+            matches = sorted(root.glob(f"{safe_id}*rank_001*.pdb")) or sorted(root.glob(f"{safe_id}*.pdb"))
+        if not matches:
+            matches = sorted(root.glob("*sample_0.cif"))
+        if not matches and source_label == "boltzgen_fold":
+            matches = sorted(root.rglob("*.cif"))
+        if not matches and source_label == "protenix":
+            matches = sorted(root.rglob("*sample_0.cif"))
+        if not matches:
+            matches = sorted(root.glob("*.cif")) + sorted(root.glob("*.pdb"))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _stage_child_viewer_structures(
+    child_runs: list[str],
+    stage_dir: Path,
+    *,
+    source_label: str,
+) -> tuple[Path | None, int]:
+    """Stage prediction structures for display without collapsing target chains."""
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for raw_child in child_runs:
+        child_dir = Path(str(raw_child))
+        if not (child_dir / "artifacts" / "normalized_candidates" / "candidates.jsonl").exists():
+            continue
+        for candidate in read_candidates(child_dir):
+            parents = candidate.get("parents") or []
+            binder_id = str(parents[0]) if parents else str(candidate.get("candidate_id") or "")
+            raw_source = (candidate.get("raw_metadata") or {}).get("source_candidate") or {}
+            raw_record = (candidate.get("raw_metadata") or {}).get("benchmark_record") or {}
+            if isinstance(raw_source, dict) and raw_source.get("candidate_id"):
+                binder_id = str(raw_source.get("candidate_id"))
+            if isinstance(raw_record, dict) and raw_record.get("candidate_id"):
+                binder_id = str(raw_record.get("candidate_id"))
+            complex_rel = candidate.get("complex_pdb")
+            if not binder_id or not complex_rel:
+                continue
+            safe_id = _safe_id(binder_id)
+            viewer_prediction_path = _child_viewer_prediction_path(child_dir, source_label, safe_id)
+            if viewer_prediction_path is None and _is_staged_input_structure_path(complex_rel):
+                # Some normalized candidates point at the staged synthetic input complex.
+                # For capacity views, that would display the reference as a successful
+                # prediction. Only stage these rows when an engine-native file was found.
+                continue
+            complex_path = viewer_prediction_path or child_dir / str(complex_rel)
+            if not complex_path.exists():
+                continue
+            target = stage_dir / f"{safe_id}.pdb"
+            if target.exists() or target.is_symlink():
+                target.unlink()
+            if complex_path.suffix.lower() == ".pdb":
+                shutil.copy2(complex_path, target)
+            elif complex_path.suffix.lower() == ".cif" or complex_path.name.endswith(".cif.gz"):
+                refolding_workflow._cif_to_pdb(complex_path, target)
+            else:
+                continue
+            chain_map_path = child_dir / str(complex_rel).replace(complex_path.name, f"{complex_path.stem}.chain_map.json")
+            if chain_map_path.exists():
+                chain_map_target = stage_dir / f"{safe_id}.chain_map.json"
+                if chain_map_target.exists() or chain_map_target.is_symlink():
+                    chain_map_target.unlink()
+                _link_or_copy(chain_map_path, chain_map_target)
             count += 1
     return (stage_dir if count else None), count
 
@@ -1612,7 +3410,8 @@ def _stage_alphafast_pdbs(
             ):
                 tmp.unlink(missing_ok=True)
             else:
-                tmp.replace(target)
+                tmp.unlink(missing_ok=True)
+                continue
         count += 1
     return (stage_dir if count else None), count
 
@@ -1647,7 +3446,7 @@ def _stage_colabfold_pdbs(
             binder_chains=binder_chains,
             target_chains=target_chains,
         ):
-            _link_or_copy(source, target)
+            continue
         count += 1
     return (stage_dir if count else None), count
 
@@ -1671,7 +3470,7 @@ def _stage_input_pdbs_for_group_metrics(
             binder_chains=binder_chains,
             target_chains=target_chains,
         ):
-            _link_or_copy(source, target)
+            continue
         count += 1
     return (stage_dir if count else None), count
 
@@ -1917,8 +3716,7 @@ def _run_benchmark_metric_postprocessing(
             "docker",
             "run",
             "--rm",
-            "-v",
-            f"{REPO_ROOT}:{REPO_ROOT}",
+            *_repo_and_runs_mounts(),
             "-w",
             str(DE_NOVO_BINDER_SCORING_DIR),
             docker_image,
@@ -2046,6 +3844,7 @@ def _run_benchmark_metric_postprocessing(
     metrics["multi_chain_target_record_count"] = sum(
         1 for _binder_chains, target_chains in unique_group_roles.values() if len(target_chains) > 1
     )
+    viewer_structure_counts: dict[str, int] = {}
     af3_pdb_dir, af3_pdb_count = _stage_alphafast_pdbs(
         output_dir / "AF3" / "alphafast_output",
         benchmark_dir / "predicted_metric_pdbs" / "af3",
@@ -2070,6 +3869,13 @@ def _run_benchmark_metric_postprocessing(
     if af2_pdb_dir is not None:
         predicted_pdb_dirs.append(("af2", af2_pdb_dir))
         metrics["af2_predicted_metric_pdb_count"] = af2_pdb_count
+    af2_viewer_dir, af2_viewer_count = _stage_child_viewer_structures(
+        af2_child_runs,
+        benchmark_dir / "predicted_viewer_structures" / "af2",
+        source_label="af2",
+    )
+    if af2_viewer_dir is not None:
+        viewer_structure_counts["af2"] = af2_viewer_count
     boltz2_pdb_dir, boltz2_pdb_count = _stage_child_candidate_pdbs(
         boltz2_child_runs,
         benchmark_dir / "predicted_metric_pdbs" / "boltz2",
@@ -2078,6 +3884,13 @@ def _run_benchmark_metric_postprocessing(
     if boltz2_pdb_dir is not None:
         predicted_pdb_dirs.append(("boltz2", boltz2_pdb_dir))
         metrics["boltz2_predicted_metric_pdb_count"] = boltz2_pdb_count
+    boltz2_viewer_dir, boltz2_viewer_count = _stage_child_viewer_structures(
+        boltz2_child_runs,
+        benchmark_dir / "predicted_viewer_structures" / "boltz2",
+        source_label="boltz2",
+    )
+    if boltz2_viewer_dir is not None:
+        viewer_structure_counts["boltz2"] = boltz2_viewer_count
     esmfold2_pdb_dir, esmfold2_pdb_count = _stage_child_candidate_pdbs(
         esmfold2_child_runs,
         benchmark_dir / "predicted_metric_pdbs" / "esmfold2",
@@ -2086,6 +3899,13 @@ def _run_benchmark_metric_postprocessing(
     if esmfold2_pdb_dir is not None:
         predicted_pdb_dirs.append(("esmfold2", esmfold2_pdb_dir))
         metrics["esmfold2_predicted_metric_pdb_count"] = esmfold2_pdb_count
+    esmfold2_viewer_dir, esmfold2_viewer_count = _stage_child_viewer_structures(
+        esmfold2_child_runs,
+        benchmark_dir / "predicted_viewer_structures" / "esmfold2",
+        source_label="esmfold2",
+    )
+    if esmfold2_viewer_dir is not None:
+        viewer_structure_counts["esmfold2"] = esmfold2_viewer_count
     for engine, child_runs in sorted((extra_child_runs or {}).items()):
         engine_pdb_dir, engine_pdb_count = _stage_child_candidate_pdbs(
             child_runs,
@@ -2095,6 +3915,15 @@ def _run_benchmark_metric_postprocessing(
         if engine_pdb_dir is not None:
             predicted_pdb_dirs.append((engine, engine_pdb_dir))
             metrics[f"{engine}_predicted_metric_pdb_count"] = engine_pdb_count
+        engine_viewer_dir, engine_viewer_count = _stage_child_viewer_structures(
+            child_runs,
+            benchmark_dir / "predicted_viewer_structures" / engine,
+            source_label=engine,
+        )
+        if engine_viewer_dir is not None:
+            viewer_structure_counts[engine] = engine_viewer_count
+    if viewer_structure_counts:
+        metrics["predicted_viewer_structure_counts"] = viewer_structure_counts
 
     if run_predicted_rosetta_metrics and run_csv.exists():
         rosetta_csv = benchmark_dir / "predicted_rosetta_metrics.csv"
@@ -2103,8 +3932,7 @@ def _run_benchmark_metric_postprocessing(
                 "docker",
                 "run",
                 "--rm",
-                "-v",
-                f"{REPO_ROOT}:{REPO_ROOT}",
+                *_repo_and_runs_mounts(),
                 "-w",
                 str(DE_NOVO_BINDER_SCORING_DIR),
                 PYROSETTA_METRICS_IMAGE,
@@ -2210,10 +4038,11 @@ def _run_alphafast_af3_refolding(
     weights_dir: Path,
     batch_size: int = 0,
     num_recycles: int = 10,
-    gpu_device: int = 0,
+    gpu_device: object = 0,
     max_records: int = 0,
     image: str = ALPHAFAST_IMAGE,
     run_data_pipeline: bool = True,
+    query_only_msa: bool = False,
 ) -> tuple[int, list[list[str]]]:
     commands: list[list[str]] = []
     if run_data_pipeline:
@@ -2226,6 +4055,7 @@ def _run_alphafast_af3_refolding(
             gpu_device=gpu_device,
             max_records=max_records,
             image=image,
+            query_only_msa=query_only_msa,
         )
         if rc != 0:
             return rc, commands
@@ -2251,15 +4081,13 @@ def _run_alphafast_af3_refolding(
     return rc, commands
 
 
-def _alphafast_common_mounts(*, db_dir: Path, weights_dir: Path | None, gpu_device: int, image: str) -> list[str]:
+def _alphafast_common_mounts(*, db_dir: Path, weights_dir: Path | None, gpu_device: object, image: str) -> list[str]:
     mounts = [
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        f"device={int(gpu_device)}",
-        "-v",
-        f"{REPO_ROOT}:{REPO_ROOT}",
+        *docker_gpu_args(gpu_device),
+        *_repo_and_runs_mounts(),
         "-v",
         f"{db_dir}:/data/public_databases:ro",
         "-v",
@@ -2271,7 +4099,13 @@ def _alphafast_common_mounts(*, db_dir: Path, weights_dir: Path | None, gpu_devi
     return mounts
 
 
-def _stage_alphafast_inputs(af3_input_dir: Path, output_dir: Path, max_records: int) -> tuple[Path, int]:
+def _stage_alphafast_inputs(
+    af3_input_dir: Path,
+    output_dir: Path,
+    max_records: int,
+    *,
+    query_only_msa: bool = False,
+) -> tuple[Path, int]:
     if not af3_input_dir.exists() or not any(af3_input_dir.glob("*.json")):
         raise ValueError("AlphaFast AF3 benchmark needs generated AF3/input_folder/*.json inputs.")
     selected_inputs = sorted(af3_input_dir.glob("*.json"))
@@ -2296,10 +4130,20 @@ def _stage_alphafast_inputs(af3_input_dir: Path, output_dir: Path, max_records: 
                     protein.pop("unpairedMsaPath", None)
                 else:
                     protein.pop("unpairedMsaPath", None)
-                    protein.pop("unpairedMsa", None)
+                    if query_only_msa:
+                        protein["unpairedMsa"] = ""
+                    else:
+                        protein.pop("unpairedMsa", None)
                     protein.pop("pairedMsaPath", None)
-                    protein.pop("pairedMsa", None)
+                    if query_only_msa:
+                        protein["pairedMsa"] = ""
+                    else:
+                        protein.pop("pairedMsa", None)
                     protein.pop("templates", None)
+            elif query_only_msa:
+                protein["unpairedMsa"] = ""
+                protein["pairedMsa"] = ""
+                protein["templates"] = []
             paired_path = protein.get("pairedMsaPath")
             if paired_path:
                 host_paired_path = Path(str(paired_path))
@@ -2321,15 +4165,21 @@ def _run_alphafast_data_pipeline(
     output_dir: Path,
     db_dir: Path,
     batch_size: int = 0,
-    gpu_device: int = 0,
+    gpu_device: object = 0,
     max_records: int = 0,
     image: str = ALPHAFAST_IMAGE,
+    query_only_msa: bool = False,
 ) -> tuple[int, list[list[str]]]:
     if not db_dir.exists():
         raise ValueError(f"AlphaFast database directory does not exist: {db_dir}")
     if not (db_dir / "mmseqs").exists():
         raise ValueError(f"AlphaFast database directory must contain an mmseqs subdirectory: {db_dir / 'mmseqs'}")
-    staged_input_dir, input_count = _stage_alphafast_inputs(af3_input_dir, output_dir, max_records)
+    staged_input_dir, input_count = _stage_alphafast_inputs(
+        af3_input_dir,
+        output_dir,
+        max_records,
+        query_only_msa=query_only_msa,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     effective_batch = int(batch_size) if batch_size and int(batch_size) > 0 else max(1, input_count)
     common_mounts = _alphafast_common_mounts(db_dir=db_dir, weights_dir=None, gpu_device=gpu_device, image=image)
@@ -2348,11 +4198,20 @@ def _run_alphafast_data_pipeline(
     return rc, [pipeline_cmd]
 
 
-def _write_alphafast_msas_to_run_csv(*, run_csv: Path, alphafast_output_dir: Path, output_dir: Path) -> dict[str, Any]:
+def _write_alphafast_msas_to_run_csv(
+    *,
+    run_csv: Path,
+    alphafast_output_dir: Path,
+    output_dir: Path,
+    msa_repository_dir: Path = MSA_REPOSITORY_DIR,
+) -> dict[str, Any]:
     df = pd.read_csv(run_csv)
     msa_dir = output_dir / "unique_msa" / "msa"
     msa_dir.mkdir(parents=True, exist_ok=True)
     written = 0
+    repository_written = 0
+    repository_existing = 0
+    repository_invalid = 0
     data_files = {path.parent.name: path for path in alphafast_output_dir.glob("*/*_data.json")}
     for index, row in df.iterrows():
         binder_id = str(row.get("binder_id") or "").strip()
@@ -2361,21 +4220,48 @@ def _write_alphafast_msas_to_run_csv(*, run_csv: Path, alphafast_output_dir: Pat
             continue
         payload = json.loads(data_path.read_text())
         binder_chain = str(row.get("binder_chain") or "A").strip() or "A"
+        target_only = _run_csv_is_capacity_target_only(row)
         for sequence in payload.get("sequences", []):
             protein = sequence.get("protein") if isinstance(sequence, dict) else None
             if not isinstance(protein, dict):
                 continue
             chain_id = str(protein.get("id") or "").strip()
-            if not chain_id or chain_id == binder_chain:
+            if not chain_id or (chain_id == binder_chain and not target_only):
                 continue
             current_msa = str(row.get(f"msa_path_{chain_id}") or "").strip()
-            if current_msa and current_msa.lower() != "no_msa" and Path(current_msa).exists():
+            if (
+                current_msa
+                and current_msa.lower() != "no_msa"
+                and Path(current_msa).exists()
+                and _a3m_sequence_count(Path(current_msa)) > 1
+            ):
                 continue
             msa_text = str(protein.get("unpairedMsa") or "").strip()
             if not msa_text:
                 continue
             msa_path = msa_dir / f"{_safe_id(binder_id)}_chain_{_safe_id(chain_id)}_alphafast.a3m"
             msa_path.write_text(msa_text + "\n")
+            raw_sequence = row.get(f"target_subchain_{chain_id}_seq")
+            if raw_sequence is None or pd.isna(raw_sequence) or not str(raw_sequence).strip():
+                raw_sequence = row.get(f"{chain_id}_seq")
+            target_sequence = "" if raw_sequence is None or pd.isna(raw_sequence) else str(raw_sequence).strip()
+            if target_sequence:
+                repository_path, _container_path = target_msa_workflow.boltz_msa_paths(
+                    target_sequence,
+                    msa_repository_dir=Path(msa_repository_dir),
+                )
+                repository_valid, _reason = target_msa_workflow.validate_a3m_file(repository_path)
+                if repository_valid:
+                    repository_existing += 1
+                else:
+                    repository_path.parent.mkdir(parents=True, exist_ok=True)
+                    repository_path.write_text(msa_text + "\n")
+                    repository_valid, _reason = target_msa_workflow.validate_a3m_file(repository_path)
+                    if repository_valid:
+                        repository_written += 1
+                    else:
+                        repository_invalid += 1
+                        repository_path.unlink(missing_ok=True)
             df.loc[index, f"msa_path_{chain_id}"] = str(msa_path)
             written += 1
     df.to_csv(run_csv, index=False)
@@ -2383,6 +4269,10 @@ def _write_alphafast_msas_to_run_csv(*, run_csv: Path, alphafast_output_dir: Pat
         "alphafast_msa_source": str(alphafast_output_dir),
         "alphafast_msa_written_count": written,
         "alphafast_msa_dir": str(msa_dir),
+        "alphafast_msa_repository_dir": str(msa_repository_dir),
+        "alphafast_msa_repository_written_count": repository_written,
+        "alphafast_msa_repository_existing_count": repository_existing,
+        "alphafast_msa_repository_invalid_count": repository_invalid,
     }
 
 
@@ -2399,9 +4289,9 @@ def _apply_msa_repository_to_run_csv(
     limit = int(max_records) if max_records and int(max_records) > 0 else len(df)
     for index, row in df.head(limit).iterrows():
         binder_chain = str(row.get("binder_chain") or "A").strip() or "A"
-        chains = _split_list(row.get("target_chains"))
+        chains = _run_csv_target_msa_chains(row, binder_chain)
         for chain in chains:
-            if not chain or chain == binder_chain:
+            if not chain:
                 continue
             raw_sequence = row.get(f"target_subchain_{chain}_seq")
             if raw_sequence is None or pd.isna(raw_sequence) or not str(raw_sequence).strip():
@@ -2409,15 +4299,23 @@ def _apply_msa_repository_to_run_csv(
             sequence = "" if raw_sequence is None or pd.isna(raw_sequence) else str(raw_sequence).strip()
             if not sequence:
                 continue
-            host_path, _container_path = target_msa_workflow.boltz_msa_paths(sequence, msa_repository_dir=msa_repository_dir)
-            valid, _reason = target_msa_workflow.validate_a3m_file(host_path)
-            if valid:
+            host_path, source = target_msa_workflow.find_cached_msa_for_sequence(
+                sequence,
+                msa_repository_dir=msa_repository_dir,
+            )
+            if host_path is not None:
                 df.loc[index, f"msa_path_{chain}"] = str(host_path)
                 repository_hits += 1
-            elif host_path.exists():
-                invalid += 1
-                repository_misses += 1
+                if source.startswith("sequence_scan"):
+                    preexisting_source_col = f"msa_path_{chain}_cache_source"
+                    df.loc[index, preexisting_source_col] = source
             else:
+                expected_path, _container_path = target_msa_workflow.boltz_msa_paths(
+                    sequence,
+                    msa_repository_dir=msa_repository_dir,
+                )
+                if expected_path.exists():
+                    invalid += 1
                 repository_misses += 1
     df.to_csv(run_csv, index=False)
     return {
@@ -2434,13 +4332,117 @@ def _run_csv_missing_target_msas(run_csv: Path, max_records: int = 0) -> int:
     missing = 0
     for _, row in df.head(limit).iterrows():
         binder_chain = str(row.get("binder_chain") or "A").strip() or "A"
-        for chain in _split_list(row.get("target_chains")):
-            if not chain or chain == binder_chain:
+        for chain in _run_csv_target_msa_chains(row, binder_chain):
+            if not chain:
                 continue
             msa_value = str(row.get(f"msa_path_{chain}") or "").strip()
             if not msa_value or msa_value.lower() == "no_msa" or not Path(msa_value).exists():
                 missing += 1
     return missing
+
+
+def _a3m_sequence_count(path: Path | None) -> int:
+    if path is None or not Path(path).exists():
+        return 0
+    count = 0
+    seen_sequence = False
+    try:
+        for raw_line in Path(path).read_text(errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if seen_sequence:
+                    count += 1
+                seen_sequence = False
+            else:
+                seen_sequence = True
+    except OSError:
+        return 0
+    if seen_sequence:
+        count += 1
+    return count
+
+
+def _run_csv_nonreal_target_msas(run_csv: Path, max_records: int = 0) -> int:
+    df = pd.read_csv(run_csv)
+    limit = int(max_records) if max_records and int(max_records) > 0 else len(df)
+    nonreal = 0
+    for _, row in df.head(limit).iterrows():
+        binder_chain = str(row.get("binder_chain") or "A").strip() or "A"
+        for chain in _run_csv_target_msa_chains(row, binder_chain):
+            if not chain:
+                continue
+            msa_value = str(row.get(f"msa_path_{chain}") or "").strip()
+            if not msa_value or msa_value.lower() == "no_msa":
+                nonreal += 1
+                continue
+            msa_path = Path(msa_value)
+            if not msa_path.exists() or _a3m_sequence_count(msa_path) <= 1:
+                nonreal += 1
+    return nonreal
+
+
+def _repair_colabfold_capacity_target_msas(
+    *,
+    run_csv: Path,
+    output_dir: Path,
+    max_records: int = 0,
+) -> dict[str, Any]:
+    """Make single-chain capacity ColabFold inputs use the real target MSA.
+
+    The shared input generator is binder/design oriented and may emit a
+    query-only ColabFold A3M for target-only capacity rows. For these rows the
+    single chain is the folding target, so the prepared target MSA should be
+    passed through directly.
+    """
+    input_dir = output_dir / "ColabFold" / "input_folder"
+    if not run_csv.exists() or not input_dir.exists():
+        return {}
+    df = pd.read_csv(run_csv)
+    limit = int(max_records) if max_records and int(max_records) > 0 else len(df)
+    repaired = 0
+    already_real = 0
+    missing = 0
+    query_only_before = 0
+    source_nonreal = 0
+    for _, row in df.head(limit).iterrows():
+        if not _run_csv_is_capacity_target_only(row):
+            continue
+        binder_id = str(row.get("binder_id") or "").strip()
+        if not binder_id:
+            continue
+        binder_chain = str(row.get("binder_chain") or "A").strip() or "A"
+        source_value = str(row.get(f"msa_path_{binder_chain}") or "").strip()
+        source_msa = Path(source_value).expanduser() if source_value and source_value.lower() != "no_msa" else None
+        if source_msa is None or not source_msa.exists():
+            missing += 1
+            continue
+        source_count = _a3m_sequence_count(source_msa)
+        if source_count <= 1:
+            source_nonreal += 1
+            continue
+        staged = input_dir / f"{_safe_id(binder_id)}.a3m"
+        if not staged.exists():
+            missing += 1
+            continue
+        staged_count = _a3m_sequence_count(staged)
+        if staged_count <= 1:
+            query_only_before += 1
+        if staged_count > 1:
+            already_real += 1
+            continue
+        shutil.copy2(source_msa, staged)
+        repaired += 1
+    if not (repaired or already_real or missing or query_only_before or source_nonreal):
+        return {}
+    return {
+        "colabfold_capacity_target_msa_repaired_count": repaired,
+        "colabfold_capacity_target_msa_already_real_count": already_real,
+        "colabfold_capacity_target_msa_missing_count": missing,
+        "colabfold_capacity_target_msa_query_only_before_count": query_only_before,
+        "colabfold_capacity_target_msa_source_nonreal_count": source_nonreal,
+    }
 
 
 def _write_chain_msa_map(run_csv: Path, output_path: Path, max_records: int = 0) -> dict[str, Any]:
@@ -2449,17 +4451,41 @@ def _write_chain_msa_map(run_csv: Path, output_path: Path, max_records: int = 0)
     records: list[dict[str, Any]] = []
     msa_present = 0
     msa_missing = 0
+    msa_real = 0
+    msa_query_only = 0
+    msa_empty = 0
     target_chain_count = 0
+    target_msa_blocking_nonreal = 0
+    target_msa_short_nonreal = 0
     for _, row in df.head(limit).iterrows():
         binder_id = str(row.get("binder_id") or "").strip()
         if not binder_id:
             continue
         binder_chain = str(row.get("binder_chain") or "A").strip() or "A"
-        target_chains = [chain for chain in _split_list(row.get("target_chains")) if chain and chain != binder_chain]
+        target_chains = _run_csv_target_msa_chains(row, binder_chain)
         target_entries: list[dict[str, Any]] = []
         for chain in target_chains:
             msa_path = str(row.get(f"msa_path_{chain}") or "").strip()
             has_msa = bool(msa_path and msa_path.lower() != "no_msa" and Path(msa_path).exists())
+            msa_sequence_count = _a3m_sequence_count(Path(msa_path)) if has_msa else 0
+            if not has_msa:
+                msa_status = "missing"
+            elif msa_sequence_count <= 0:
+                msa_status = "empty"
+                msa_empty += 1
+            elif msa_sequence_count == 1:
+                msa_status = "query_only"
+                msa_query_only += 1
+            else:
+                msa_status = "real_msa"
+                msa_real += 1
+            target_length = _safe_int(row.get(f"target_subchain_{chain}_len") or row.get(f"{chain}_length"))
+            real_msa_required = not (target_length and target_length < TARGET_MSA_REQUIRED_MIN_LENGTH)
+            if msa_status != "real_msa":
+                if real_msa_required:
+                    target_msa_blocking_nonreal += 1
+                else:
+                    target_msa_short_nonreal += 1
             if has_msa:
                 msa_present += 1
             else:
@@ -2471,9 +4497,12 @@ def _write_chain_msa_map(run_csv: Path, output_path: Path, max_records: int = 0)
                     "sequence_column": f"target_subchain_{chain}_seq"
                     if f"target_subchain_{chain}_seq" in df.columns
                     else f"{chain}_seq",
-                    "length": _safe_int(row.get(f"target_subchain_{chain}_len") or row.get(f"{chain}_length")),
+                    "length": target_length,
                     "msa_path": msa_path or None,
                     "msa_available": has_msa,
+                    "msa_status": msa_status,
+                    "msa_sequence_count": msa_sequence_count,
+                    "real_msa_required": real_msa_required,
                 }
             )
         records.append(
@@ -2495,6 +4524,12 @@ def _write_chain_msa_map(run_csv: Path, output_path: Path, max_records: int = 0)
             "target_chain_count": target_chain_count,
             "target_msa_available_count": msa_present,
             "target_msa_missing_count": msa_missing,
+            "target_msa_real_count": msa_real,
+            "target_msa_query_only_count": msa_query_only,
+            "target_msa_empty_count": msa_empty,
+            "target_msa_blocking_nonreal_count": target_msa_blocking_nonreal,
+            "target_msa_short_nonreal_count": target_msa_short_nonreal,
+            "target_msa_required_min_length": TARGET_MSA_REQUIRED_MIN_LENGTH,
         },
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2760,8 +4795,7 @@ def _generate_model_inputs_command(*, output_dir: Path, docker_image: str, model
         "docker",
         "run",
         "--rm",
-        "-v",
-        f"{REPO_ROOT}:{REPO_ROOT}",
+        *_repo_and_runs_mounts(),
         "-w",
         str(DE_NOVO_BINDER_SCORING_DIR),
         docker_image,
@@ -2871,7 +4905,7 @@ def _run_colabfold_prediction(
     cache_dir: Path,
     num_recycles: int,
     num_models: int,
-    gpu_device: int,
+    gpu_device: object,
     max_records: int,
     use_target_templates: bool,
     max_template_hits: int,
@@ -2908,11 +4942,9 @@ def _run_colabfold_prediction(
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        f"device={int(gpu_device)}",
+        *docker_gpu_args(gpu_device),
         "--shm-size=32G",
-        "-v",
-        f"{REPO_ROOT}:{REPO_ROOT}",
+        *_repo_and_runs_mounts(),
         "-v",
         f"{cache_dir}:/cache/params:rw",
         "-w",
@@ -2969,8 +5001,7 @@ def _extract_and_summarize_colabfold_outputs(
         "docker",
         "run",
         "--rm",
-        "-v",
-        f"{REPO_ROOT}:{REPO_ROOT}",
+        *_repo_and_runs_mounts(),
         "-w",
         str(DE_NOVO_BINDER_SCORING_DIR),
         docker_image,
@@ -3032,6 +5063,9 @@ def run_de_novo_binder_scoring_dataset(
     input_pdb_dir: Path | None = None,
     source_run_dir: Path | None = None,
     candidates_jsonl: Path | None = None,
+    selected_candidate_ids: list[str] | None = None,
+    target_override_pdb: Path | None = None,
+    target_override_chains: list[str] | None = None,
     mode: str = "pdb_only",
     generate_inputs: bool = True,
     models: list[str] | None = None,
@@ -3046,6 +5080,7 @@ def run_de_novo_binder_scoring_dataset(
     run_af2_initial_guess: bool = False,
     af2_num_recycles: int = 3,
     af2_multimer: bool = True,
+    af2_use_initial_guess: bool = False,
     af2_use_binder_template: bool = False,
     af2_use_interface_template: bool = False,
     run_boltz2_initial_guess: bool = False,
@@ -3075,17 +5110,20 @@ def run_de_novo_binder_scoring_dataset(
     colabfold_cache_dir: Path = COLABFOLD_CACHE_DIR,
     colabfold_msa_source: str = "msa_repository_then_alphafast_mmseqs_gpu",
     msa_repository_dir: Path = MSA_REPOSITORY_DIR,
+    require_real_target_msa: bool = True,
     colabfold_num_recycles: int = 3,
     colabfold_num_models: int = 3,
     colabfold_use_target_templates: bool = True,
     colabfold_max_template_hits: int = 4,
-    colabfold_gpu_device: int = 0,
+    colabfold_gpu_device: object = 0,
     run_alphafast_af3: bool = False,
     alphafast_db_dir: Path = ALPHAFAST_DB_DIR,
     alphafast_weights_dir: Path = ALPHAFAST_WEIGHTS_DIR,
     alphafast_batch_size: int = 0,
     alphafast_num_recycles: int = 10,
-    alphafast_gpu_device: int = 0,
+    alphafast_query_only_msa: bool = False,
+    alphafast_gpu_device: object = 0,
+    gpu_device: object | None = None,
     max_records: int = 0,
     num_loops: int = 3,
     num_sampling_steps: int = 32,
@@ -3094,9 +5132,14 @@ def run_de_novo_binder_scoring_dataset(
     docker_image: str = SCORING_SCRIPTS_IMAGE,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     existing_job: JobPaths | None = None,
+    resume: bool = False,
     job_type: str = "de_novo_binder_scoring_dataset",
     tool_name: str = "de_novo_binder_scoring_scripts",
 ) -> Path:
+    selected_gpu_device = normalize_gpu_device(gpu_device if gpu_device is not None else alphafast_gpu_device)
+    if gpu_device is not None:
+        colabfold_gpu_device = gpu_device
+        alphafast_gpu_device = gpu_device
     msa_source = str(colabfold_msa_source or "msa_repository_then_alphafast_mmseqs_gpu")
     msa_consuming_engines = bool(
         run_colabfold
@@ -3122,9 +5165,13 @@ def run_de_novo_binder_scoring_dataset(
         "input_pdb_dir": str(input_pdb_dir) if input_pdb_dir else None,
         "source_run_dir": str(source_run_dir) if source_run_dir else None,
         "candidates_jsonl": str(candidates_jsonl) if candidates_jsonl else None,
+        "selected_candidate_ids": list(selected_candidate_ids or []),
+        "target_override_pdb": str(target_override_pdb) if target_override_pdb else None,
+        "target_override_chains": list(target_override_chains or []),
     }
+    evaluation_mode = "refolding_validation" if candidates_jsonl else "binder_benchmark"
     params_payload = {
-        "evaluation_mode": "refolding_validation" if candidates_jsonl else "binder_benchmark",
+        "evaluation_mode": evaluation_mode,
         "mode": mode,
         "generate_inputs": generate_inputs,
         "models": selected_models,
@@ -3139,6 +5186,7 @@ def run_de_novo_binder_scoring_dataset(
         "run_af2_initial_guess": run_af2_initial_guess,
         "af2_num_recycles": af2_num_recycles,
         "af2_multimer": af2_multimer,
+        "af2_use_initial_guess": af2_use_initial_guess,
         "af2_use_binder_template": af2_use_binder_template,
         "af2_use_interface_template": af2_use_interface_template,
         "run_boltz2_initial_guess": run_boltz2_initial_guess,
@@ -3171,6 +5219,8 @@ def run_de_novo_binder_scoring_dataset(
         "colabfold_msa_source": msa_source,
         "shared_msa_source": msa_source,
         "msa_repository_dir": str(msa_repository_dir),
+        "require_real_target_msa": bool(require_real_target_msa),
+        "gpu_device": selected_gpu_device,
         "colabfold_num_recycles": colabfold_num_recycles,
         "colabfold_num_models": colabfold_num_models,
         "colabfold_use_target_templates": colabfold_use_target_templates,
@@ -3182,9 +5232,12 @@ def run_de_novo_binder_scoring_dataset(
         "alphafast_weights_dir": str(alphafast_weights_dir),
         "alphafast_batch_size": alphafast_batch_size,
         "alphafast_num_recycles": alphafast_num_recycles,
+        "alphafast_query_only_msa": bool(alphafast_query_only_msa),
         "alphafast_gpu_device": alphafast_gpu_device,
         "max_records": max_records,
+        "selected_candidate_count": len(selected_candidate_ids or []),
         "docker_image": docker_image,
+        "resume": bool(resume),
     }
     if existing_job is None:
         job = create_job(
@@ -3208,7 +5261,11 @@ def run_de_novo_binder_scoring_dataset(
     update_status(job.run_dir, "running")
     raw_dir = job.run_dir / "artifacts" / "raw" / "de_novo_binder_scoring"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    if candidates_jsonl is not None:
+    output_dir = raw_dir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prepared_run_csv = output_dir / "run.csv"
+    resume_prepared_inputs = bool(resume and prepared_run_csv.exists() and _csv_data_row_count(prepared_run_csv) > 0)
+    if candidates_jsonl is not None and not resume_prepared_inputs:
         if source_run_dir is None:
             raise ValueError("source_run_dir is required when candidates_jsonl is provided.")
         candidate_stage_dir = job.run_dir / "artifacts" / "queued_inputs" / "candidate_repo_dataset"
@@ -3217,6 +5274,9 @@ def run_de_novo_binder_scoring_dataset(
             candidates_jsonl=Path(candidates_jsonl),
             staged_dir=candidate_stage_dir,
             max_candidates=int(max_records or 0),
+            selected_candidate_ids=list(selected_candidate_ids or []),
+            target_override_pdb=Path(target_override_pdb) if target_override_pdb else None,
+            target_override_chains=list(target_override_chains or []),
         )
         input_payload["input_csv"] = str(input_csv)
         input_payload["input_pdb_dir"] = str(input_pdb_dir)
@@ -3230,16 +5290,24 @@ def run_de_novo_binder_scoring_dataset(
                 "params": params_payload,
             },
         )
-    staged_csv, staged_pdb_dir = _stage_repo_format_inputs(
-        raw_dir=raw_dir,
-        input_zip=input_zip,
-        input_zip_bytes=input_zip_bytes,
-        input_csv=input_csv,
-        input_csv_text=input_csv_text,
-        input_pdb_dir=input_pdb_dir,
-    )
-    output_dir = raw_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if resume_prepared_inputs:
+        staged_csv = raw_dir / "dataset" / "input.csv"
+        staged_pdb_dir = raw_dir / "dataset" / "input_pdbs"
+        if not staged_csv.exists():
+            staged_csv = None
+        if not staged_pdb_dir.exists():
+            staged_pdb_dir = output_dir / "input_pdbs"
+        if not staged_pdb_dir.exists():
+            staged_pdb_dir = None
+    else:
+        staged_csv, staged_pdb_dir = _stage_repo_format_inputs(
+            raw_dir=raw_dir,
+            input_zip=input_zip,
+            input_zip_bytes=input_zip_bytes,
+            input_csv=input_csv,
+            input_csv_text=input_csv_text,
+            input_pdb_dir=input_pdb_dir,
+        )
     progress_total = sum(
         1
         for enabled in [
@@ -3272,8 +5340,7 @@ def run_de_novo_binder_scoring_dataset(
         "docker",
         "run",
         "--rm",
-        "-v",
-        f"{REPO_ROOT}:{REPO_ROOT}",
+        *_repo_and_runs_mounts(),
         "-w",
         str(DE_NOVO_BINDER_SCORING_DIR),
         docker_image,
@@ -3294,18 +5361,30 @@ def run_de_novo_binder_scoring_dataset(
             finish_job(job.run_dir, False, {"metrics": {"error": "input_csv missing"}})
             raise ValueError("Repo-format benchmark needs input.csv for hybrid or seq_only_csv mode.")
         process_cmd.extend(["--input_csv", str(staged_csv)])
-    write_json(job.run_dir / "command.json", {"mode": "docker", "commands": [process_cmd]})
-    return_code = _run_docker_command(job.run_dir, process_cmd)
-    if return_code != 0:
-        finish_job(job.run_dir, False, {"metrics": {"process_inputs_return_code": return_code}})
-        raise RuntimeError(f"de_novo_binder_scoring process_inputs failed with return code {return_code}.")
-    commands = [process_cmd]
+    if resume_prepared_inputs:
+        existing_commands = read_json(job.run_dir / "command.json").get("commands")
+        commands = list(existing_commands) if isinstance(existing_commands, list) else []
+    else:
+        write_json(job.run_dir / "command.json", {"mode": "docker", "commands": [process_cmd]})
+        return_code = _run_docker_command(job.run_dir, process_cmd)
+        if return_code != 0:
+            finish_job(job.run_dir, False, {"metrics": {"process_inputs_return_code": return_code}})
+            raise RuntimeError(f"de_novo_binder_scoring process_inputs failed with return code {return_code}.")
+        commands = [process_cmd]
     run_csv = output_dir / "run.csv"
+    if not resume_prepared_inputs and staged_pdb_dir is not None and staged_pdb_dir.exists():
+        canonical_input_dir = output_dir / "input_pdbs"
+        canonical_input_dir.mkdir(parents=True, exist_ok=True)
+        for source in staged_pdb_dir.glob("*.pdb"):
+            shutil.copy2(source, canonical_input_dir / source.name)
+            chain_map = source.with_suffix(".chain_map.json")
+            if chain_map.exists():
+                shutil.copy2(chain_map, canonical_input_dir / chain_map.name)
     pre_input_metrics: dict[str, Any] = {}
     pre_input_metrics.update(_apply_staged_csv_metadata_to_run_csv(run_csv, staged_csv))
     runtime_size = _run_csv_runtime_size(run_csv, max_records=int(max_records)) if run_csv.exists() else {"candidate_count": 0}
     alphafast_data_pipeline_done = False
-    if msa_consuming_engines and msa_source != "repo_run_csv" and run_csv.exists():
+    if not resume_prepared_inputs and msa_consuming_engines and msa_source != "repo_run_csv" and run_csv.exists():
         progress_step += 1
         _emit_benchmark_progress(
             job.run_dir,
@@ -3325,15 +5404,24 @@ def run_de_novo_binder_scoring_dataset(
                 )
             )
         pre_input_metrics["msa_repository_missing_after_lookup"] = _run_csv_missing_target_msas(run_csv, max_records=int(max_records))
-        if msa_source == "msa_repository" and pre_input_metrics["msa_repository_missing_after_lookup"]:
+        pre_input_metrics["msa_repository_nonreal_after_lookup"] = _run_csv_nonreal_target_msas(run_csv, max_records=int(max_records))
+        repository_block_count = (
+            pre_input_metrics["msa_repository_nonreal_after_lookup"]
+            if require_real_target_msa
+            else pre_input_metrics["msa_repository_missing_after_lookup"]
+        )
+        if msa_source == "msa_repository" and repository_block_count:
             finish_job(job.run_dir, False, {"metrics": pre_input_metrics})
             raise RuntimeError(
-                "MSA repository mode was selected, but some selected target-chain MSAs are missing. "
+                "MSA repository mode was selected, but some selected target-chain MSAs are missing or query-only. "
                 "Use repository-then-AlphaFast/MMseqs to fill misses with the local MMseqs GPU pipeline."
             )
         use_alphafast_msa = msa_source == "alphafast_mmseqs_gpu" or (
             msa_source == "msa_repository_then_alphafast_mmseqs_gpu"
-            and pre_input_metrics["msa_repository_missing_after_lookup"] > 0
+            and (
+                pre_input_metrics["msa_repository_missing_after_lookup"] > 0
+                or pre_input_metrics["msa_repository_nonreal_after_lookup"] > 0
+            )
         )
         if use_alphafast_msa:
             af3_input_dir = output_dir / "AF3" / "input_folder"
@@ -3358,7 +5446,7 @@ def run_de_novo_binder_scoring_dataset(
                 output_dir=af3_output_dir,
                 db_dir=Path(alphafast_db_dir).expanduser(),
                 batch_size=int(alphafast_batch_size),
-                gpu_device=int(alphafast_gpu_device),
+                gpu_device=alphafast_gpu_device,
                 max_records=int(max_records),
                 image=ALPHAFAST_IMAGE,
             )
@@ -3375,17 +5463,42 @@ def run_de_novo_binder_scoring_dataset(
                     run_csv=run_csv,
                     alphafast_output_dir=af3_output_dir,
                     output_dir=output_dir,
+                    msa_repository_dir=Path(msa_repository_dir).expanduser(),
                 )
             )
             pre_input_metrics["shared_msa_missing_after_generation"] = _run_csv_missing_target_msas(run_csv, max_records=int(max_records))
+            pre_input_metrics["shared_msa_nonreal_after_generation"] = _run_csv_nonreal_target_msas(run_csv, max_records=int(max_records))
     if run_csv.exists():
+        chain_msa_path = job.run_dir / "artifacts" / "benchmark" / "chain_msa_map.json"
         chain_msa_summary = _write_chain_msa_map(
             run_csv,
-            job.run_dir / "artifacts" / "benchmark" / "chain_msa_map.json",
+            chain_msa_path,
             max_records=int(max_records),
         )
+        shutil.copy2(chain_msa_path, job.run_dir / "artifacts" / "benchmark" / "target_msa_manifest.json")
         pre_input_metrics.update({f"chain_msa_{key}": value for key, value in chain_msa_summary.items()})
-    if generate_inputs:
+        if msa_consuming_engines and require_real_target_msa:
+            nonreal_count = int(chain_msa_summary.get("target_msa_blocking_nonreal_count") or 0)
+            pre_input_metrics["shared_msa_nonreal_final_count"] = nonreal_count
+            if nonreal_count > 0:
+                finish_job(
+                    job.run_dir,
+                    False,
+                    {
+                        "outputs": {
+                            "run_csv": str(run_csv.relative_to(job.run_dir)) if run_csv.exists() else None,
+                            "chain_msa_map": "artifacts/benchmark/chain_msa_map.json",
+                            "target_msa_manifest": "artifacts/benchmark/target_msa_manifest.json",
+                        },
+                        "metrics": pre_input_metrics,
+                    },
+                )
+                raise RuntimeError(
+                    f"{nonreal_count} selected protein target-chain MSA(s) are missing, empty, or query-only after shared MSA preparation. "
+                    f"Short target chains under {TARGET_MSA_REQUIRED_MIN_LENGTH} residues are allowed without a real MSA. "
+                    "Prediction was stopped before engine input generation because real target MSAs are required for protein targets."
+                )
+    if generate_inputs and not resume_prepared_inputs:
         progress_step += 1
         _emit_benchmark_progress(
             job.run_dir,
@@ -3406,6 +5519,14 @@ def run_de_novo_binder_scoring_dataset(
         if return_code != 0:
             finish_job(job.run_dir, False, {"metrics": {"generate_model_inputs_return_code": return_code}})
             raise RuntimeError(f"de_novo_binder_scoring generate_model_inputs failed with return code {return_code}.")
+        if run_colabfold and run_csv.exists():
+            pre_input_metrics.update(
+                _repair_colabfold_capacity_target_msas(
+                    run_csv=run_csv,
+                    output_dir=output_dir,
+                    max_records=int(max_records),
+                )
+            )
     metric_csvs: list[Path] = []
     if run_pyrosetta_input_metrics:
         progress_step += 1
@@ -3417,12 +5538,43 @@ def run_de_novo_binder_scoring_dataset(
             total_steps=progress_total,
             progress_callback=progress_callback,
         )
-        rosetta_cmd = [
+        existing_input_rosetta = output_dir / "input_rosetta_metrics.csv"
+        if resume_prepared_inputs and existing_input_rosetta.exists():
+            metric_csvs.append(existing_input_rosetta)
+            pre_input_metrics["input_rosetta_resumed_from_artifacts"] = True
+        else:
+            input_group_roles = _benchmark_group_roles(run_csv)
+            input_metric_dir, input_metric_count = _stage_input_pdbs_for_group_metrics(
+                output_dir / "input_pdbs",
+                job.run_dir / "artifacts" / "benchmark" / "predicted_metric_pdbs" / "input",
+                input_group_roles,
+            )
+            pre_input_metrics["input_rosetta_evaluation_contract"] = {
+                "binder_group": "declared binder chains normalized to A",
+                "target_group": "all declared target chains normalized together to B",
+                "source_structures_modified": False,
+            }
+            pre_input_metrics["input_rosetta_evaluation_pdb_count"] = input_metric_count
+            if input_metric_dir is None:
+                finish_job(
+                    job.run_dir,
+                    False,
+                    {
+                        "metrics": {
+                            **pre_input_metrics,
+                            "error": "No input structures could be normalized for PyRosetta evaluation.",
+                        }
+                    },
+                )
+                raise RuntimeError(
+                    "No input structures could be normalized to binder A / combined target B "
+                    "for PyRosetta evaluation."
+                )
+            rosetta_cmd = [
             "docker",
             "run",
             "--rm",
-            "-v",
-            f"{REPO_ROOT}:{REPO_ROOT}",
+            *_repo_and_runs_mounts(),
             "-w",
             str(DE_NOVO_BINDER_SCORING_DIR),
             PYROSETTA_METRICS_IMAGE,
@@ -3433,19 +5585,19 @@ def run_de_novo_binder_scoring_dataset(
             "--out-csv",
             str(output_dir / "input_rosetta_metrics.csv"),
             "--folder",
-            f"input:{output_dir / 'input_pdbs'}",
+            f"input:{input_metric_dir}",
             "--nprocs",
             str(max(1, int(pyrosetta_nprocs))),
             "--dalphaball-path",
             "./functions/DAlphaBall.gcc",
-        ]
-        commands.append(rosetta_cmd)
-        write_json(job.run_dir / "command.json", {"mode": "docker", "commands": commands})
-        return_code = _run_docker_command(job.run_dir, rosetta_cmd)
-        if return_code != 0:
-            finish_job(job.run_dir, False, {"metrics": {"pyrosetta_input_metrics_return_code": return_code}})
-            raise RuntimeError(f"de_novo_binder_scoring PyRosetta input metrics failed with return code {return_code}.")
-        metric_csvs.append(output_dir / "input_rosetta_metrics.csv")
+            ]
+            commands.append(rosetta_cmd)
+            write_json(job.run_dir / "command.json", {"mode": "docker", "commands": commands})
+            return_code = _run_docker_command(job.run_dir, rosetta_cmd)
+            if return_code != 0:
+                finish_job(job.run_dir, False, {"metrics": {"pyrosetta_input_metrics_return_code": return_code}})
+                raise RuntimeError(f"de_novo_binder_scoring PyRosetta input metrics failed with return code {return_code}.")
+            metric_csvs.append(output_dir / "input_rosetta_metrics.csv")
     metrics: dict[str, Any] = {
         "process_inputs_return_code": 0,
         "input_generation_done": bool(generate_inputs),
@@ -3490,33 +5642,44 @@ def run_de_novo_binder_scoring_dataset(
             total_steps=progress_total,
             progress_callback=progress_callback,
         )
-        started_at = time.monotonic()
-        esm_csv_text = _repo_run_csv_to_esmfold2_csv(job.run_dir, run_csv)
-        if esm_csv_text.strip() and len(esm_csv_text.splitlines()) > 1:
-            child_run = run_esmfold2_binder_benchmark(
-                input_csv_text=esm_csv_text,
-                modes=esmfold2_modes or ["initial_guess"],
-                max_records=max_records,
-                num_loops=num_loops,
-                num_sampling_steps=num_sampling_steps,
-                seed=seed,
-                device=device,
-                use_target_msa=bool(esmfold2_use_target_msa),
-                use_docker=True,
-                internal_parent_run_dir=job.run_dir,
-            )
-            esmfold2_child_runs.append(str(child_run))
-            esmfold2_table, esmfold2_summary_path, esmfold2_summary = _summarize_child_candidate_metrics(
-                parent_run_dir=job.run_dir,
-                child_run_dir=child_run,
-                output_prefix="esmfold2",
-            )
-            if esmfold2_table is not None:
-                metrics["esmfold2_metrics_table"] = str(esmfold2_table.relative_to(job.run_dir))
-                metric_csvs.append(esmfold2_table)
-            if esmfold2_summary_path is not None:
-                metrics["esmfold2_summary"] = str(esmfold2_summary_path.relative_to(job.run_dir))
-        _record_runtime_timing(metrics, "esmfold2", started_at, **runtime_size)
+        existing_table = job.run_dir / "artifacts" / "benchmark" / "esmfold2_metrics.csv"
+        if resume and _csv_data_row_count(existing_table) == int(metrics.get("record_count") or 0):
+            metric_csvs.append(existing_table)
+            esmfold2_child_runs.extend(_completed_benchmark_child_runs(job.run_dir, "esmfold2"))
+            esmfold2_summary = read_json(job.run_dir / "artifacts" / "benchmark" / "esmfold2_feature_summary.json")
+            metrics["esmfold2_metrics_table"] = str(existing_table.relative_to(job.run_dir))
+            metrics["esmfold2_resumed_from_artifacts"] = True
+            started_at = None
+        else:
+            started_at = time.monotonic()
+        if started_at is not None:
+            esm_csv_text = _repo_run_csv_to_esmfold2_csv(job.run_dir, run_csv)
+            if esm_csv_text.strip() and len(esm_csv_text.splitlines()) > 1:
+                child_run = run_esmfold2_binder_benchmark(
+                    input_csv_text=esm_csv_text,
+                    modes=esmfold2_modes or ["initial_guess"],
+                    max_records=max_records,
+                    num_loops=num_loops,
+                    num_sampling_steps=num_sampling_steps,
+                    seed=seed,
+                    device=device,
+                    gpu_device=selected_gpu_device,
+                    use_target_msa=bool(esmfold2_use_target_msa),
+                    use_docker=True,
+                    internal_parent_run_dir=job.run_dir,
+                )
+                esmfold2_child_runs.append(str(child_run))
+                esmfold2_table, esmfold2_summary_path, esmfold2_summary = _summarize_child_candidate_metrics(
+                    parent_run_dir=job.run_dir,
+                    child_run_dir=child_run,
+                    output_prefix="esmfold2",
+                )
+                if esmfold2_table is not None:
+                    metrics["esmfold2_metrics_table"] = str(esmfold2_table.relative_to(job.run_dir))
+                    metric_csvs.append(esmfold2_table)
+                if esmfold2_summary_path is not None:
+                    metrics["esmfold2_summary"] = str(esmfold2_summary_path.relative_to(job.run_dir))
+            _record_runtime_timing(metrics, "esmfold2", started_at, **runtime_size)
     if run_af2_initial_guess and run_csv.exists():
         progress_step += 1
         _emit_benchmark_progress(
@@ -3527,31 +5690,43 @@ def run_de_novo_binder_scoring_dataset(
             total_steps=progress_total,
             progress_callback=progress_callback,
         )
-        started_at = time.monotonic()
-        benchmark_candidates = _repo_run_csv_to_candidates(job.run_dir, run_csv, max_records=max_records)
-        child_run = refolding_workflow.run_af2_initial_guess_complex_refolding(
-            source_run_dir=job.run_dir,
-            candidates_jsonl=benchmark_candidates,
-            require_monomer_success=False,
-            num_recycles=int(af2_num_recycles),
-            multimer=bool(af2_multimer),
-            use_binder_template=bool(af2_use_binder_template),
-            use_interface_template=bool(af2_use_interface_template),
-            docker_image=AF2_INITIAL_GUESS_IMAGE,
-            internal_parent_run_dir=job.run_dir,
-        )
-        af2_initial_guess_child_runs.append(str(child_run))
-        af2_table, af2_summary_path, af2_summary = _summarize_child_candidate_metrics(
-            parent_run_dir=job.run_dir,
-            child_run_dir=child_run,
-            output_prefix="af2_initial_guess",
-        )
-        if af2_table is not None:
-            metrics["af2_initial_guess_metrics_table"] = str(af2_table.relative_to(job.run_dir))
-            metric_csvs.append(af2_table)
-        if af2_summary_path is not None:
-            metrics["af2_initial_guess_summary"] = str(af2_summary_path.relative_to(job.run_dir))
-        _record_runtime_timing(metrics, "af2_initial_guess", started_at, **runtime_size)
+        existing_table = job.run_dir / "artifacts" / "benchmark" / "af2_initial_guess_metrics.csv"
+        if resume and _csv_data_row_count(existing_table) == int(metrics.get("record_count") or 0):
+            metric_csvs.append(existing_table)
+            af2_initial_guess_child_runs.extend(_completed_benchmark_child_runs(job.run_dir, "af2_initial_guess"))
+            af2_summary = read_json(job.run_dir / "artifacts" / "benchmark" / "af2_initial_guess_feature_summary.json")
+            metrics["af2_initial_guess_metrics_table"] = str(existing_table.relative_to(job.run_dir))
+            metrics["af2_initial_guess_resumed_from_artifacts"] = True
+            started_at = None
+        else:
+            started_at = time.monotonic()
+        if started_at is not None:
+            benchmark_candidates = _repo_run_csv_to_candidates(job.run_dir, run_csv, max_records=max_records)
+            child_run = refolding_workflow.run_af2_initial_guess_complex_refolding(
+                source_run_dir=job.run_dir,
+                candidates_jsonl=benchmark_candidates,
+                require_monomer_success=False,
+                num_recycles=int(af2_num_recycles),
+                multimer=bool(af2_multimer),
+                use_initial_guess=bool(af2_use_initial_guess),
+                use_binder_template=bool(af2_use_binder_template),
+                use_interface_template=bool(af2_use_interface_template),
+                docker_image=AF2_INITIAL_GUESS_IMAGE,
+                internal_parent_run_dir=job.run_dir,
+                gpu_device=selected_gpu_device,
+            )
+            af2_initial_guess_child_runs.append(str(child_run))
+            af2_table, af2_summary_path, af2_summary = _summarize_child_candidate_metrics(
+                parent_run_dir=job.run_dir,
+                child_run_dir=child_run,
+                output_prefix="af2_initial_guess",
+            )
+            if af2_table is not None:
+                metrics["af2_initial_guess_metrics_table"] = str(af2_table.relative_to(job.run_dir))
+                metric_csvs.append(af2_table)
+            if af2_summary_path is not None:
+                metrics["af2_initial_guess_summary"] = str(af2_summary_path.relative_to(job.run_dir))
+            _record_runtime_timing(metrics, "af2_initial_guess", started_at, **runtime_size)
     if run_boltz2_initial_guess and run_csv.exists():
         progress_step += 1
         _emit_benchmark_progress(
@@ -3562,32 +5737,43 @@ def run_de_novo_binder_scoring_dataset(
             total_steps=progress_total,
             progress_callback=progress_callback,
         )
-        started_at = time.monotonic()
-        benchmark_candidates = _repo_run_csv_to_candidates(job.run_dir, run_csv, max_records=max_records)
-        child_run = refolding_workflow.run_boltz2_complex_refolding(
-            source_run_dir=job.run_dir,
-            candidates_jsonl=benchmark_candidates,
-            require_monomer_success=False,
-            use_target_template=bool(boltz2_use_target_template),
-            recycling_steps=int(boltz2_recycling_steps),
-            sampling_steps=int(boltz2_sampling_steps),
-            diffusion_samples=int(boltz2_diffusion_samples),
-            write_full_pae=bool(boltz2_write_full_pae),
-            internal_parent_run_dir=job.run_dir,
-            benchmark_run_csv=run_csv if boltz2_use_target_msa else None,
-        )
-        boltz2_initial_guess_child_runs.append(str(child_run))
-        boltz2_table, boltz2_summary_path, boltz2_summary = _summarize_child_candidate_metrics(
-            parent_run_dir=job.run_dir,
-            child_run_dir=child_run,
-            output_prefix="boltz2_initial_guess",
-        )
-        if boltz2_table is not None:
-            metrics["boltz2_initial_guess_metrics_table"] = str(boltz2_table.relative_to(job.run_dir))
-            metric_csvs.append(boltz2_table)
-        if boltz2_summary_path is not None:
-            metrics["boltz2_initial_guess_summary"] = str(boltz2_summary_path.relative_to(job.run_dir))
-        _record_runtime_timing(metrics, "boltz2_initial_guess", started_at, **runtime_size)
+        existing_table = job.run_dir / "artifacts" / "benchmark" / "boltz2_initial_guess_metrics.csv"
+        if resume and _csv_data_row_count(existing_table) == int(metrics.get("record_count") or 0):
+            metric_csvs.append(existing_table)
+            boltz2_initial_guess_child_runs.extend(_completed_benchmark_child_runs(job.run_dir, "boltz2"))
+            boltz2_summary = read_json(job.run_dir / "artifacts" / "benchmark" / "boltz2_initial_guess_feature_summary.json")
+            metrics["boltz2_initial_guess_metrics_table"] = str(existing_table.relative_to(job.run_dir))
+            metrics["boltz2_initial_guess_resumed_from_artifacts"] = True
+            started_at = None
+        else:
+            started_at = time.monotonic()
+        if started_at is not None:
+            benchmark_candidates = _repo_run_csv_to_candidates(job.run_dir, run_csv, max_records=max_records)
+            child_run = refolding_workflow.run_boltz2_complex_refolding(
+                source_run_dir=job.run_dir,
+                candidates_jsonl=benchmark_candidates,
+                require_monomer_success=False,
+                use_target_template=bool(boltz2_use_target_template),
+                recycling_steps=int(boltz2_recycling_steps),
+                sampling_steps=int(boltz2_sampling_steps),
+                diffusion_samples=int(boltz2_diffusion_samples),
+                write_full_pae=bool(boltz2_write_full_pae),
+                internal_parent_run_dir=job.run_dir,
+                benchmark_run_csv=run_csv if boltz2_use_target_msa else None,
+                gpu_device=selected_gpu_device,
+            )
+            boltz2_initial_guess_child_runs.append(str(child_run))
+            boltz2_table, boltz2_summary_path, boltz2_summary = _summarize_child_candidate_metrics(
+                parent_run_dir=job.run_dir,
+                child_run_dir=child_run,
+                output_prefix="boltz2_initial_guess",
+            )
+            if boltz2_table is not None:
+                metrics["boltz2_initial_guess_metrics_table"] = str(boltz2_table.relative_to(job.run_dir))
+                metric_csvs.append(boltz2_table)
+            if boltz2_summary_path is not None:
+                metrics["boltz2_initial_guess_summary"] = str(boltz2_summary_path.relative_to(job.run_dir))
+            _record_runtime_timing(metrics, "boltz2_initial_guess", started_at, **runtime_size)
     extra_engine_specs = [
         (
             bool(run_rf3),
@@ -3607,6 +5793,7 @@ def run_de_novo_binder_scoring_dataset(
                 seed=int(rf3_seed),
                 benchmark_run_csv=run_csv if rf3_use_target_msa else None,
                 internal_parent_run_dir=job.run_dir,
+                gpu_device=selected_gpu_device,
             ),
         ),
         (
@@ -3625,6 +5812,8 @@ def run_de_novo_binder_scoring_dataset(
                 diffusion_steps=int(protenix_diffusion_steps),
                 samples=int(protenix_samples),
                 internal_parent_run_dir=job.run_dir,
+                existing_job=_recoverable_benchmark_child_job(job.run_dir, "protenix") if resume else None,
+                gpu_device=selected_gpu_device,
             ),
         ),
         (
@@ -3641,6 +5830,7 @@ def run_de_novo_binder_scoring_dataset(
                 sampling_steps=int(boltzgen_sampling_steps),
                 diffusion_samples=int(boltzgen_diffusion_samples),
                 internal_parent_run_dir=job.run_dir,
+                gpu_device=selected_gpu_device,
             ),
         ),
     ]
@@ -3656,10 +5846,40 @@ def run_de_novo_binder_scoring_dataset(
             total_steps=progress_total,
             progress_callback=progress_callback,
         )
+        existing_table = job.run_dir / "artifacts" / "benchmark" / f"{engine_key}_metrics.csv"
+        if resume and _csv_data_row_count(existing_table) == int(metrics.get("record_count") or 0):
+            metric_csvs.append(existing_table)
+            child_runs.extend(_completed_benchmark_child_runs(job.run_dir, engine_key))
+            summary_target.update(read_json(job.run_dir / "artifacts" / "benchmark" / f"{engine_key}_feature_summary.json"))
+            metrics[f"{engine_key}_metrics_table"] = str(existing_table.relative_to(job.run_dir))
+            metrics[f"{engine_key}_resumed_from_artifacts"] = True
+            continue
         started_at = time.monotonic()
         benchmark_candidates = _repo_run_csv_to_candidates(job.run_dir, run_csv, max_records=max_records)
         child_run = runner(benchmark_candidates)
         child_runs.append(str(child_run))
+        child_result = read_json(Path(child_run) / "result.json")
+        child_metrics = (
+            child_result.get("metrics")
+            if isinstance(child_result.get("metrics"), dict)
+            else {}
+        )
+        child_candidate_count = int(child_metrics.get("candidate_count") or 0)
+        if child_result.get("success") is not True or child_candidate_count <= 0:
+            return_code = child_metrics.get("return_code")
+            failure_message = (
+                f"{display_name} produced no predicted structures"
+                if child_candidate_count <= 0
+                else f"{display_name} subrun failed"
+            )
+            if return_code not in (None, ""):
+                failure_message += f" with return code {return_code}"
+            metrics[f"{engine_key}_return_code"] = return_code
+            metrics[f"{engine_key}_candidate_count"] = child_candidate_count
+            metrics[f"{engine_key}_child_run"] = str(child_run)
+            metrics["worker_error"] = failure_message
+            finish_job(job.run_dir, False, {"metrics": metrics})
+            raise RuntimeError(failure_message)
         table, summary_path, summary = _summarize_child_candidate_metrics(
             parent_run_dir=job.run_dir,
             child_run_dir=child_run,
@@ -3682,46 +5902,71 @@ def run_de_novo_binder_scoring_dataset(
             total_steps=progress_total,
             progress_callback=progress_callback,
         )
-        colabfold_started_at = time.monotonic()
-        metrics["colabfold_msa_source"] = msa_source
-        metrics["colabfold_use_target_templates"] = bool(colabfold_use_target_templates)
-        metrics["colabfold_max_template_hits"] = int(colabfold_max_template_hits)
-        rc, selected_count, template_count, colabfold_commands = _run_colabfold_prediction(
-            job_run_dir=job.run_dir,
-            run_csv=run_csv,
-            output_dir=output_dir,
-            cache_dir=Path(colabfold_cache_dir).expanduser(),
-            num_recycles=int(colabfold_num_recycles),
-            num_models=int(colabfold_num_models),
-            gpu_device=int(colabfold_gpu_device),
-            max_records=int(max_records),
-            use_target_templates=bool(colabfold_use_target_templates),
-            max_template_hits=int(colabfold_max_template_hits),
-            image=COLABFOLD_IMAGE,
-        )
-        commands.extend(colabfold_commands)
-        write_json(job.run_dir / "command.json", {"mode": "docker", "commands": commands})
-        metrics["colabfold_return_code"] = rc
-        metrics["colabfold_selected_count"] = selected_count
-        metrics["colabfold_target_template_count"] = template_count
-        metrics["colabfold_output_dir"] = str((output_dir / "ColabFold" / "ptm_output").relative_to(job.run_dir))
-        if rc != 0:
-            finish_job(job.run_dir, False, {"metrics": metrics})
-            raise RuntimeError(f"ColabFold benchmark failed with return code {rc}.")
-        colab_table, colab_summary_path, colabfold_summary, extract_commands = _extract_and_summarize_colabfold_outputs(
-            parent_run_dir=job.run_dir,
-            run_csv=run_csv,
-            output_dir=output_dir,
-            docker_image=docker_image,
-        )
-        commands.extend(extract_commands)
-        write_json(job.run_dir / "command.json", {"mode": "docker", "commands": commands})
-        if colab_table is not None:
-            metrics["colabfold_metrics_table"] = str(colab_table.relative_to(job.run_dir))
-            metric_csvs.append(colab_table)
-        if colab_summary_path is not None:
-            metrics["colabfold_summary"] = str(colab_summary_path.relative_to(job.run_dir))
-        _record_runtime_timing(metrics, "colabfold", colabfold_started_at, **runtime_size)
+        existing_table = job.run_dir / "artifacts" / "benchmark" / "colabfold_metrics.csv"
+        if resume and _csv_data_row_count(existing_table) == int(metrics.get("record_count") or 0):
+            metric_csvs.append(existing_table)
+            colabfold_summary = read_json(job.run_dir / "artifacts" / "benchmark" / "colabfold_feature_summary.json")
+            metrics["colabfold_metrics_table"] = str(existing_table.relative_to(job.run_dir))
+            metrics["colabfold_resumed_from_artifacts"] = True
+            colabfold_started_at = None
+        else:
+            colabfold_started_at = time.monotonic()
+        if colabfold_started_at is not None:
+            metrics["colabfold_msa_source"] = msa_source
+            metrics["colabfold_use_target_templates"] = bool(colabfold_use_target_templates)
+            metrics["colabfold_max_template_hits"] = int(colabfold_max_template_hits)
+            rc, selected_count, template_count, colabfold_commands = _run_colabfold_prediction(
+                job_run_dir=job.run_dir,
+                run_csv=run_csv,
+                output_dir=output_dir,
+                cache_dir=Path(colabfold_cache_dir).expanduser(),
+                num_recycles=int(colabfold_num_recycles),
+                num_models=int(colabfold_num_models),
+                gpu_device=colabfold_gpu_device,
+                max_records=int(max_records),
+                use_target_templates=bool(colabfold_use_target_templates),
+                max_template_hits=int(colabfold_max_template_hits),
+                image=COLABFOLD_IMAGE,
+            )
+            commands.extend(colabfold_commands)
+            write_json(job.run_dir / "command.json", {"mode": "docker", "commands": commands})
+            metrics["colabfold_return_code"] = rc
+            metrics["colabfold_selected_count"] = selected_count
+            metrics["colabfold_target_template_count"] = template_count
+            metrics["colabfold_output_dir"] = str((output_dir / "ColabFold" / "ptm_output").relative_to(job.run_dir))
+            if rc != 0:
+                finish_job(job.run_dir, False, {"metrics": metrics})
+                raise RuntimeError(f"ColabFold benchmark failed with return code {rc}.")
+            prediction_dir = output_dir / "ColabFold" / "ptm_output"
+            prediction_files = [
+                path
+                for pattern in ("**/*.pdb", "**/*.cif", "**/*.mmcif")
+                for path in prediction_dir.glob(pattern)
+                if path.is_file()
+            ]
+            metrics["colabfold_prediction_count"] = len(prediction_files)
+            if not prediction_files:
+                message = (
+                    "ColabFold completed without producing a predicted PDB/mmCIF structure. "
+                    "Inspect the ColabFold log for input-feature or template errors."
+                )
+                metrics["worker_error"] = message
+                finish_job(job.run_dir, False, {"metrics": metrics})
+                raise RuntimeError(message)
+            colab_table, colab_summary_path, colabfold_summary, extract_commands = _extract_and_summarize_colabfold_outputs(
+                parent_run_dir=job.run_dir,
+                run_csv=run_csv,
+                output_dir=output_dir,
+                docker_image=docker_image,
+            )
+            commands.extend(extract_commands)
+            write_json(job.run_dir / "command.json", {"mode": "docker", "commands": commands})
+            if colab_table is not None:
+                metrics["colabfold_metrics_table"] = str(colab_table.relative_to(job.run_dir))
+                metric_csvs.append(colab_table)
+            if colab_summary_path is not None:
+                metrics["colabfold_summary"] = str(colab_summary_path.relative_to(job.run_dir))
+            _record_runtime_timing(metrics, "colabfold", colabfold_started_at, **runtime_size)
     alphafast_commands: list[list[str]] = []
     if run_alphafast_af3:
         progress_step += 1
@@ -3733,44 +5978,53 @@ def run_de_novo_binder_scoring_dataset(
             total_steps=progress_total,
             progress_callback=progress_callback,
         )
-        started_at = time.monotonic()
-        af3_input_dir = output_dir / "AF3" / "input_folder"
-        af3_output_dir = output_dir / "AF3" / "alphafast_output"
-        rc, alphafast_commands = _run_alphafast_af3_refolding(
-            job_run_dir=job.run_dir,
-            af3_input_dir=af3_input_dir,
-            output_dir=af3_output_dir,
-            db_dir=Path(alphafast_db_dir).expanduser(),
-            weights_dir=Path(alphafast_weights_dir).expanduser(),
-            batch_size=int(alphafast_batch_size),
-            num_recycles=int(alphafast_num_recycles),
-            gpu_device=int(alphafast_gpu_device),
-            max_records=int(max_records),
-            image=ALPHAFAST_IMAGE,
-            run_data_pipeline=not alphafast_data_pipeline_done,
-        )
-        commands.extend(alphafast_commands)
-        write_json(job.run_dir / "command.json", {"mode": "docker", "commands": commands})
-        metrics["alphafast_af3_return_code"] = rc
-        metrics["alphafast_af3_output_dir"] = str(af3_output_dir.relative_to(job.run_dir))
-        if rc != 0:
-            finish_job(job.run_dir, False, {"metrics": metrics})
-            raise RuntimeError(f"AlphaFast AF3 benchmark failed with return code {rc}.")
-        af3_table, af3_summary_path, af3_summary = _summarize_alphafast_af3_outputs(
-            parent_run_dir=job.run_dir,
-            run_csv=run_csv,
-            alphafast_output_dir=af3_output_dir,
-        )
-        if af3_table is not None:
-            metrics["alphafast_af3_metrics_table"] = str(af3_table.relative_to(job.run_dir))
-            metric_csvs.append(af3_table)
-        if af3_summary_path is not None:
-            metrics["alphafast_af3_summary"] = str(af3_summary_path.relative_to(job.run_dir))
-        _record_runtime_timing(metrics, "alphafast_af3", started_at, **runtime_size)
+        existing_table = job.run_dir / "artifacts" / "benchmark" / "alphafast_af3_metrics.csv"
+        if resume and _csv_data_row_count(existing_table) == int(metrics.get("record_count") or 0):
+            metric_csvs.append(existing_table)
+            metrics["alphafast_af3_metrics_table"] = str(existing_table.relative_to(job.run_dir))
+            metrics["alphafast_af3_resumed_from_artifacts"] = True
+            started_at = None
+        else:
+            started_at = time.monotonic()
+        if started_at is not None:
+            af3_input_dir = output_dir / "AF3" / "input_folder"
+            af3_output_dir = output_dir / "AF3" / "alphafast_output"
+            rc, alphafast_commands = _run_alphafast_af3_refolding(
+                job_run_dir=job.run_dir,
+                af3_input_dir=af3_input_dir,
+                output_dir=af3_output_dir,
+                db_dir=Path(alphafast_db_dir).expanduser(),
+                weights_dir=Path(alphafast_weights_dir).expanduser(),
+                batch_size=int(alphafast_batch_size),
+                num_recycles=int(alphafast_num_recycles),
+                gpu_device=alphafast_gpu_device,
+                max_records=int(max_records),
+                image=ALPHAFAST_IMAGE,
+                run_data_pipeline=not alphafast_data_pipeline_done,
+                query_only_msa=bool(alphafast_query_only_msa),
+            )
+            commands.extend(alphafast_commands)
+            write_json(job.run_dir / "command.json", {"mode": "docker", "commands": commands})
+            metrics["alphafast_af3_return_code"] = rc
+            metrics["alphafast_af3_output_dir"] = str(af3_output_dir.relative_to(job.run_dir))
+            if rc != 0:
+                finish_job(job.run_dir, False, {"metrics": metrics})
+                raise RuntimeError(f"AlphaFast AF3 benchmark failed with return code {rc}.")
+            af3_table, af3_summary_path, af3_summary = _summarize_alphafast_af3_outputs(
+                parent_run_dir=job.run_dir,
+                run_csv=run_csv,
+                alphafast_output_dir=af3_output_dir,
+            )
+            if af3_table is not None:
+                metrics["alphafast_af3_metrics_table"] = str(af3_table.relative_to(job.run_dir))
+                metric_csvs.append(af3_table)
+            if af3_summary_path is not None:
+                metrics["alphafast_af3_summary"] = str(af3_summary_path.relative_to(job.run_dir))
+            _record_runtime_timing(metrics, "alphafast_af3", started_at, **runtime_size)
     progress_step += 1
     _emit_benchmark_progress(
         job.run_dir,
-        phase="Calculating benchmark metrics",
+        phase="Calculating evaluation metrics" if evaluation_mode == "refolding_validation" else "Calculating benchmark metrics",
         engine="Rosetta / PyMOL / interface metrics",
         step=progress_step,
         total_steps=progress_total,
@@ -3853,6 +6107,9 @@ def run_de_novo_binder_scoring_dataset(
         "missing_external_tool_images": "artifacts/benchmark/missing_external_tool_images.json",
         "chain_msa_map": "artifacts/benchmark/chain_msa_map.json"
         if (job.run_dir / "artifacts" / "benchmark" / "chain_msa_map.json").exists()
+        else None,
+        "target_msa_manifest": "artifacts/benchmark/target_msa_manifest.json"
+        if (job.run_dir / "artifacts" / "benchmark" / "target_msa_manifest.json").exists()
         else None,
         "artifact_layout_version": "benchmark.single_run.v1",
         "engine_artifacts": engine_artifacts,
@@ -3966,18 +6223,27 @@ def _run_esmfold2_benchmark_worker(
             if not target_pdb.exists():
                 raise ValueError(f"Benchmark record {record['candidate_id']} has no readable target_pdb.")
             source_run_dir = run_dir
-            source_complex = Path(str(record.get("complex_pdb") or "")) if record.get("complex_pdb") else None
             binder_sequence = str(record.get("binder_sequence") or "").strip()
             if not binder_sequence:
                 binder_sequence = refolding_workflow._candidate_binder_sequence(source_run_dir, source_candidate)
-            binder_chains, inferred_target_chains = refolding_workflow._infer_chain_roles(source_run_dir, source_candidate, source_complex)
-            target_sequences, residue_maps = esm_binder_workflow._target_sequences(target_pdb, inferred_target_chains)
+            declared_target_chains = list(record.get("target_chains") or [])
+            target_only = bool(record.get("capacity_target_only")) or str(record.get("target_source") or "").lower() == "capacity_target_only"
+            if target_only:
+                target_sequences = {}
+                residue_maps = {}
+            else:
+                target_sequences, residue_maps = esm_binder_workflow._target_sequences(target_pdb, declared_target_chains)
             target_chains = list(target_sequences)
-            binder_chain = esm_binder_workflow._choose_binder_chain(target_chains)
+            binder_chain = "A"
             mapped_hotspots = esm_binder_workflow._mapped_hotspots(record.get("hotspots") or [], residue_maps)
             record_msa_paths = record.get("msa_paths") if use_target_msa and isinstance(record.get("msa_paths"), dict) else {}
             target_msas: dict[str, Any] = {}
+            binder_msa = None
             msa_notes: list[str] = []
+            if target_only:
+                binder_msa, note = _load_esmfold2_msa(MSA, record_msa_paths.get(binder_chain), binder_sequence)
+                if note:
+                    msa_notes.append(f"{binder_chain}:{note}")
             for target_chain, target_sequence in target_sequences.items():
                 msa, note = _load_esmfold2_msa(MSA, record_msa_paths.get(target_chain), target_sequence)
                 if msa is not None:
@@ -4015,7 +6281,7 @@ def _run_esmfold2_benchmark_worker(
                             ProteinInput(id=chain, sequence=sequence, msa=target_msas.get(chain))
                             for chain, sequence in target_sequences.items()
                         ],
-                        ProteinInput(id=binder_chain, sequence=binder_sequence),
+                        ProteinInput(id=binder_chain, sequence=binder_sequence, msa=binder_msa),
                     ],
                     distogram_conditioning=distogram_conditioning,
                 )
@@ -4145,6 +6411,7 @@ def run_esmfold2_binder_benchmark(
     use_target_msa: bool = False,
     use_docker: bool = True,
     internal_parent_run_dir: Path | None = None,
+    gpu_device: object = "0",
 ) -> Path:
     selected_modes = [mode for mode in (modes or ["sequence", "initial_guess"]) if mode in {"sequence", "initial_guess"}]
     if not selected_modes:
@@ -4161,6 +6428,7 @@ def run_esmfold2_binder_benchmark(
             "num_sampling_steps": num_sampling_steps,
             "seed": seed,
             "device": device,
+            "gpu_device": normalize_gpu_device(gpu_device),
             "contact_cutoff": contact_cutoff,
             "use_target_msa": use_target_msa,
             "use_docker": use_docker,
@@ -4197,11 +6465,9 @@ def run_esmfold2_binder_benchmark(
             "docker",
             "run",
             "--rm",
-            "--gpus",
-            "all",
+            *docker_gpu_args(gpu_device),
             "--shm-size=64G",
-            "-v",
-            f"{REPO_ROOT}:{REPO_ROOT}",
+            *_repo_and_runs_mounts(),
             "-v",
             f"{BIOHUB_ESM_ROOT}:{BIOHUB_ESM_ROOT}:ro",
             "-v",

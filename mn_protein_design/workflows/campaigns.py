@@ -83,6 +83,7 @@ def _run_module_step(source: dict[str, Any], step: dict[str, Any]) -> Path:
             omit_aas=str(params.get("omit_aas") or "CX"),
             seed=int(params["seed"]) if params.get("seed") else None,
             require_backbone_hotspot_filter_pass=bool(params.get("require_backbone_hotspot_filter_pass", False)),
+            gpu_device=params.get("gpu_device", "0"),
         )
     if module == "sequence_design" and tool == "foundry_mpnn":
         return run_foundry_mpnn_sequence_design(
@@ -92,6 +93,7 @@ def _run_module_step(source: dict[str, Any], step: dict[str, Any]) -> Path:
             batch_size=int(params.get("batch_size") or 10),
             model_type=str(params.get("model_type") or "ligand_mpnn"),
             checkpoint_path=str(params.get("checkpoint_path") or "/weights/ligandmpnn_v_32_010_25.pt"),
+            gpu_device=params.get("gpu_device", "0"),
         )
     if module == "monomer_refolding":
         return run_monomer_refolding_contract(
@@ -99,6 +101,7 @@ def _run_module_step(source: dict[str, Any], step: dict[str, Any]) -> Path:
             candidates_jsonl=Path(str(source["candidates_jsonl"])),
             tool=tool,
             min_plddt=float(params.get("min_plddt") or 70.0),
+            gpu_device=params.get("gpu_device", "0"),
         )
     if module == "complex_refolding":
         return run_complex_refolding_contract(
@@ -114,6 +117,7 @@ def _run_module_step(source: dict[str, Any], step: dict[str, Any]) -> Path:
             seed=int(params.get("seed") or 0),
             device=str(params.get("device") or "auto"),
             contact_cutoff=float(params.get("contact_cutoff") or 8.0),
+            gpu_device=params.get("gpu_device", "0"),
         )
     if module == "analysis":
         return run_analysis_contract(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import shutil
 import time
 from dataclasses import dataclass
@@ -12,6 +14,8 @@ from mn_protein_design.runtime import runs_root
 
 
 ACTIVE_STATUSES = {"queued", "running", "preparing"}
+PAUSED_STATUSES = {"paused", "holding"}
+STOPPED_STATUSES = {"cancelled", "stopped"}
 ACTIVE_OWNER_STALE_SECONDS = 6 * 60 * 60
 GPU_TOOL_KEYWORDS = (
     "alphafold",
@@ -68,6 +72,15 @@ def _queue_resource_for(tool: str, params: dict | None) -> str | None:
     explicit = str(params.get("queue_resource") or "").strip().lower()
     if explicit:
         return explicit
+    gpu_device = str(params.get("gpu_device") or "").strip().lower()
+    if gpu_device:
+        if gpu_device in {"none", "cpu", "off", "false", "0-gpu"}:
+            return None
+        if gpu_device in {"all", "auto", "any"}:
+            return "gpu"
+        if gpu_device.startswith("device="):
+            gpu_device = gpu_device.removeprefix("device=").strip()
+        return f"gpu:{gpu_device or '0'}"
     if str(params.get("device") or "").strip().lower() == "cuda":
         return "gpu"
     if any("gpu" in str(key).lower() for key in params):
@@ -117,7 +130,7 @@ def _active_resource_owner(resource: str, requester_run_dir: Path) -> Path | Non
                 continue
         input_payload = read_json(run_dir / "input.json")
         params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
-        active_resource = str(metadata.get("queue_resource") or _queue_resource_for(str(metadata.get("tool") or ""), params) or "")
+        active_resource = str(_queue_resource_for(str(metadata.get("tool") or input_payload.get("tool") or ""), params) or metadata.get("queue_resource") or "")
         if active_resource == resource:
             return run_dir
     return None
@@ -248,7 +261,10 @@ def mark_internal_job(
 def update_status(run_dir: Path, status: str, **extra: object) -> None:
     metadata = read_json(run_dir / "metadata.json")
     if status == "running":
-        queue_resource = str(extra.get("queue_resource") or metadata.get("queue_resource") or "").strip()
+        input_payload = read_json(run_dir / "input.json")
+        params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+        derived_queue_resource = _queue_resource_for(str(metadata.get("tool") or input_payload.get("tool") or ""), params)
+        queue_resource = str(extra.get("queue_resource") or derived_queue_resource or metadata.get("queue_resource") or "").strip()
         if queue_resource:
             _acquire_resource_lock(run_dir, queue_resource)
             metadata = read_json(run_dir / "metadata.json")
@@ -258,6 +274,8 @@ def update_status(run_dir: Path, status: str, **extra: object) -> None:
     if status in {"completed", "failed", "cancelled"}:
         metadata.setdefault("completed_at", metadata["updated_at"])
     write_json(run_dir / "metadata.json", metadata)
+    if status in {"completed", "failed", "cancelled", *PAUSED_STATUSES}:
+        _release_resource_lock(run_dir)
 
 
 def finish_job(run_dir: Path, success: bool, result: dict) -> None:
@@ -278,7 +296,109 @@ def finish_job(run_dir: Path, success: bool, result: dict) -> None:
     _release_resource_lock(run_dir)
 
 
-def collect_jobs(task_group: str | None = None) -> list[dict]:
+def _signal_worker_process(run_dir: Path, sig: int = signal.SIGTERM) -> bool:
+    metadata = read_json(run_dir / "metadata.json")
+    try:
+        pid = int(metadata.get("worker_pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid <= 0:
+        return False
+    try:
+        os.killpg(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        try:
+            os.kill(pid, sig)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def stop_job(run_dir: Path, reason: str = "Stopped by user") -> None:
+    """Stop a queued/running job and mark it cancelled without deleting artifacts."""
+    _signal_worker_process(run_dir, signal.SIGTERM)
+    _release_resource_lock(run_dir)
+    metadata = read_json(run_dir / "metadata.json")
+    stopped_at = utc_now()
+    metadata["status"] = "cancelled"
+    metadata["cancelled_at"] = stopped_at
+    metadata["completed_at"] = stopped_at
+    metadata["updated_at"] = stopped_at
+    metadata["progress_label"] = reason
+    metadata["cancel_reason"] = reason
+    write_json(run_dir / "metadata.json", metadata)
+    result = read_json(run_dir / "result.json")
+    result.update(
+        {
+            "success": False,
+            "cancelled": True,
+            "cancel_reason": reason,
+        }
+    )
+    write_json(run_dir / "result.json", result)
+
+
+def pause_job(run_dir: Path, reason: str = "") -> None:
+    """Park a resumable job without treating it as a failed result."""
+    _signal_worker_process(run_dir, signal.SIGTERM)
+    _release_resource_lock(run_dir)
+    metadata = read_json(run_dir / "metadata.json")
+    metadata.pop("completed_at", None)
+    metadata["status"] = "paused"
+    metadata["paused_at"] = utc_now()
+    metadata["updated_at"] = metadata["paused_at"]
+    if reason:
+        metadata["pause_reason"] = reason
+        metadata["progress_label"] = reason
+    write_json(run_dir / "metadata.json", metadata)
+    result = read_json(run_dir / "result.json")
+    if result:
+        result["success"] = None
+        result["paused"] = True
+        if reason:
+            result["pause_reason"] = reason
+        write_json(run_dir / "result.json", result)
+
+
+def prepare_job_for_resume(run_dir: Path) -> None:
+    """Return a stopped job to the queue without discarding its artifacts."""
+    _release_resource_lock(run_dir)
+    metadata = read_json(run_dir / "metadata.json")
+    metadata.pop("completed_at", None)
+    metadata.pop("worker_error", None)
+    metadata.pop("worker_exception_type", None)
+    metadata["status"] = "queued"
+    metadata["resume_requested_at"] = utc_now()
+    metadata["current_phase"] = "Waiting to resume"
+    metadata["current_engine"] = ""
+    metadata["progress_label"] = "Waiting to resume from completed artifacts"
+    metadata["updated_at"] = metadata["resume_requested_at"]
+    write_json(run_dir / "metadata.json", metadata)
+    result = read_json(run_dir / "result.json")
+    if result:
+        result["success"] = None
+        result["resuming"] = True
+        result.pop("worker_error", None)
+        result.pop("worker_exception_type", None)
+        write_json(run_dir / "result.json", result)
+
+
+def resume_job(run_dir: Path) -> None:
+    """Queue a paused/stopped local-worker job again."""
+    if not (run_dir / "worker_request.json").exists():
+        raise FileNotFoundError(f"Job is not resumable because worker_request.json is missing: {run_dir}")
+    prepare_job_for_resume(run_dir)
+    from mn_protein_design.core.local_worker import spawn_worker_for_run
+
+    spawn_worker_for_run(run_dir)
+
+
+def collect_jobs(task_group: str | None = None, *, include_hidden: bool = False) -> list[dict]:
     root = runs_root()
     root.mkdir(parents=True, exist_ok=True)
     groups = [task_group] if task_group else [p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith("_")]
@@ -289,13 +409,23 @@ def collect_jobs(task_group: str | None = None) -> list[dict]:
             continue
         for run_dir in sorted([p for p in group_dir.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
             metadata = read_json(run_dir / "metadata.json")
-            if metadata.get("hidden"):
+            if not include_hidden and (metadata.get("hidden") or metadata.get("capacity_parent_run_id")):
                 continue
             result = read_json(run_dir / "result.json")
             input_payload = read_json(run_dir / "input.json")
             input_params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
-            status = metadata.get("status") or ("completed" if result.get("success") else "unknown")
-            if result.get("success") is False:
+            queue_resource = (
+                _queue_resource_for(str(metadata.get("tool") or input_payload.get("tool", "")), input_params)
+                or metadata.get("queue_resource", "")
+            )
+            metadata_status = str(metadata.get("status") or "")
+            status = metadata_status or ("completed" if result.get("success") else "unknown")
+            if (
+                result.get("success") is False
+                and metadata_status not in ACTIVE_STATUSES
+                and metadata_status not in PAUSED_STATUSES
+                and metadata_status not in STOPPED_STATUSES
+            ):
                 status = "failed"
             rows.append(
                 {
@@ -305,7 +435,7 @@ def collect_jobs(task_group: str | None = None) -> list[dict]:
                     "job_type": metadata.get("job_type") or input_payload.get("job_type", ""),
                     "tool": metadata.get("tool") or input_payload.get("tool", ""),
                     "status": status,
-                    "queue_resource": metadata.get("queue_resource", ""),
+                    "queue_resource": queue_resource,
                     "current_phase": metadata.get("current_phase", ""),
                     "current_engine": metadata.get("current_engine", ""),
                     "campaign_name": metadata.get("campaign_name") or input_params.get("campaign_name", ""),

@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from mn_protein_design.core.jobs import JobPaths, finish_job, read_json, update_status
+from mn_protein_design.core.jobs import JobPaths, finish_job, read_json, update_status, utc_now, write_json
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -42,6 +42,11 @@ def run_worker_job(run_dir: Path) -> int:
         raise RuntimeError(f"No worker_request.json found for {run_dir}")
 
     try:
+        if kind == "design_campaign":
+            from mn_protein_design.workflows.design_campaigns import run_design_campaign
+
+            run_design_campaign(run_dir)
+            return 0
         if kind in {"de_novo_binder_scoring_dataset", "candidate_refolding_evaluation"}:
             from mn_protein_design.workflows.benchmark import run_de_novo_binder_scoring_dataset
 
@@ -49,6 +54,51 @@ def run_worker_job(run_dir: Path) -> int:
             job = JobPaths(task_group="benchmark", run_id=run_dir.name, run_dir=run_dir)
             run_de_novo_binder_scoring_dataset(existing_job=job, **kwargs)
             return 0
+        if kind == "benchmark_pyrosetta_backfill":
+            from mn_protein_design.workflows.benchmark import run_missing_pyrosetta_benchmark_metrics
+
+            kwargs = _restore_worker_kwargs(request)
+            run_missing_pyrosetta_benchmark_metrics(run_dir, **kwargs)
+            return 0
+        if kind == "capacity_benchmark_scheduler":
+            from mn_protein_design.workflows.capacity_benchmark import run_capacity_benchmark_scheduler
+
+            kwargs = _restore_worker_kwargs(request)
+            run_capacity_benchmark_scheduler(run_dir, **kwargs)
+            return 0
+        if kind == "detection_tool":
+            from mn_protein_design.workflows.detection import run_masif_seed, run_scannet, run_surf2spot
+
+            metadata = read_json(run_dir / "metadata.json")
+            input_payload = read_json(run_dir / "input.json")
+            tool = str(input_payload.get("tool") or metadata.get("tool") or "")
+            inputs = input_payload.get("inputs") if isinstance(input_payload.get("inputs"), dict) else {}
+            params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+            job = JobPaths(task_group=str(metadata.get("task_group") or ""), run_id=run_dir.name, run_dir=run_dir)
+            target_pdb = Path(str(inputs.get("target_pdb") or "")).expanduser()
+            gpu_device = params.get("gpu_device", "0")
+            if tool == "scannet":
+                run_scannet(
+                    target_pdb,
+                    [str(chain) for chain in inputs.get("chains") or []],
+                    mode=str(params.get("mode") or "interface"),
+                    use_msa=bool(params.get("use_msa")),
+                    gpu_device=gpu_device,
+                    existing_job=job,
+                )
+                return 0
+            if tool == "surf2spot":
+                run_surf2spot(target_pdb, gpu_device=gpu_device, existing_job=job)
+                return 0
+            if tool == "masif_seed":
+                run_masif_seed(
+                    target_pdb,
+                    str(inputs.get("chain_id") or ""),
+                    gpu_device=gpu_device,
+                    existing_job=job,
+                )
+                return 0
+            raise RuntimeError(f"Unknown detection tool for local worker: {tool}")
         raise RuntimeError(f"Unknown local worker request kind: {kind}")
     except Exception as exc:
         _worker_log(run_dir, "worker_stderr.log", traceback.format_exc())
@@ -73,7 +123,7 @@ def spawn_worker_for_run(run_dir: Path) -> subprocess.Popen:
     run_dir = run_dir.expanduser().resolve()
     stdout = (run_dir / "worker_stdout.log").open("a")
     stderr = (run_dir / "worker_stderr.log").open("a")
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -86,6 +136,12 @@ def spawn_worker_for_run(run_dir: Path) -> subprocess.Popen:
         stderr=stderr,
         start_new_session=True,
     )
+    metadata = read_json(run_dir / "metadata.json")
+    metadata["worker_pid"] = proc.pid
+    metadata["worker_started_at"] = utc_now()
+    metadata["updated_at"] = metadata["worker_started_at"]
+    write_json(run_dir / "metadata.json", metadata)
+    return proc
 
 
 def main() -> None:

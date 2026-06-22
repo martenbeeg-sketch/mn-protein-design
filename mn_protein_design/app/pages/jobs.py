@@ -8,8 +8,26 @@ from mn_protein_design.core.jobs import collect_jobs
 
 st.title("Jobs")
 st.caption("All file-backed jobs across target preparation, detection, design, refolding, and analysis.")
+st.caption(
+    "Select rows to pause, stop, resume, or delete jobs. GPU-backed jobs are pinned by their queue resource, "
+    "so independent jobs on GPU 0 and GPU 1 can run side by side while jobs sharing one GPU wait their turn."
+)
 
-all_rows = collect_jobs()
+show_internal_jobs = st.checkbox(
+    "Show internal child jobs",
+    value=False,
+    help="Includes hidden engine-cell jobs such as Capacity Benchmark child runs. Parent jobs remain visible by default.",
+)
+all_rows = collect_jobs(include_hidden=show_internal_jobs)
+try:
+    from mn_protein_design.workflows.capacity_benchmark import capacity_parent_rows
+
+    capacity_status = {str(row.get("run_id")): str(row.get("status") or "") for row in capacity_parent_rows()}
+    for row in all_rows:
+        if str(row.get("job_type") or "") == "refolding_capacity_benchmark":
+            row["status"] = capacity_status.get(str(row.get("run_id")), row.get("status"))
+except Exception:
+    pass
 if not all_rows:
     st.info("No jobs yet.")
     st.stop()

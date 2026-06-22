@@ -54,8 +54,10 @@ services:
       context: .
       dockerfile: containers/biohub-esm/Dockerfile
       platforms: ["linux/x86_64"]
+    gpus: all
     volumes:
       - biohub-esm-hf-cache:/cache/huggingface
+      - /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro
 
   colabfold:
     image: mnprot-colabfold-cuda12:1.6.1

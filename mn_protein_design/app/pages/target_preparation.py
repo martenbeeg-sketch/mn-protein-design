@@ -7,7 +7,13 @@ import streamlit as st
 
 from mn_protein_design.app.components.molstar_viewer import molstar_custom_component, StructureVisualization
 from mn_protein_design.core.residue_selection import ResidueSelection
-from mn_protein_design.core.structures import detect_nonstandard_residues, download_pdb, filter_pdb_text, pdb_summary
+from mn_protein_design.core.structures import (
+    detect_nonstandard_residues,
+    download_alphafold_db_pdb,
+    download_pdb,
+    filter_pdb_text,
+    pdb_summary,
+)
 from mn_protein_design.runtime import app_home
 from mn_protein_design.workflows.target_prep import prepare_target
 
@@ -90,7 +96,12 @@ left, right = st.columns([0.9, 1.25], gap="large")
 
 with left:
     st.subheader("1. Import")
-    source_mode = st.radio("Source", ["Download from PDB", "Upload PDB"], horizontal=True, label_visibility="collapsed")
+    source_mode = st.radio(
+        "Source",
+        ["Download from PDB", "AlphaFold DB", "Upload PDB"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
     if source_mode == "Download from PDB":
         pdb_id = st.text_input("PDB ID", placeholder="1BRS").strip()
         if st.button("Download structure", disabled=not pdb_id):
@@ -98,6 +109,19 @@ with left:
                 with st.spinner(f"Downloading {pdb_id.upper()} from RCSB PDB..."):
                     _store_source(pdb_id.upper(), download_pdb(pdb_id))
                 st.success(f"Imported {pdb_id.upper()}")
+            except Exception as exc:
+                st.error(str(exc))
+    elif source_mode == "AlphaFold DB":
+        afdb_id = st.text_input(
+            "UniProt accession or AlphaFold DB PDB URL",
+            placeholder="P0DTC2 or https://alphafold.ebi.ac.uk/files/AF-P0DTC2-F1-model_v4.pdb",
+        ).strip()
+        if st.button("Download AlphaFold DB structure", disabled=not afdb_id):
+            try:
+                label = Path(afdb_id.rstrip("/")).stem if afdb_id.startswith(("http://", "https://")) else afdb_id.upper()
+                with st.spinner(f"Downloading {label} from AlphaFold DB..."):
+                    _store_source(label, download_alphafold_db_pdb(afdb_id))
+                st.success(f"Imported {label}")
             except Exception as exc:
                 st.error(str(exc))
     else:
@@ -119,12 +143,13 @@ with left:
         state["remove_waters"] = st.checkbox("Remove waters", value=state["remove_waters"])
         state["remove_hetero"] = st.checkbox("Remove hetero atoms", value=state["remove_hetero"])
         state["prepare_msa"] = st.checkbox(
-            "Prepare Boltz2 target MSA",
+            "Prepare shared target MSAs",
             value=state.get("prepare_msa", True),
             help=(
                 "Caches one A3M per selected target chain in "
-                "/mnt/db/reference_files/boltz_models/msa_repository for downstream "
-                "Genie3/Boltz2 workflows."
+                "/mnt/db/reference_files/boltz_models/msa_repository. The same sequence-hashed "
+                "cache is reused by practical/full AF3, ColabFold, Boltz-style, RF3, "
+                "Protenix, and ESMFold2 workflows when supported."
             ),
         )
         nonstandard = detect_nonstandard_residues(_selected_text_for_nonstandard_detection())

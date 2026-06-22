@@ -20,6 +20,7 @@ from mn_protein_design.core.candidates import (
     read_candidates,
     write_candidates,
 )
+from mn_protein_design.core.gpu import docker_gpu_args, normalize_gpu_device
 from mn_protein_design.core.hotspot_metrics import calculate_hotspot_metrics, passes_hotspot_prefilter
 from mn_protein_design.core.jobs import collect_jobs, create_job, finish_job, read_json, update_status, write_json
 from mn_protein_design.core.manifests import load_manifest
@@ -316,6 +317,8 @@ def _normalize_bindcraft_candidates(run_dir: Path, params: dict, target_artifact
     for index, pdb_path in enumerate(pdb_by_design.values(), start=1):
         design_name = pdb_path.stem
         metrics = _bindcraft_stats_for_design(stats, design_name)
+        trajectory_name = re.sub(r"_mpnn\d+(?:_model\d+)?$", "", design_name)
+        trajectory_path = output_dir / "Trajectory" / f"{trajectory_name}.pdb"
         binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
             target_artifact,
             pdb_path,
@@ -357,6 +360,12 @@ def _normalize_bindcraft_candidates(run_dir: Path, params: dict, target_artifact
                     "input_target_chains": params.get("target_chains", []),
                     "target_chain_inference": chain_inference,
                     "bindcraft_output_kind": pdb_path.parent.name,
+                    "design_reference_pdb": _rel_path(run_dir, trajectory_path)
+                    if trajectory_path.exists()
+                    else None,
+                    "design_reference_kind": "bindcraft_trajectory"
+                    if trajectory_path.exists()
+                    else "",
                 },
             }
         )
@@ -374,6 +383,49 @@ def _rel_path(run_dir: Path, path: Path | None) -> str | None:
 
 def _write_candidates(run_dir: Path, tool: str, candidates: list[dict]) -> None:
     write_candidates(run_dir, tool, candidates)
+
+
+def _candidate_structure_key(candidate: dict) -> str:
+    return str(candidate.get("complex_pdb") or candidate.get("binder_pdb") or candidate.get("candidate_id") or "")
+
+
+def _with_pool_metadata(candidate: dict, pool_level: str, coverage: str) -> dict:
+    raw_metadata = dict(candidate.get("raw_metadata") or {})
+    raw_metadata.setdefault("candidate_pool_level", pool_level)
+    raw_metadata.setdefault("candidate_pool_coverage", coverage)
+    metrics = dict(candidate.get("metrics") or {})
+    metrics.setdefault("candidate_pool_level", pool_level)
+    candidate = dict(candidate)
+    candidate["raw_metadata"] = raw_metadata
+    candidate["metrics"] = metrics
+    return candidate
+
+
+def _merge_candidate_pools(
+    *,
+    tool: str,
+    native_candidates: list[dict],
+    raw_candidates: list[dict],
+    native_coverage: str,
+    raw_coverage: str,
+) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for candidate in native_candidates:
+        enriched = _with_pool_metadata(candidate, "native_pipeline", native_coverage)
+        key = _candidate_structure_key(enriched)
+        seen.add(key)
+        merged.append(enriched)
+    for candidate in raw_candidates:
+        key = _candidate_structure_key(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        index = len(merged) + 1
+        enriched = _with_pool_metadata(candidate, "prefilter_generated", raw_coverage)
+        enriched["candidate_id"] = f"{tool}_prefilter_{index:05d}"
+        merged.append(enriched)
+    return merged
 
 
 def _generic_candidate_records(
@@ -423,8 +475,19 @@ def _read_csv_rows(path: Path | None) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def _normalize_boltzgen_generation_candidates(run_dir: Path, params: dict, target_artifact: Path) -> list[dict]:
-    structure_paths = sorted((run_dir / "artifacts").glob("raw/boltzgen/run-generation-only/intermediate_designs/*.cif"))
+def _normalize_boltzgen_generation_candidates(
+    run_dir: Path,
+    params: dict,
+    target_artifact: Path,
+    *,
+    write_output: bool = True,
+) -> list[dict]:
+    structure_paths = sorted(
+        [
+            *(run_dir / "artifacts").glob("raw/boltzgen/run-generation-only/intermediate_designs/*.cif"),
+            *(run_dir / "artifacts").glob("raw/boltzgen/run-vanilla/intermediate_designs/*.cif"),
+        ]
+    )
     metadata_paths = {
         path.stem: path
         for path in sorted((run_dir / "artifacts").glob("raw/boltzgen/run-generation-only/intermediate_designs/*.npz"))
@@ -462,7 +525,7 @@ def _normalize_boltzgen_generation_candidates(run_dir: Path, params: dict, targe
                 },
             }
         )
-    return write_candidates(run_dir, "boltzgen", candidates)
+    return write_candidates(run_dir, "boltzgen", candidates) if write_output else candidates
 
 
 def _boltzgen_metric_rows(run_dir: Path, budget: int) -> list[dict[str, str]]:
@@ -580,7 +643,20 @@ def _normalize_boltzgen_vanilla_candidates(run_dir: Path, params: dict, target_a
                 },
             }
         )
-    return write_candidates(run_dir, "boltzgen", candidates)
+    raw_candidates = _normalize_boltzgen_generation_candidates(
+        run_dir,
+        params,
+        target_artifact,
+        write_output=False,
+    )
+    merged = _merge_candidate_pools(
+        tool="boltzgen",
+        native_candidates=candidates,
+        raw_candidates=raw_candidates,
+        native_coverage="final ranked native pipeline designs",
+        raw_coverage="intermediate generated BoltzGen structures before final ranking",
+    )
+    return write_candidates(run_dir, "boltzgen", merged)
 
 
 def _clean_key(text: str, fallback: str = "mn_app_target") -> str:
@@ -708,7 +784,7 @@ def _write_boltz_msa_probe_yaml(path: Path, sequence: str) -> None:
     )
 
 
-def _ensure_boltz_msa_for_sequence(run_dir: Path, sequence: str, label: str) -> str:
+def _ensure_boltz_msa_for_sequence(run_dir: Path, sequence: str, label: str, gpu_device: object = "0") -> str:
     host_path, container_path = _boltz_msa_paths(sequence)
     host_path.parent.mkdir(parents=True, exist_ok=True)
     valid, reason = _validate_a3m_file(host_path)
@@ -726,8 +802,7 @@ def _ensure_boltz_msa_for_sequence(run_dir: Path, sequence: str, label: str) -> 
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        "all",
+        *docker_gpu_args(gpu_device),
         "--shm-size=64G",
         "-v",
         f"{probe_dir}:/work",
@@ -778,8 +853,14 @@ def _ensure_boltz_msa_for_sequence(run_dir: Path, sequence: str, label: str) -> 
     return container_path
 
 
-def _ensure_boltz_msas_for_target(run_dir: Path, target_artifact: Path, target_chains: list[str]) -> dict[str, str]:
-    return _shared_ensure_boltz_msas_for_target(run_dir, target_artifact, target_chains, raw_subdir="genie3/boltz_msa_cache")
+def _ensure_boltz_msas_for_target(run_dir: Path, target_artifact: Path, target_chains: list[str], gpu_device: object = "0") -> dict[str, str]:
+    return _shared_ensure_boltz_msas_for_target(
+        run_dir,
+        target_artifact,
+        target_chains,
+        raw_subdir="genie3/boltz_msa_cache",
+        gpu_device=gpu_device,
+    )
 
 
 def _write_genie3_target_files(
@@ -1064,6 +1145,26 @@ def _genie3_structure_for_row(results_dir: Path, row: dict[str, str], successful
     return None
 
 
+def _genie3_generated_structure_paths(output_root: Path, problem_key: str) -> list[Path]:
+    evaluated = [
+        *output_root.glob(f"{problem_key}/eval_shards/*/structures/*/unrelaxed_rank_*.pdb"),
+        *output_root.glob(f"round_*/{problem_key}/eval_shards/*/structures/*/unrelaxed_rank_*.pdb"),
+    ]
+    paths = [
+        *output_root.glob(f"{problem_key}/pdbs/*.pdb"),
+        *output_root.glob("pdbs/*.pdb"),
+        *output_root.glob("**/pdbs/*.pdb"),
+    ]
+    preferred = evaluated if any(path.is_file() for path in evaluated) else paths
+    readable: dict[Path, Path] = {}
+    for path in preferred:
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        readable.setdefault(resolved, path)
+    return sorted(readable.values())
+
+
 def _normalize_genie3_candidates(run_dir: Path, params: dict, target_artifact: Path) -> list[dict]:
     problem_key = str(params.get("problem_key") or "mn_app_target")
     run_mode = str(params.get("run_mode") or "generation_only")
@@ -1087,20 +1188,37 @@ def _normalize_genie3_candidates(run_dir: Path, params: dict, target_artifact: P
                 rows = _read_csv_rows(info_csv)
                 results_dir = candidate_results_dir
                 break
-    if not rows:
-        generated_paths = sorted([*output_root.glob(f"{problem_key}/pdbs/*.pdb"), *output_root.glob("pdbs/*.pdb")])
-        candidates = []
+    def generated_genie3_candidates() -> list[dict]:
+        generated_paths = _genie3_generated_structure_paths(output_root, problem_key)
+        generated: list[dict] = []
         for index, structure_path in enumerate(generated_paths, start=1):
+            evaluated = "eval_shards" in structure_path.parts
             binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
                 target_artifact,
                 structure_path,
                 params.get("target_chains", []),
             )
-            candidates.append(
+            metrics: dict[str, Any] = {
+                "result_kind": "native_evaluation_fallback" if evaluated else "generation_only",
+                "target_chain_inference": chain_inference,
+            }
+            if evaluated:
+                score_paths = sorted(structure_path.parent.glob("scores_rank_*.json"))
+                if score_paths:
+                    scores = read_json(score_paths[0])
+                    metrics.update(
+                        {
+                            "complex_refolding_backend": "genie3_colabfold",
+                            "ptm": scores.get("ptm"),
+                            "iptm": scores.get("iptm"),
+                            "max_pae": scores.get("max_pae"),
+                        }
+                    )
+            generated.append(
                 {
                     "candidate_id": f"genie3_{index:05d}",
                     "source_tool": "genie3",
-                    "stage": STAGE_GENERATION_BACKBONE_SEQUENCE,
+                    "stage": STAGE_COMPLEX_REFOLDING if evaluated else STAGE_GENERATION_BACKBONE_SEQUENCE,
                     "target_pdb": _rel_path(run_dir, target_artifact),
                     "complex_pdb": _rel_path(run_dir, structure_path),
                     "binder_pdb": None,
@@ -1110,11 +1228,18 @@ def _normalize_genie3_candidates(run_dir: Path, params: dict, target_artifact: P
                     "hotspots": [token for token in params.get("hotspots", "").split(",") if token],
                     "binder_length": params.get("binder_length"),
                     "contig": None,
-                    "metrics": {"result_kind": "generation_only", "target_chain_inference": chain_inference},
-                    "raw_metadata": {"result_kind": "generation_only", "problem_key": problem_key},
+                    "metrics": metrics,
+                    "raw_metadata": {
+                        "result_kind": metrics["result_kind"],
+                        "problem_key": problem_key,
+                        "output_kind": "genie3_evaluated_structure" if evaluated else "genie3_generated_backbone",
+                    },
                 }
             )
-        return write_candidates(run_dir, "genie3", candidates)
+        return generated
+
+    if not rows:
+        return write_candidates(run_dir, "genie3", generated_genie3_candidates())
 
     candidates: list[dict] = []
     for index, row in enumerate(rows, start=1):
@@ -1168,7 +1293,14 @@ def _normalize_genie3_candidates(run_dir: Path, params: dict, target_artifact: P
                 },
             }
         )
-    return write_candidates(run_dir, "genie3", candidates)
+    merged = _merge_candidate_pools(
+        tool="genie3",
+        native_candidates=candidates,
+        raw_candidates=generated_genie3_candidates(),
+        native_coverage="Genie3 native evaluation rows and success table",
+        raw_coverage="generated Genie3 PDBs before native success filtering",
+    )
+    return write_candidates(run_dir, "genie3", merged)
 
 
 def _pxdesign_summary_paths(run_dir: Path) -> list[Path]:
@@ -1268,10 +1400,29 @@ def _normalize_pxdesign_candidates(run_dir: Path, params: dict, target_artifact:
                     },
                 }
             )
-    return write_candidates(run_dir, "pxdesign", candidates)
+    raw_candidates = _normalize_pxdesign_generation_candidates(
+        run_dir,
+        params,
+        target_artifact,
+        write_output=False,
+    )
+    merged = _merge_candidate_pools(
+        tool="pxdesign",
+        native_candidates=candidates,
+        raw_candidates=raw_candidates,
+        native_coverage="PXDesign summary/native retained structures",
+        raw_coverage="raw PXDesign inference prediction CIFs before native filtering",
+    )
+    return write_candidates(run_dir, "pxdesign", merged)
 
 
-def _normalize_pxdesign_generation_candidates(run_dir: Path, params: dict, target_artifact: Path) -> list[dict]:
+def _normalize_pxdesign_generation_candidates(
+    run_dir: Path,
+    params: dict,
+    target_artifact: Path,
+    *,
+    write_output: bool = True,
+) -> list[dict]:
     raw_dir = run_dir / "artifacts" / "raw" / "pxdesign" / "output"
     structure_paths = sorted(path for path in raw_dir.glob("**/*.cif") if path.is_file())
     candidates: list[dict] = []
@@ -1310,7 +1461,7 @@ def _normalize_pxdesign_generation_candidates(run_dir: Path, params: dict, targe
                 },
             }
         )
-    return write_candidates(run_dir, "pxdesign", candidates)
+    return write_candidates(run_dir, "pxdesign", candidates) if write_output else candidates
 
 
 def _proteina_complexa_result_rows(run_dir: Path) -> tuple[Path | None, list[dict[str, str]]]:
@@ -1453,7 +1604,52 @@ def _normalize_proteina_complexa_candidates(run_dir: Path, params: dict, target_
                 },
             }
         )
-    return write_candidates(run_dir, "proteina_complexa", candidates)
+    raw_candidates: list[dict] = []
+    inference_root = run_dir / "artifacts" / "raw" / "proteina_complexa" / "inference"
+    for structure_path in sorted(inference_root.glob("**/job_*/*.pdb")):
+        if structure_path.name.endswith("_binder.pdb") or structure_path.name.endswith("_updated.pdb"):
+            continue
+        index = len(raw_candidates) + 1
+        binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
+            target_artifact,
+            structure_path,
+            params.get("target_chains", []),
+        )
+        sequences = _sequences_by_chain(structure_path)
+        raw_candidates.append(
+            {
+                "candidate_id": f"proteina_complexa_generated_{index:05d}",
+                "source_tool": "proteina_complexa",
+                "stage": STAGE_GENERATION_BACKBONE_SEQUENCE,
+                "target_pdb": _rel_path(run_dir, target_artifact),
+                "complex_pdb": _rel_path(run_dir, structure_path),
+                "binder_pdb": None,
+                "binder_sequence": "".join(sequences.get(chain, "") for chain in binder_chains) or None,
+                "target_chains": target_chains,
+                "binder_chains": binder_chains,
+                "hotspots": [token for token in params.get("hotspots", "").split(",") if token],
+                "binder_length": params.get("binder_length"),
+                "contig": None,
+                "metrics": {
+                    "result_kind": "generated_prefilter",
+                    "target_chain_inference": chain_inference,
+                },
+                "raw_metadata": {
+                    "result_kind": "generated_prefilter",
+                    "input_target_chains": params.get("target_chains", []),
+                    "target_chain_inference": chain_inference,
+                    "output_kind": "proteina_complexa_inference_prefilter",
+                },
+            }
+        )
+    merged = _merge_candidate_pools(
+        tool="proteina_complexa",
+        native_candidates=candidates,
+        raw_candidates=raw_candidates,
+        native_coverage="ranked Proteina-Complexa evaluation/filter result rows",
+        raw_coverage="generated Proteina-Complexa inference complexes before evaluation filtering",
+    )
+    return write_candidates(run_dir, "proteina_complexa", merged)
 
 
 def _normalize_rfdiffusion3_contig(contig: str) -> str:
@@ -1636,7 +1832,13 @@ def _infer_generated_chain_roles(target_artifact: Path, generated_structure: Pat
     return binder_chains, target_chains, inference
 
 
-def _normalize_rfdiffusion3_candidates(run_dir: Path, params: dict, target_artifact: Path) -> list[dict]:
+def _normalize_rfdiffusion3_candidates(
+    run_dir: Path,
+    params: dict,
+    target_artifact: Path,
+    *,
+    write_output: bool = True,
+) -> list[dict]:
     raw_dir = run_dir / "artifacts" / "raw" / "rfdiffusion3_foundry" / "rfd3"
     structure_paths = sorted([*raw_dir.glob("*.cif"), *raw_dir.glob("*.cif.gz")])
     metadata_paths = {path.stem.replace(".cif", ""): path for path in raw_dir.glob("*.json")}
@@ -1675,7 +1877,8 @@ def _normalize_rfdiffusion3_candidates(run_dir: Path, params: dict, target_artif
                 },
             }
         )
-    _write_candidates(run_dir, "rfdiffusion3_foundry", candidates)
+    if write_output:
+        _write_candidates(run_dir, "rfdiffusion3_foundry", candidates)
     return candidates
 
 
@@ -1796,8 +1999,56 @@ def _normalize_rfdiffusion3_foundry_native_candidates(run_dir: Path, params: dic
                 },
             }
         )
-    _write_candidates(run_dir, "rfdiffusion3_foundry", candidates)
-    return candidates
+    raw_candidates = _normalize_rfdiffusion3_candidates(
+        run_dir,
+        params,
+        target_artifact,
+        write_output=False,
+    )
+    mpnn_candidates: list[dict] = []
+    for mpnn_path in sorted(raw_root.glob("mpnn/**/*.cif")):
+        index = len(mpnn_candidates) + 1
+        binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
+            target_artifact,
+            mpnn_path,
+            params.get("target_chains", []),
+        )
+        sequences = _sequences_by_chain(mpnn_path)
+        mpnn_candidates.append(
+            {
+                "candidate_id": f"rfdiffusion3_foundry_mpnn_{index:05d}",
+                "source_tool": "rfdiffusion3_foundry",
+                "stage": STAGE_GENERATION_BACKBONE_SEQUENCE,
+                "target_pdb": _rel_path(run_dir, target_artifact),
+                "complex_pdb": _rel_path(run_dir, mpnn_path),
+                "binder_pdb": None,
+                "binder_sequence": "".join(sequences.get(chain, "") for chain in binder_chains) or None,
+                "target_chains": target_chains,
+                "binder_chains": binder_chains,
+                "hotspots": [token for token in params.get("hotspots", "").split(",") if token],
+                "binder_length": params.get("binder_length"),
+                "contig": params.get("contig"),
+                "metrics": {
+                    "result_kind": "foundry_mpnn_prefilter",
+                    "target_chain_inference": chain_inference,
+                },
+                "raw_metadata": {
+                    "result_kind": "foundry_mpnn_prefilter",
+                    "input_target_chains": params.get("target_chains", []),
+                    "target_chain_inference": chain_inference,
+                    "output_kind": "foundry_mpnn_prefilter",
+                },
+            }
+        )
+    merged = _merge_candidate_pools(
+        tool="rfdiffusion3_foundry",
+        native_candidates=candidates,
+        raw_candidates=[*mpnn_candidates, *raw_candidates],
+        native_coverage="RF3-folded native Foundry survivors",
+        raw_coverage="RFdiffusion3 and Foundry MPNN structures before RF3 survivor filtering",
+    )
+    _write_candidates(run_dir, "rfdiffusion3_foundry", merged)
+    return merged
 
 
 def _finish_design_job(run_dir: Path, success: bool, rc: int, candidates: list[dict], artifact_patterns: list[tuple[str, str]]) -> None:
@@ -2162,6 +2413,7 @@ def run_rfdiffusion_classic(
     complex_num_recycles: int = 3,
     analysis_keep_top_n: int = 100,
     analysis_thresholds: dict[str, float] | None = None,
+    gpu_device: object = "0",
 ) -> Path:
     hotspots = normalize_hotspots(hotspots) if hotspots else ""
     validate_rfdiffusion_inputs(contig, hotspots, binder_length, num_designs, timesteps)
@@ -2219,6 +2471,7 @@ def run_rfdiffusion_classic(
         "complex_num_recycles": complex_num_recycles,
         "analysis_keep_top_n": analysis_keep_top_n,
         "analysis_thresholds": analysis_thresholds or {},
+        "gpu_device": normalize_gpu_device(gpu_device),
         "pipeline_mode": "mn_protein_design_rfdiffusion",
     }
     job = create_job(
@@ -2336,8 +2589,7 @@ def run_rfdiffusion_classic(
             "docker",
             "run",
             "--rm",
-            "--gpus",
-            "all",
+            *docker_gpu_args(gpu_device),
             "-v",
             f"{job.run_dir}:/work",
             "-v",
@@ -2370,12 +2622,16 @@ def run_rfdiffusion_classic(
                     "omit_aas": str(mpnn_omit_aa or "CX"),
                     "seed": None,
                     "require_backbone_hotspot_filter_pass": bool(apply_backbone_hotspot_prefilter),
+                    "gpu_device": normalize_gpu_device(gpu_device),
                 },
             },
             {
                 "module": "monomer_refolding",
                 "tool": monomer_refolding_tool,
-                "params": {"min_plddt": float(thresholds.get("min_binder_plddt", 70.0))},
+                "params": {
+                    "min_plddt": float(thresholds.get("min_binder_plddt", 70.0)),
+                    "gpu_device": normalize_gpu_device(gpu_device),
+                },
             },
             {
                 "module": "complex_refolding",
@@ -2385,6 +2641,7 @@ def run_rfdiffusion_classic(
                     "template_mode": complex_template_mode,
                     "multimer": complex_multimer,
                     "num_recycles": complex_num_recycles,
+                    "gpu_device": normalize_gpu_device(gpu_device),
                 },
             },
             {
@@ -2458,6 +2715,7 @@ def run_bindcraft(
     max_trajectories: int = 1,
     filter_settings: str = "default_filters.json",
     advanced_settings_file: str = "default_4stage_multimer_mpnn.json",
+    gpu_device: object = "0",
 ) -> Path:
     if not target_chains:
         raise ValueError("At least one target chain is required.")
@@ -2476,9 +2734,6 @@ def run_bindcraft(
     advanced_settings_path = _ovo_bindcraft_resource("settings_advanced", advanced_settings_file)
     if not advanced_settings_path.exists():
         raise ValueError(f"Unknown BindCraft advanced settings file: {advanced_settings_file}")
-    if filter_settings == "no_filters.json":
-        filter_settings = "default_filters.json"
-
     manifest = load_manifest("bindcraft")
     params = {
         "target_chains": target_chains,
@@ -2493,6 +2748,7 @@ def run_bindcraft(
         "max_trajectories": max_trajectories,
         "filter_settings": filter_settings,
         "advanced_settings_file": advanced_settings_file,
+        "gpu_device": normalize_gpu_device(gpu_device),
     }
     job = create_job(
         DESIGN_GROUP,
@@ -2523,8 +2779,7 @@ def run_bindcraft(
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        "all",
+        *docker_gpu_args(gpu_device),
         "--shm-size=64G",
         "-v",
         f"{job.run_dir}:/work",
@@ -2583,6 +2838,7 @@ def run_rfdiffusion3_foundry(
     mpnn_checkpoint_path: str = "/weights/proteinmpnn_v_48_020.pt",
     rf3_checkpoint_path: str = "/weights/rf3_foundry_01_24_latest_remapped.ckpt",
     prepare_target_msa: bool = True,
+    gpu_device: object = "0",
 ) -> Path:
     hotspots = normalize_hotspots(hotspots) if hotspots else ""
     manifest = load_manifest("rfdiffusion3_foundry")
@@ -2605,6 +2861,7 @@ def run_rfdiffusion3_foundry(
         "mpnn_checkpoint_path": mpnn_checkpoint_path,
         "rf3_checkpoint_path": rf3_checkpoint_path,
         "prepare_target_msa": prepare_target_msa,
+        "gpu_device": normalize_gpu_device(gpu_device),
     }
     job = create_job(DESIGN_GROUP, "design_campaign", "rfdiffusion3_foundry", {"target_pdb": str(target_pdb), "target_chains": target_chains}, params)
     if campaign_name.strip():
@@ -2630,6 +2887,7 @@ def run_rfdiffusion3_foundry(
                 target_artifact,
                 target_chains,
                 raw_subdir="rfdiffusion3_foundry/rf3_msa_cache",
+                gpu_device=gpu_device,
             )
             params["target_msa_by_chain"] = msa_by_source_chain
             write_json(
@@ -2685,8 +2943,7 @@ def run_rfdiffusion3_foundry(
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        "all",
+        *docker_gpu_args(gpu_device),
         "-v",
         f"{job.run_dir}:/work",
         "-v",
@@ -2722,8 +2979,7 @@ def run_rfdiffusion3_foundry(
                     "docker",
                     "run",
                     "--rm",
-                    "--gpus",
-                    "all",
+                    *docker_gpu_args(gpu_device),
                     "-v",
                     f"{job.run_dir}:/work",
                     "-v",
@@ -2773,8 +3029,7 @@ def run_rfdiffusion3_foundry(
                         "docker",
                         "run",
                         "--rm",
-                        "--gpus",
-                        "all",
+                        *docker_gpu_args(gpu_device),
                         "-v",
                         f"{job.run_dir}:/work",
                         "-v",
@@ -2836,6 +3091,7 @@ def run_boltzgen(
     budget: int = 1,
     sampling_steps: int = 20,
     run_vanilla_pipeline: bool = True,
+    gpu_device: object = "0",
 ) -> Path:
     hotspots = normalize_hotspots(hotspots) if hotspots else ""
     lengths = parse_binder_lengths(binder_length)
@@ -2854,6 +3110,7 @@ def run_boltzgen(
         "budget": budget,
         "sampling_steps": sampling_steps,
         "run_vanilla_pipeline": run_vanilla_pipeline,
+        "gpu_device": normalize_gpu_device(gpu_device),
     }
     job = create_job(DESIGN_GROUP, "design_campaign", "boltzgen", {"target_pdb": str(target_pdb), "target_chains": target_chains}, params)
     raw_dir = job.run_dir / "artifacts" / "raw" / "boltzgen"
@@ -2915,7 +3172,24 @@ def run_boltzgen(
         f"{run_args}; "
         f"{output_check}"
     )
-    command = ["docker", "run", "--rm", "--gpus", "all", "--shm-size=64G", "--entrypoint", "/bin/bash", "-v", "/mnt/db/reference_files/boltzgen-cache:/cache", "-v", f"{job.run_dir}:/work", "-w", "/work", manifest["image"], "-lc", script]
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        *docker_gpu_args(gpu_device),
+        "--shm-size=64G",
+        "--entrypoint",
+        "/bin/bash",
+        "-v",
+        "/mnt/db/reference_files/boltzgen-cache:/cache",
+        "-v",
+        f"{job.run_dir}:/work",
+        "-w",
+        "/work",
+        manifest["image"],
+        "-lc",
+        script,
+    ]
     rc = _run_shell_steps(job.run_dir, [{"name": "boltzgen", "command": command}])
     if rc == 0 and run_vanilla_pipeline:
         candidates = _normalize_boltzgen_vanilla_candidates(job.run_dir, params, target_artifact)
@@ -2959,6 +3233,7 @@ def run_genie3(
     run_mode: str = "full_vanilla_pipeline",
     enable_beam_search: bool = False,
     beam_width: int = 4,
+    gpu_device: object = "0",
 ) -> Path:
     if not target_chains:
         raise ValueError("At least one target chain is required.")
@@ -3000,6 +3275,7 @@ def run_genie3(
         "run_mode": run_mode,
         "enable_beam_search": enable_beam_search,
         "beam_width": beam_width,
+        "gpu_device": normalize_gpu_device(gpu_device),
         "pipeline_mode": "genie3_vanilla_binder",
     }
     job = create_job(
@@ -3018,7 +3294,12 @@ def run_genie3(
     if folding_model_name == "boltz2":
         try:
             update_status(job.run_dir, "running")
-            boltz_msa_by_source_chain = _ensure_boltz_msas_for_target(job.run_dir, target_artifact, target_chains)
+            boltz_msa_by_source_chain = _ensure_boltz_msas_for_target(
+                job.run_dir,
+                target_artifact,
+                target_chains,
+                gpu_device=gpu_device,
+            )
         except Exception as exc:
             with (job.run_dir / "stderr.log").open("a") as stderr:
                 stderr.write(f"Boltz2 MSA cache preparation failed: {exc}\n")
@@ -3093,8 +3374,7 @@ def run_genie3(
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        "all",
+        *docker_gpu_args(gpu_device),
         "--shm-size=64G",
         "-v",
         "/mnt/db/reference_files/genie3/pretrained:/opt/genie3/pretrained:ro",
@@ -3150,6 +3430,7 @@ def run_pxdesign(
     use_fast_ln: bool = True,
     use_deepspeed_evo_attention: bool = False,
     prepare_target_msa: bool = True,
+    gpu_device: object = "0",
 ) -> Path:
     hotspots = normalize_hotspots(hotspots) if hotspots else ""
     lengths = parse_binder_lengths(binder_length)
@@ -3170,6 +3451,7 @@ def run_pxdesign(
         "use_fast_ln": use_fast_ln,
         "use_deepspeed_evo_attention": use_deepspeed_evo_attention,
         "prepare_target_msa": prepare_target_msa,
+        "gpu_device": normalize_gpu_device(gpu_device),
     }
     job = create_job(DESIGN_GROUP, "design_campaign", "pxdesign", {"target_pdb": str(target_pdb), "target_chains": target_chains}, params)
     if campaign_name.strip():
@@ -3188,6 +3470,7 @@ def run_pxdesign(
                 target_chains,
                 raw_subdir="pxdesign/input/msa",
                 yaml_base_dir=raw_dir,
+                gpu_device=gpu_device,
             )
             params["pxdesign_msa_dirs"] = pxdesign_msa_dirs
         except Exception as exc:
@@ -3265,8 +3548,7 @@ def run_pxdesign(
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        "all",
+        *docker_gpu_args(gpu_device),
         "-v",
         f"{job.run_dir}:/work",
         "-v",
@@ -3547,32 +3829,39 @@ def _normalize_protpardelle_1c_candidates(run_dir: Path, params: dict, target_ar
         for rank, candidate in enumerate(candidates, start=1):
             metrics = candidate.setdefault("metrics", {})
             metrics["native_final_rank"] = rank
-    if not candidates:
-        sample_paths = sorted(output_dir.glob("**/sample_*.pdb"))
-        for index, structure_path in enumerate(sample_paths, start=1):
-            binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
-                target_artifact,
-                structure_path,
-                params.get("target_chains", []),
-            )
-            candidates.append(
-                {
-                    "candidate_id": f"protpardelle_1c_{index:05d}",
-                    "source_tool": "protpardelle_1c",
-                    "stage": STAGE_GENERATION_BACKBONE,
-                    "target_pdb": _rel_path(run_dir, target_artifact),
-                    "complex_pdb": _rel_path(run_dir, structure_path),
-                    "binder_pdb": None,
-                    "binder_sequence": None,
-                    "target_chains": target_chains,
-                    "binder_chains": binder_chains,
-                    "hotspots": [token for token in params.get("hotspots", "").split(",") if token],
-                    "binder_length": params.get("binder_length"),
-                    "contig": params.get("motif_contig"),
-                    "metrics": {"result_kind": "generation_only", "target_chain_inference": chain_inference},
-                    "raw_metadata": {"result_kind": "generation_only", "target_chain_inference": chain_inference},
-                }
-            )
+    sample_candidates: list[dict] = []
+    sample_paths = sorted(output_dir.glob("**/sample_*.pdb"))
+    for index, structure_path in enumerate(sample_paths, start=1):
+        binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
+            target_artifact,
+            structure_path,
+            params.get("target_chains", []),
+        )
+        sample_candidates.append(
+            {
+                "candidate_id": f"protpardelle_1c_sample_{index:05d}",
+                "source_tool": "protpardelle_1c",
+                "stage": STAGE_GENERATION_BACKBONE,
+                "target_pdb": _rel_path(run_dir, target_artifact),
+                "complex_pdb": _rel_path(run_dir, structure_path),
+                "binder_pdb": None,
+                "binder_sequence": None,
+                "target_chains": target_chains,
+                "binder_chains": binder_chains,
+                "hotspots": [token for token in params.get("hotspots", "").split(",") if token],
+                "binder_length": params.get("binder_length"),
+                "contig": params.get("motif_contig"),
+                "metrics": {"result_kind": "generation_only", "target_chain_inference": chain_inference},
+                "raw_metadata": {"result_kind": "generation_only", "target_chain_inference": chain_inference},
+            }
+        )
+    candidates = _merge_candidate_pools(
+        tool="protpardelle_1c",
+        native_candidates=candidates,
+        raw_candidates=sample_candidates,
+        native_coverage="native Protpardelle ESMFold/MPNN metric rows",
+        raw_coverage="raw Protpardelle scaffold samples before ESMFold/MPNN filtering",
+    )
     return write_candidates(run_dir, "protpardelle_1c", candidates)
 
 
@@ -3592,6 +3881,7 @@ def run_protpardelle_1c(
     crop_cond_start: float = 0.0,
     batch_size: int = 1,
     seed: int = 7,
+    gpu_device: object = "0",
 ) -> Path:
     if not target_chains:
         raise ValueError("At least one target chain is required.")
@@ -3619,6 +3909,7 @@ def run_protpardelle_1c(
         "crop_cond_start": crop_cond_start,
         "batch_size": batch_size,
         "seed": seed,
+        "gpu_device": normalize_gpu_device(gpu_device),
         "contract": "protpardelle_1c_native_pipeline",
     }
     job = create_job(DESIGN_GROUP, "design_campaign", "protpardelle_1c", {"target_pdb": str(target_pdb), "target_chains": target_chains}, params)
@@ -3661,8 +3952,7 @@ def run_protpardelle_1c(
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        "all",
+        *docker_gpu_args(gpu_device),
         "-v",
         f"{job.run_dir}:/work",
         "-v",
@@ -3726,6 +4016,7 @@ def run_proteina_complexa(
     replicas: int = 2,
     seed: int = 5,
     batch_size: int = 1,
+    gpu_device: object = "0",
 ) -> Path:
     if not target_chains:
         raise ValueError("At least one target chain is required.")
@@ -3757,6 +4048,7 @@ def run_proteina_complexa(
         "replicas": replicas,
         "seed": seed,
         "batch_size": batch_size,
+        "gpu_device": normalize_gpu_device(gpu_device),
         "contract": "search_binder_local_pipeline",
     }
     job = create_job(DESIGN_GROUP, "design_campaign", "proteina_complexa", {"target_pdb": str(target_pdb), "target_chains": target_chains}, params)
@@ -3821,8 +4113,7 @@ def run_proteina_complexa(
                 "docker",
                 "run",
                 "--rm",
-                "--gpus",
-                "all",
+                *docker_gpu_args(gpu_device),
                 "-v",
                 f"{job.run_dir}:/work",
                 "-v",

@@ -8,15 +8,71 @@ import streamlit as st
 from mn_protein_design.core.candidates import candidate_stage_counts, read_candidates
 from mn_protein_design.core.jobs import (
     ACTIVE_STATUSES,
+    PAUSED_STATUSES,
+    STOPPED_STATUSES,
     collect_jobs,
     delete_job_run,
     deletion_plan,
     display_job_code,
     find_downstream_jobs,
+    pause_job,
     read_json,
+    resume_job,
+    stop_job,
 )
+from mn_protein_design.core.gpu import available_gpu_devices
+from mn_protein_design.core.runtime_estimator import collect_runtime_observations, estimate_job_runtime_with_observations
 from mn_protein_design.runtime import runs_root
 from mn_protein_design.workflows.campaigns import run_lineage_steps
+
+
+ESMFOLD2_PARAMETER_PRESETS: dict[str, dict[str, int]] = {
+    "Fast": {"num_loops": 3, "num_sampling_steps": 50},
+    "Standard": {"num_loops": 10, "num_sampling_steps": 68},
+    "Careful": {"num_loops": 20, "num_sampling_steps": 68},
+    "High diffusion": {"num_loops": 10, "num_sampling_steps": 200},
+    "Design rank": {"num_loops": 3, "num_sampling_steps": 200},
+}
+
+
+def esmfold2_preset_selector(
+    *,
+    key: str,
+    steps_key: str,
+    loops_key: str,
+    disabled: bool = False,
+    default: str = "Standard",
+) -> str:
+    options = list(ESMFOLD2_PARAMETER_PRESETS)
+    if default not in options:
+        default = "Standard"
+    preset = st.selectbox(
+        "ESMFold2 preset",
+        options,
+        index=options.index(default),
+        key=f"{key}_esmfold2_parameter_preset",
+        disabled=disabled,
+        help="Fills the ESMFold2 sampling steps and recycling loops. You can still edit those values manually.",
+    )
+    applied_key = f"{key}_esmfold2_parameter_preset_applied"
+    if st.session_state.get(applied_key) != preset:
+        values = ESMFOLD2_PARAMETER_PRESETS[preset]
+        st.session_state[steps_key] = int(values["num_sampling_steps"])
+        st.session_state[loops_key] = int(values["num_loops"])
+        st.session_state[applied_key] = preset
+    return str(preset)
+
+
+def esmfold2_preset_label(num_loops: object, num_sampling_steps: object) -> str:
+    try:
+        loops = int(float(str(num_loops)))
+        steps = int(float(str(num_sampling_steps)))
+    except (TypeError, ValueError):
+        return ""
+    for name, values in ESMFOLD2_PARAMETER_PRESETS.items():
+        if int(values["num_loops"]) == loops and int(values["num_sampling_steps"]) == steps:
+            return name
+    return f"Custom {loops}/{steps}"
 
 
 def selected_dataframe_rows(event: object, key: str | None = None) -> list[int]:
@@ -181,6 +237,19 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
         st.info("No jobs yet.")
         return
     df = pd.DataFrame(rows)
+    runtime_observations = collect_runtime_observations()
+    estimate_rows = []
+    for row in rows:
+        input_payload = read_json(Path(str(row.get("run_dir") or "")) / "input.json")
+        estimate_rows.append(
+            estimate_job_runtime_with_observations(
+                row,
+                input_payload=input_payload,
+                observations=runtime_observations,
+            )
+        )
+    df["estimated_time"] = [row.get("estimated_time", "n/a") for row in estimate_rows]
+    df["estimate_basis"] = [row.get("basis", "") for row in estimate_rows]
     df["job_code_link"] = df.apply(
         lambda row: (
             f"/results?task_group={row['task_group']}"
@@ -200,6 +269,8 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
             "queue_resource",
             "current_phase",
             "current_engine",
+            "estimated_time",
+            "estimate_basis",
             "created_at",
             "updated_at",
             "run_id",
@@ -231,9 +302,50 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
     table_widget_key = f"{table_key}_jobs_table"
     selected_indices = [idx for idx in selected_dataframe_rows(event, table_widget_key) if 0 <= idx < len(display_df)]
     selected_rows = display_df.iloc[selected_indices].copy() if selected_indices else display_df.iloc[0:0].copy()
+    selected_full_rows = df.iloc[selected_indices].copy() if selected_indices else df.iloc[0:0].copy()
+    active_action_rows = selected_full_rows[selected_full_rows["status"].isin(ACTIVE_STATUSES)]
+    paused_action_rows = selected_full_rows[selected_full_rows["status"].isin(PAUSED_STATUSES)]
+    resumable_action_rows = selected_full_rows[
+        selected_full_rows["status"].isin(PAUSED_STATUSES | STOPPED_STATUSES | {"failed"})
+    ]
+    action_cols = st.columns(3)
+    if action_cols[0].button(
+        "Pause selected",
+        disabled=active_action_rows.empty,
+        key=f"{table_key}_pause_selected_jobs",
+        help="Stops active local workers, releases GPU locks, and marks jobs paused for later resume.",
+    ):
+        for row in active_action_rows.to_dict(orient="records"):
+            pause_job(Path(str(row["run_dir"])), "Paused by user")
+        st.rerun()
+    if action_cols[1].button(
+        "Stop selected",
+        disabled=(active_action_rows.empty and paused_action_rows.empty),
+        key=f"{table_key}_stop_selected_jobs",
+        help="Cancels selected active or paused jobs without deleting artifacts.",
+    ):
+        for row in pd.concat([active_action_rows, paused_action_rows]).drop_duplicates("run_id").to_dict(orient="records"):
+            stop_job(Path(str(row["run_dir"])), "Stopped by user")
+        st.rerun()
+    if action_cols[2].button(
+        "Resume selected",
+        disabled=resumable_action_rows.empty,
+        key=f"{table_key}_resume_selected_jobs",
+        help="Queues selected paused/stopped local-worker jobs again when worker_request.json is available.",
+    ):
+        errors = []
+        for row in resumable_action_rows.to_dict(orient="records"):
+            try:
+                resume_job(Path(str(row["run_dir"])))
+            except Exception as exc:
+                errors.append(f"{row.get('job_code')}: {exc}")
+        if errors:
+            st.error("Some jobs could not be resumed: " + "; ".join(errors))
+        else:
+            st.rerun()
     active_selected = selected_rows[selected_rows["status"].isin(ACTIVE_STATUSES)]
     if not active_selected.empty:
-        st.warning("Running, queued, or preparing jobs cannot be deleted.")
+        st.warning("Running, queued, or preparing jobs cannot be deleted. Pause or stop them first.")
     selected_rows = selected_rows[~selected_rows["status"].isin(ACTIVE_STATUSES)]
     selected_refs = [
         (str(row["task_group"]), str(row["run_id"]))
@@ -263,6 +375,88 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
 
 def result_link(task_group: str, run_id: str, label: str = "Open result") -> str:
     return f"/results?task_group={task_group}&run_id={run_id}"
+
+
+def _job_gpu_device(row: dict) -> str:
+    input_payload = read_json(Path(str(row.get("run_dir") or "")) / "input.json")
+    params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+    raw = str(params.get("gpu_device") or "").strip()
+    if raw:
+        return raw.removeprefix("device=")
+    resource = str(row.get("queue_resource") or "").strip()
+    if resource.startswith("gpu:"):
+        return resource.removeprefix("gpu:")
+    if resource == "gpu":
+        return "all"
+    return ""
+
+
+def gpu_run_panel(*, key: str, default: str = "0") -> str:
+    options = available_gpu_devices()
+    if default not in options:
+        default = options[0] if options else "0"
+    rows = []
+    for row in collect_jobs():
+        if row.get("status") not in ACTIVE_STATUSES:
+            continue
+        resource = str(row.get("queue_resource") or "")
+        if not resource.startswith("gpu"):
+            continue
+        gpu_device = _job_gpu_device(row)
+        rows.append(
+            {
+                "result": result_link(str(row.get("task_group") or ""), str(row.get("run_id") or ""), "Open"),
+                "gpu": gpu_device or resource,
+                "status": row.get("status"),
+                "job_code": row.get("job_code"),
+                "task": row.get("task_group"),
+                "tool": row.get("tool"),
+                "phase": row.get("current_phase") or "",
+                "updated_at": row.get("updated_at") or "",
+                "run_id": row.get("run_id"),
+            }
+        )
+    assigned_gpus = {str(row.get("gpu") or "") for row in rows}
+    for option in options:
+        option_text = str(option)
+        if option_text in {"all", "none"} or option_text in assigned_gpus:
+            continue
+        rows.append(
+            {
+                "result": "",
+                "gpu": option_text,
+                "status": "idle",
+                "job_code": "",
+                "task": "",
+                "tool": "",
+                "phase": "",
+                "updated_at": "",
+                "run_id": "",
+            }
+        )
+    st.caption("GPU activity before launch/resume")
+    rows.sort(
+        key=lambda row: (
+            str(row.get("gpu") or ""),
+            1 if str(row.get("status") or "") == "idle" else 0,
+            str(row.get("status") or ""),
+            str(row.get("updated_at") or ""),
+        )
+    )
+    st.dataframe(
+        pd.DataFrame(rows),
+        hide_index=True,
+        width="stretch",
+        column_config={"result": st.column_config.LinkColumn("result", display_text="Open")},
+    )
+    selected_gpu = st.selectbox(
+        "GPU device",
+        options,
+        index=options.index(default),
+        key=f"{key}_gpu_device",
+        help="Pins Docker-backed GPU jobs to a host GPU. Inside a pinned container, the selected GPU appears as cuda:0.",
+    )
+    return str(selected_gpu)
 
 
 def source_from_run_dir(run_dir: Path) -> dict:

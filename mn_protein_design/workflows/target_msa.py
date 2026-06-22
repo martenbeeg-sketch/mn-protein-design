@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import shutil
 import subprocess
 from pathlib import Path
+
+from mn_protein_design.core.gpu import docker_gpu_args
+from mn_protein_design.runtime import runs_root
 
 
 AA3_TO_1 = {
@@ -33,6 +37,9 @@ AA3_TO_1 = {
 _A3M_SEQUENCE_ALLOWED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-")
 BOLTZ_CACHE_DIR = Path("/mnt/db/reference_files/boltz_models")
 BOLTZ_MSA_REPOSITORY_DIR = BOLTZ_CACHE_DIR / "msa_repository"
+ALPHAFAST_IMAGE = "alphafast:latest"
+ALPHAFAST_DB_DIR = Path("/mnt/db/reference_files/alignment")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _clean_key(text: str, fallback: str = "target") -> str:
@@ -77,6 +84,27 @@ def boltz_msa_paths(sequence: str, msa_repository_dir: Path = BOLTZ_MSA_REPOSITO
     return msa_repository_dir / filename, f"/msa_repository/{filename}"
 
 
+def _normalize_msa_query_sequence(sequence: str) -> str:
+    return re.sub(r"[^A-Za-z]+", "", str(sequence or "")).upper()
+
+
+def _first_a3m_query_sequence(path: Path) -> str:
+    sequence_lines: list[str] = []
+    in_first_record = False
+    for raw_line in path.read_text(errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            if in_first_record:
+                break
+            in_first_record = True
+            continue
+        if in_first_record:
+            sequence_lines.append(line.replace("-", ""))
+    return _normalize_msa_query_sequence("".join(sequence_lines))
+
+
 def validate_a3m_file(path: Path) -> tuple[bool, str]:
     if not path.exists():
         return False, "file does not exist"
@@ -107,6 +135,46 @@ def validate_a3m_file(path: Path) -> tuple[bool, str]:
     if not saw_sequence:
         return False, "contains headers only and no sequence"
     return True, ""
+
+
+def find_cached_msa_for_sequence(
+    sequence: str,
+    msa_repository_dir: Path = BOLTZ_MSA_REPOSITORY_DIR,
+) -> tuple[Path | None, str]:
+    """Find a valid cached A3M for an exact protein sequence.
+
+    The canonical cache path is the SHA256 of the sequence, but older app runs may
+    have written valid A3Ms with job-local or descriptive filenames. Scanning by
+    the first A3M/query sequence lets new runs reuse those files without tying MSA
+    discovery to a particular target-preparation run ID.
+    """
+    cleaned_sequence = "".join(str(sequence or "").split()).upper()
+    if not cleaned_sequence:
+        return None, "empty sequence"
+    host_path, _container_path = boltz_msa_paths(cleaned_sequence, msa_repository_dir=msa_repository_dir)
+    valid, reason = validate_a3m_file(host_path)
+    if valid:
+        return host_path, "sequence_hash"
+    if host_path.exists():
+        repaired = _repair_a3m_file(host_path)
+        if repaired:
+            return host_path, "sequence_hash_repaired"
+    if not Path(msa_repository_dir).exists():
+        return None, f"repository missing; hash path: {reason}"
+
+    expected_query = _normalize_msa_query_sequence(cleaned_sequence)
+    for candidate in sorted(Path(msa_repository_dir).glob("**/*.a3m")):
+        if candidate == host_path:
+            continue
+        valid, _candidate_reason = validate_a3m_file(candidate)
+        if not valid and not _repair_a3m_file(candidate):
+            continue
+        try:
+            if _first_a3m_query_sequence(candidate) == expected_query:
+                return candidate, "sequence_scan"
+        except Exception:
+            continue
+    return None, reason or "no sequence-matched A3M in repository"
 
 
 def _validate_a3m_payload(raw: bytes) -> tuple[bool, str]:
@@ -155,7 +223,123 @@ def _write_boltz_msa_probe_yaml(path: Path, sequence: str) -> None:
     )
 
 
-def ensure_boltz_msa_for_sequence(run_dir: Path, sequence: str, label: str, raw_subdir: str = "target_msa") -> str:
+def _repo_and_runs_mounts() -> list[str]:
+    mounts = ["-v", f"{REPO_ROOT}:{REPO_ROOT}"]
+    try:
+        run_root = runs_root().resolve()
+        repo_root = REPO_ROOT.resolve()
+    except Exception:
+        return mounts
+    try:
+        run_root.relative_to(repo_root)
+    except ValueError:
+        mounts.extend(["-v", f"{run_root}:{run_root}"])
+    return mounts
+
+
+def _write_alphafast_msa_input(path: Path, sequence: str, label: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "dialect": "alphafold3",
+                "version": 4,
+                "name": _clean_key(label),
+                "sequences": [
+                    {
+                        "protein": {
+                            "id": "A",
+                            "sequence": sequence,
+                            "templates": [],
+                        }
+                    }
+                ],
+                "modelSeeds": [1],
+            },
+            indent=2,
+        )
+    )
+
+
+def _extract_alphafast_unpaired_msa(output_dir: Path, sequence: str) -> str:
+    for data_json in sorted(output_dir.glob("*/*_data.json")):
+        try:
+            payload = json.loads(data_json.read_text())
+        except Exception:
+            continue
+        for entry in payload.get("sequences") or []:
+            protein = entry.get("protein") if isinstance(entry, dict) else None
+            if not isinstance(protein, dict):
+                continue
+            if str(protein.get("sequence") or "").strip() != sequence:
+                continue
+            msa_text = str(protein.get("unpairedMsa") or "").strip()
+            if msa_text:
+                return msa_text + "\n"
+    return ""
+
+
+def _ensure_alphafast_mmseqs_msa_for_sequence(
+    run_dir: Path,
+    sequence: str,
+    label: str,
+    raw_subdir: str,
+    gpu_device: object,
+    image: str = ALPHAFAST_IMAGE,
+    db_dir: Path = ALPHAFAST_DB_DIR,
+) -> str:
+    if not db_dir.exists():
+        raise RuntimeError(f"AlphaFast database directory does not exist: {db_dir}")
+    if not (db_dir / "mmseqs").exists():
+        raise RuntimeError(f"AlphaFast database directory must contain an mmseqs subdirectory: {db_dir / 'mmseqs'}")
+    probe_dir = run_dir / "artifacts" / "raw" / raw_subdir / _clean_key(label)
+    input_dir = probe_dir / "input"
+    output_dir = probe_dir / "alphafast_output"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_alphafast_msa_input(input_dir / f"{_clean_key(label)}.json", sequence, label)
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        *docker_gpu_args(gpu_device),
+        *_repo_and_runs_mounts(),
+        "-v",
+        f"{db_dir}:/data/public_databases:ro",
+        "-v",
+        f"{db_dir / 'mmseqs'}:/data/mmseqs_databases:ro",
+        "-w",
+        "/app/alphafold",
+        image,
+        "python",
+        "/app/alphafold/run_data_pipeline.py",
+        f"--input_dir={input_dir}",
+        f"--output_dir={output_dir}",
+        "--db_dir=/data/public_databases",
+        "--mmseqs_db_dir=/data/mmseqs_databases",
+        "--use_mmseqs_gpu",
+        "--batch_size=1",
+    ]
+    with (run_dir / "stdout.log").open("a") as stdout, (run_dir / "stderr.log").open("a") as stderr:
+        stdout.write(f"$ {' '.join(command)}\n")
+        stdout.write(f"Local AlphaFast/MMseqs MSA cache miss for {label}\n")
+        stdout.flush()
+        completed = subprocess.run(command, stdout=stdout, stderr=stderr, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(f"AlphaFast/MMseqs MSA preparation failed for {label} with return code {completed.returncode}.")
+    msa_text = _extract_alphafast_unpaired_msa(output_dir, sequence)
+    if not msa_text:
+        raise RuntimeError(f"AlphaFast/MMseqs did not produce an unpaired MSA for {label}.")
+    return msa_text
+
+
+def ensure_boltz_msa_for_sequence(
+    run_dir: Path,
+    sequence: str,
+    label: str,
+    raw_subdir: str = "target_msa",
+    gpu_device: object = "0",
+    msa_source: str = "alphafast_mmseqs_gpu",
+) -> str:
     host_path, container_path = boltz_msa_paths(sequence)
     host_path.parent.mkdir(parents=True, exist_ok=True)
     valid, reason = validate_a3m_file(host_path)
@@ -167,6 +351,28 @@ def ensure_boltz_msa_for_sequence(run_dir: Path, sequence: str, label: str, raw_
             stdout.write(f"MSA cache hit for {label}: {host_path}\n")
         return container_path
 
+    if str(msa_source or "").strip().lower() in {"alphafast_mmseqs_gpu", "local_alphafast_mmseqs_gpu", "local"}:
+        payload = _ensure_alphafast_mmseqs_msa_for_sequence(
+            run_dir,
+            sequence,
+            label,
+            raw_subdir=raw_subdir,
+            gpu_device=gpu_device,
+        ).encode("utf-8").rstrip(b"\x00").replace(b"\r\n", b"\n")
+        valid_payload, payload_reason = _validate_a3m_payload(payload)
+        if not valid_payload:
+            raise RuntimeError(f"AlphaFast/MMseqs produced invalid A3M for {label}: {payload_reason}.")
+        host_path.write_bytes(payload)
+        valid, reason = validate_a3m_file(host_path)
+        if not valid:
+            raise RuntimeError(f"Cached AlphaFast/MMseqs MSA is invalid for {label}: {reason}.")
+        with (run_dir / "stdout.log").open("a") as stdout:
+            stdout.write(f"MSA cached for {label} from local AlphaFast/MMseqs GPU: {host_path}\n")
+        return container_path
+
+    if str(msa_source or "").strip().lower() not in {"boltz_msa_server", "boltz_server", "remote_boltz_msa_server"}:
+        raise RuntimeError(f"Unknown target MSA source: {msa_source}")
+
     probe_dir = run_dir / "artifacts" / "raw" / raw_subdir / _clean_key(label)
     probe_dir.mkdir(parents=True, exist_ok=True)
     yaml_path = probe_dir / "input.yaml"
@@ -175,8 +381,7 @@ def ensure_boltz_msa_for_sequence(run_dir: Path, sequence: str, label: str, raw_
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        "all",
+        *docker_gpu_args(gpu_device),
         "-v",
         f"{probe_dir}:/work",
         "-v",
@@ -231,13 +436,20 @@ def ensure_boltz_msas_for_target(
     target_artifact: Path,
     target_chains: list[str] | None = None,
     raw_subdir: str = "target_msa",
+    gpu_device: object = "0",
 ) -> dict[str, str]:
     sequences = target_chain_sequences(target_artifact, target_chains)
     msa_paths: dict[str, str] = {}
     for chain, sequence in sequences.items():
         if not sequence:
             continue
-        msa_paths[chain] = ensure_boltz_msa_for_sequence(run_dir, sequence, f"target_chain_{chain}", raw_subdir=raw_subdir)
+        msa_paths[chain] = ensure_boltz_msa_for_sequence(
+            run_dir,
+            sequence,
+            f"target_chain_{chain}",
+            raw_subdir=raw_subdir,
+            gpu_device=gpu_device,
+        )
     return msa_paths
 
 
@@ -247,6 +459,7 @@ def ensure_pxdesign_msa_dirs_for_target(
     target_chains: list[str] | None = None,
     raw_subdir: str = "pxdesign/input/msa",
     yaml_base_dir: Path | None = None,
+    gpu_device: object = "0",
 ) -> dict[str, str]:
     """Create PXDesign-compatible MSA directories from the shared A3M cache.
 
@@ -262,7 +475,13 @@ def ensure_pxdesign_msa_dirs_for_target(
     for chain, sequence in sequences.items():
         if not sequence:
             continue
-        ensure_boltz_msa_for_sequence(run_dir, sequence, f"target_chain_{chain}", raw_subdir=raw_subdir)
+        ensure_boltz_msa_for_sequence(
+            run_dir,
+            sequence,
+            f"target_chain_{chain}",
+            raw_subdir=raw_subdir,
+            gpu_device=gpu_device,
+        )
         host_msa, _container_msa = boltz_msa_paths(sequence)
         valid, reason = validate_a3m_file(host_msa)
         if not valid:

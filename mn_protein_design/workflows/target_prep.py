@@ -98,9 +98,16 @@ def prepare_target(
             },
         }
         msa_by_chain = {}
+        source_msa_by_chain = {}
         msa_error = ""
         if prepare_msa:
             try:
+                source_msa_by_chain = ensure_boltz_msas_for_target(
+                    job.run_dir,
+                    raw_target,
+                    sorted(keep_chain_set or []),
+                    raw_subdir="source_target_msa",
+                )
                 msa_by_chain = ensure_boltz_msas_for_target(
                     job.run_dir,
                     trimmed_target,
@@ -108,6 +115,7 @@ def prepare_target(
                     raw_subdir="target_msa",
                 )
                 target_payload["boltz_msa_by_chain"] = msa_by_chain
+                target_payload["source_boltz_msa_by_chain"] = source_msa_by_chain
             except Exception as exc:
                 msa_error = str(exc)
                 with (job.run_dir / "stderr.log").open("a") as stderr:
@@ -147,11 +155,13 @@ def prepare_target(
                 "outputs": {"artifacts": artifacts, "target": target_payload},
                 "metrics": {**stats, **mapping_metrics, **repair_metrics},
                 "target_msa_by_chain": msa_by_chain,
+                "source_target_msa_by_chain": source_msa_by_chain,
                 "target_msa_error": msa_error,
                 "downstream_artifacts": {
                     "target_clean_pdb": "artifacts/target_clean.pdb",
                     "target_trimmed_pdb": "artifacts/target_trimmed.pdb",
                     "target_msa_by_chain": msa_by_chain,
+                    "source_target_msa_by_chain": source_msa_by_chain,
                     **({"target_mapped_pdb": "artifacts/target_mapped.pdb"} if map_known_modified_residues else {}),
                     **({"target_repaired_pdb": "artifacts/target_repaired.pdb"} if replace_nonstandard_residues else {}),
                     "target_json": "artifacts/target.json",

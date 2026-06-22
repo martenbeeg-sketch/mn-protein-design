@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import random
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -9,13 +11,18 @@ from typing import Any
 import numpy as np
 
 from mn_protein_design.core.candidates import STAGE_COMPLEX_REFOLDING, write_candidates
+from mn_protein_design.core.gpu import docker_gpu_args, normalize_gpu_device
 from mn_protein_design.core.jobs import create_job, finish_job, update_status, write_json
+from mn_protein_design.core.structures import filter_pdb_text
 
 
 DESIGN_GROUP = "design"
 BIOHUB_ESM_ROOT = Path("/mnt/db/reference_files/biohub-esm")
 ESMFOLD2_MODEL_DIR = BIOHUB_ESM_ROOT / "ESMFold2"
 ESMC_MODEL_DIR = BIOHUB_ESM_ROOT / "ESMC-6B"
+ESMFOLD2_BINDER_MODEL_ROOT = BIOHUB_ESM_ROOT / "binder-design"
+ESMFOLD2_BINDER_IMAGE = "mnprot-biohub-esm-cu128:latest"
+DEFAULT_BINDER_MODEL = "ESMFold2-Experimental-Fast"
 VENDORED_ESM_DIR = Path(__file__).resolve().parents[2] / "tools_to_implement" / "esm"
 AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
 SOLUBLE_AA_WEIGHTS = {
@@ -521,3 +528,188 @@ def run_esmfold2_binder_screening(
             stderr.write(f"{type(exc).__name__}: {exc}\n")
         finish_job(job.run_dir, False, {"metrics": {"error": str(exc)}})
         raise
+
+
+def run_esmfold2_native_binder_design(
+    *,
+    target_pdb: Path,
+    target_chain: str,
+    hotspots: str = "",
+    binder_length: int = 60,
+    num_designs: int = 1,
+    campaign_name: str = "",
+    optimization_steps: int = 150,
+    learning_rate: float = 0.1,
+    seed: int = 0,
+    model_name: str = DEFAULT_BINDER_MODEL,
+    compile_model: bool = False,
+    checkpoint_lm: bool = False,
+    gpu_device: object = "0",
+) -> Path:
+    """Run Biohub's released gradient-guided ESMFold2 binder design protocol."""
+    target_pdb = Path(target_pdb)
+    target_sequences, _ = _target_sequences(target_pdb, [target_chain])
+    if target_chain not in target_sequences:
+        raise ValueError(f"Target chain {target_chain!r} was not found in {target_pdb}.")
+    if binder_length < 1:
+        raise ValueError("Binder length must be at least 1.")
+    if num_designs < 1:
+        raise ValueError("Design attempts must be at least 1.")
+    if optimization_steps < 1:
+        raise ValueError("Optimization steps must be at least 1.")
+    if learning_rate <= 0:
+        raise ValueError("Learning rate must be positive.")
+
+    model_dir = ESMFOLD2_BINDER_MODEL_ROOT / model_name
+    if not model_dir.exists():
+        raise FileNotFoundError(
+            f"Required ESMFold2 binder-design checkpoint is missing: {model_dir}. "
+            "Run the Biohub ESM model setup command first."
+        )
+
+    params = {
+        "target_chain": target_chain,
+        "target_chains": [target_chain],
+        "hotspots": hotspots,
+        "binder_length": int(binder_length),
+        "num_designs": int(num_designs),
+        "campaign_name": campaign_name.strip(),
+        "optimization_steps": int(optimization_steps),
+        "learning_rate": float(learning_rate),
+        "seed": int(seed),
+        "model_name": model_name,
+        "compile_model": bool(compile_model),
+        "checkpoint_lm": bool(checkpoint_lm),
+        "gpu_device": normalize_gpu_device(gpu_device),
+        "pipeline_mode": "biohub_esmfold2_gradient_binder_design",
+        "memory_profile": "lean_shared_model",
+    }
+    job = create_job(
+        DESIGN_GROUP,
+        "design_campaign",
+        "esmfold2_binder_design",
+        {"target_pdb": str(target_pdb), "target_chains": [target_chain]},
+        params,
+    )
+    if campaign_name.strip():
+        update_status(job.run_dir, "queued", campaign_name=campaign_name.strip())
+
+    raw_dir = job.run_dir / "artifacts" / "raw" / "esmfold2_binder_design"
+    output_dir = raw_dir / "output"
+    config_dir = raw_dir / "config"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    target_artifact = raw_dir / "target.pdb"
+    target_artifact.write_text(
+        filter_pdb_text(
+            target_pdb.read_text(errors="ignore"),
+            keep_chains={target_chain},
+        )
+    )
+    config = {
+        "target_sequence": target_sequences[target_chain],
+        "binder_length": int(binder_length),
+        "num_designs": int(num_designs),
+        "optimization_steps": int(optimization_steps),
+        "learning_rate": float(learning_rate),
+        "seed": int(seed),
+        "model_name": model_name,
+        "compile": bool(compile_model),
+        "checkpoint_lm": bool(checkpoint_lm),
+        "tutorial_path": "/opt/esm/cookbook/tutorials/binder_design.py",
+        "reference_root": "/ref/biohub-esm",
+        "output_dir": "/work/artifacts/raw/esmfold2_binder_design/output",
+    }
+    config_path = config_dir / "binder_design.json"
+    write_json(config_path, config)
+
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        *docker_gpu_args(gpu_device),
+        "--shm-size=32G",
+        "-v",
+        f"{job.run_dir}:/work",
+        "-v",
+        f"{BIOHUB_ESM_ROOT}:/ref/biohub-esm:ro",
+        "-v",
+        "mn-protein-design_biohub-esm-hf-cache:/cache/huggingface",
+        ESMFOLD2_BINDER_IMAGE,
+        "biohub-esm-binder-design",
+        "--config",
+        "/work/artifacts/raw/esmfold2_binder_design/config/binder_design.json",
+    ]
+    write_json(job.run_dir / "command.json", {"mode": "docker", "steps": [{"name": "esmfold2_binder_design", "command": command}]})
+    update_status(job.run_dir, "running")
+    with (job.run_dir / "stdout.log").open("a") as stdout, (job.run_dir / "stderr.log").open("a") as stderr:
+        proc = subprocess.run(command, stdout=stdout, stderr=stderr, check=False)
+    rc = int(proc.returncode)
+
+    candidates: list[dict[str, Any]] = []
+    metrics_path = output_dir / "design_metrics.json"
+    if rc == 0 and metrics_path.exists():
+        payload = json.loads(metrics_path.read_text())
+        for design in payload.get("designs") or []:
+            design_index = int(design.get("design_index") or len(candidates) + 1)
+            critics = design.get("critics") or []
+            critic = max(
+                critics,
+                key=lambda row: float(row.get("iptm") or row.get("distogram_iptm_proxy") or 0.0),
+                default={},
+            )
+            complex_value = critic.get("complex_path")
+            complex_path = None
+            if complex_value:
+                complex_path = output_dir / Path(str(complex_value)).name
+            candidates.append(
+                {
+                    "candidate_id": f"esmfold2_design_{design_index:05d}",
+                    "source_tool": "esmfold2_binder_design",
+                    "stage": STAGE_COMPLEX_REFOLDING,
+                    "target_pdb": str(target_artifact.relative_to(job.run_dir)),
+                    "complex_pdb": str(complex_path.relative_to(job.run_dir)) if complex_path and complex_path.exists() else None,
+                    "binder_pdb": None,
+                    "binder_sequence": design.get("binder_sequence"),
+                    "target_chains": ["A"],
+                    "binder_chains": ["B"],
+                    "hotspots": [token for token in re.split(r"[\s,;]+", hotspots) if token],
+                    "binder_length": str(design.get("binder_length") or binder_length),
+                    "contig": None,
+                    "metrics": {
+                        "result_kind": "native_pipeline",
+                        "complex_refolding_backend": "biohub_esmfold2_gradient_design",
+                        "final_loss": critic.get("final_loss"),
+                        "iptm": critic.get("iptm"),
+                        "distogram_iptm_proxy": critic.get("distogram_iptm_proxy"),
+                        "native_design_rank": design_index,
+                    },
+                    "raw_metadata": {
+                        "result_kind": "native_pipeline",
+                        "model_name": model_name,
+                        "memory_profile": payload.get("profile"),
+                        "input_target_chain": target_chain,
+                        "output_target_chain": "A",
+                        "output_binder_chain": "B",
+                        "critics": critics,
+                    },
+                }
+            )
+        write_candidates(job.run_dir, "esmfold2_binder_design", candidates)
+
+    finish_job(
+        job.run_dir,
+        rc == 0 and bool(candidates),
+        {
+            "outputs": {
+                "candidates": str(job.run_dir / "artifacts" / "normalized_candidates" / "candidates.jsonl"),
+                "raw_output": str(output_dir),
+            },
+            "metrics": {
+                "return_code": rc,
+                "candidate_count": len(candidates),
+                "model_name": model_name,
+            },
+        },
+    )
+    return job.run_dir

@@ -9,6 +9,7 @@ from typing import Any
 
 from mn_protein_design.core.artifacts import Artifact, artifact_path
 from mn_protein_design.core.candidates import STAGE_GENERATION_BACKBONE, STAGE_SEQUENCE_DESIGN, read_candidates, write_candidates
+from mn_protein_design.core.gpu import docker_gpu_args, normalize_gpu_device
 from mn_protein_design.core.jobs import create_job, finish_job, update_status, write_json
 from mn_protein_design.core.manifests import load_manifest
 
@@ -197,6 +198,9 @@ def _normalize_ligandmpnn_candidates(
                             "fasta_header": seq_row.get("header"),
                             "sequence_index": sequence_index,
                             "ligandmpnn_design_index": design_index,
+                            "fixed_residues": params.get("fixed_residues_by_candidate", {}).get(
+                                source_id, []
+                            ),
                         },
                     }
                 )
@@ -213,6 +217,9 @@ def run_ligandmpnn_sequence_design(
     omit_aas: str = "CX",
     seed: int | None = None,
     require_backbone_hotspot_filter_pass: bool = False,
+    accepted_stages: list[str] | None = None,
+    fixed_residues_by_candidate: dict[str, list[str]] | None = None,
+    gpu_device: object = "0",
 ) -> Path:
     source_run_dir = Path(source_run_dir)
     candidates_jsonl = Path(candidates_jsonl)
@@ -220,8 +227,9 @@ def run_ligandmpnn_sequence_design(
         raise ValueError("model_type must be protein_mpnn, ligand_mpnn, or soluble_mpnn.")
     if num_seq_per_target < 1:
         raise ValueError("Sequences per backbone must be at least 1.")
+    accepted_stage_set = set(accepted_stages or [STAGE_GENERATION_BACKBONE])
     source_candidates = [
-        candidate for candidate in read_candidates(candidates_jsonl) if candidate.get("stage") == STAGE_GENERATION_BACKBONE
+        candidate for candidate in read_candidates(candidates_jsonl) if candidate.get("stage") in accepted_stage_set
     ]
     if require_backbone_hotspot_filter_pass:
         source_candidates = [
@@ -230,9 +238,15 @@ def run_ligandmpnn_sequence_design(
             if (candidate.get("metrics") or {}).get("passes_backbone_hotspot_filter") is not False
         ]
     if not source_candidates:
-        raise ValueError("No generation.backbone candidates were found in the selected candidate set after filters.")
+        raise ValueError(
+            "No candidates with an accepted stage were found in the selected candidate set after filters."
+        )
 
     manifest = load_manifest("ligandmpnn")
+    fixed_residues_by_candidate = {
+        str(candidate_id): [str(residue) for residue in residues if str(residue).strip()]
+        for candidate_id, residues in (fixed_residues_by_candidate or {}).items()
+    }
     params = {
         "source_run_dir": str(source_run_dir),
         "candidates_jsonl": str(candidates_jsonl),
@@ -243,6 +257,9 @@ def run_ligandmpnn_sequence_design(
         "omit_AAs": omit_aas,
         "seed": seed,
         "require_backbone_hotspot_filter_pass": require_backbone_hotspot_filter_pass,
+        "accepted_stages": sorted(accepted_stage_set),
+        "fixed_residues_by_candidate": fixed_residues_by_candidate,
+        "gpu_device": normalize_gpu_device(gpu_device),
     }
     job = create_job(
         DESIGN_GROUP,
@@ -296,12 +313,14 @@ def run_ligandmpnn_sequence_design(
         ]
         if seed is not None:
             args.extend(["--seed", str(seed)])
+        fixed_residues = fixed_residues_by_candidate.get(source_id, [])
+        if fixed_residues:
+            args.extend(["--fixed_residues", " ".join(fixed_residues)])
         command = [
             "docker",
             "run",
             "--rm",
-            "--gpus",
-            "all",
+            *docker_gpu_args(gpu_device),
             "-v",
             f"{job.run_dir}:/work",
             "-w",
@@ -471,6 +490,7 @@ def run_foundry_mpnn_sequence_design(
     batch_size: int = 10,
     model_type: str = "ligand_mpnn",
     checkpoint_path: str = "/weights/ligandmpnn_v_32_010_25.pt",
+    gpu_device: object = "0",
 ) -> Path:
     source_run_dir = Path(source_run_dir)
     candidates_jsonl = Path(candidates_jsonl)
@@ -492,6 +512,7 @@ def run_foundry_mpnn_sequence_design(
         "batch_size": batch_size,
         "model_type": model_type,
         "checkpoint_path": checkpoint_path,
+        "gpu_device": normalize_gpu_device(gpu_device),
     }
     job = create_job(
         DESIGN_GROUP,
@@ -526,8 +547,7 @@ def run_foundry_mpnn_sequence_design(
             "docker",
             "run",
             "--rm",
-            "--gpus",
-            "all",
+            *docker_gpu_args(gpu_device),
             "-v",
             f"{job.run_dir}:/work",
             "-v",

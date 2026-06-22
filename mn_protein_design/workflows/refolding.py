@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import yaml
 
+from mn_protein_design.core.gpu import docker_gpu_args, normalize_gpu_device
 from mn_protein_design.core.candidates import (
     STAGE_COMPLEX_REFOLDING,
     STAGE_GENERATION_BACKBONE_SEQUENCE,
@@ -130,6 +131,63 @@ def _strip_monomer_suffix(candidate_id: object) -> str:
 
 def _clean_sequence(value: object) -> str:
     return "".join(ch for ch in str(value or "").upper() if ch.isalpha())
+
+
+def _a3m_sequence_count(path: Path | None) -> int:
+    if path is None or not Path(path).exists():
+        return 0
+    count = 0
+    seen_sequence = False
+    try:
+        for raw_line in Path(path).read_text(errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if seen_sequence:
+                    count += 1
+                seen_sequence = False
+            else:
+                seen_sequence = True
+    except OSError:
+        return 0
+    if seen_sequence:
+        count += 1
+    return count
+
+
+def _msa_status(path: Path | None, *, expected_sequence: object = "", record_sequence: object = "") -> tuple[str, int]:
+    if path is None or not Path(path).exists():
+        return "missing", 0
+    expected = _clean_sequence(expected_sequence)
+    recorded = _clean_sequence(record_sequence)
+    if expected and recorded and expected != recorded:
+        return "sequence_mismatch", _a3m_sequence_count(path)
+    sequence_count = _a3m_sequence_count(path)
+    if sequence_count <= 0:
+        return "empty", sequence_count
+    if sequence_count == 1:
+        return "query_only", sequence_count
+    return "real_msa", sequence_count
+
+
+def _resolve_msa_record(
+    *,
+    chain: str,
+    sequence: object,
+    msa_records: dict[str, dict[str, str]],
+    used_msa_records: set[str],
+) -> tuple[str, dict[str, str] | None, str]:
+    if chain in msa_records and chain not in used_msa_records:
+        return chain, msa_records[chain], "chain"
+    clean_sequence = _clean_sequence(sequence)
+    if clean_sequence:
+        for candidate_chain, record in msa_records.items():
+            if candidate_chain in used_msa_records:
+                continue
+            if _clean_sequence(record.get("sequence")) == clean_sequence:
+                return candidate_chain, record, "sequence"
+    return "", None, "none"
 
 
 def _load_run_csv_msa_records(run_csv: Path | None) -> dict[str, dict[str, dict[str, str]]]:
@@ -258,20 +316,29 @@ def _write_rf3_json_inputs(
     rf3_inputs: dict[str, Path] = {}
     metrics = {
         "rf3_target_msa_injected_count": 0,
+        "rf3_target_msa_real_count": 0,
+        "rf3_target_msa_query_only_count": 0,
         "rf3_target_msa_missing_count": 0,
         "rf3_target_msa_sequence_mismatch_count": 0,
+        "rf3_binder_no_msa_count": 0,
+        "rf3_query_only_msa_fallback_count": 0,
     }
     msa_dir = input_dir / "msas"
     msa_dir.mkdir(parents=True, exist_ok=True)
+    manifest_records: list[dict[str, Any]] = []
     for safe_id, staged_path in staged.items():
         source = next(item for item in source_candidates if safe_id == _safe_id(item.get("candidate_id")))
+        candidate_id = str(source.get("candidate_id") or safe_id)
+        raw = source.get("raw_metadata") if isinstance(source.get("raw_metadata"), dict) else {}
+        capacity_target_only = bool(raw.get("capacity_target_only"))
         binder_chains = _candidate_chains(source, "binder_chains", ["A"])
         target_chains = _candidate_chains(source, "target_chains", [])
-        if not target_chains:
+        if capacity_target_only:
+            target_chains = []
+        elif not target_chains:
             _inferred_binder, target_chains = _infer_chain_roles(source_run_dir, source)
-        target_set = set(target_chains)
+        target_set = set(binder_chains if capacity_target_only else target_chains)
         sequences = _pdb_sequences_by_chain(staged_path)
-        raw = source.get("raw_metadata") if isinstance(source.get("raw_metadata"), dict) else {}
         row = raw.get("repo_run_csv_row") if isinstance(raw.get("repo_run_csv_row"), dict) else {}
         declared_sequences: dict[str, str] = {}
         for chain in binder_chains:
@@ -289,34 +356,83 @@ def _write_rf3_json_inputs(
         used_msa_records: set[str] = set()
         for chain, sequence in sequences.items():
             component = {"seq": sequence, "chain_id": chain}
+            role = "target" if chain in target_set else "binder"
+            manifest_row: dict[str, Any] = {
+                "candidate_id": candidate_id,
+                "safe_id": safe_id,
+                "engine_chain": chain,
+                "role": role,
+                "sequence_length": len(_clean_sequence(sequence)),
+                "msa_status": "disabled" if not use_target_msa else "no_msa_expected",
+                "source_record_chain": None,
+                "source_match": None,
+                "source_msa_path": None,
+                "staged_msa_path": None,
+                "msa_sequence_count": 0,
+            }
+            if role == "binder":
+                metrics["rf3_binder_no_msa_count"] += 1
             if use_target_msa and chain in target_set:
-                record_chain = chain if chain in msa_records else ""
-                if not record_chain:
-                    for candidate_chain, record in msa_records.items():
-                        if candidate_chain in used_msa_records:
-                            continue
-                        if _clean_sequence(record.get("sequence")) == _clean_sequence(sequence):
-                            record_chain = candidate_chain
-                            break
-                record = msa_records.get(record_chain) if record_chain else None
+                record_chain, record, match_mode = _resolve_msa_record(
+                    chain=chain,
+                    sequence=sequence,
+                    msa_records=msa_records,
+                    used_msa_records=used_msa_records,
+                )
+                manifest_row["source_record_chain"] = record_chain or None
+                manifest_row["source_match"] = match_mode
                 if record is None:
+                    manifest_row["msa_status"] = "missing"
                     metrics["rf3_target_msa_missing_count"] += 1
-                elif _clean_sequence(record.get("sequence")) and _clean_sequence(record.get("sequence")) != _clean_sequence(sequence):
-                    metrics["rf3_target_msa_sequence_mismatch_count"] += 1
                 else:
                     source_msa = Path(str(record.get("msa_path") or ""))
-                    if source_msa.exists():
+                    status, sequence_count = _msa_status(
+                        source_msa,
+                        expected_sequence=sequence,
+                        record_sequence=record.get("sequence"),
+                    )
+                    manifest_row["msa_status"] = status
+                    manifest_row["source_msa_path"] = str(source_msa)
+                    manifest_row["msa_sequence_count"] = sequence_count
+                    if status == "sequence_mismatch":
+                        metrics["rf3_target_msa_sequence_mismatch_count"] += 1
+                    elif status in {"missing", "empty"}:
+                        metrics["rf3_target_msa_missing_count"] += 1
+                    else:
                         staged_msa = msa_dir / f"{safe_id}_chain_{_safe_id(chain)}{source_msa.suffix or '.a3m'}"
                         shutil.copy2(source_msa, staged_msa)
                         component["msa_path"] = f"/work/artifacts/raw/rf3/inputs/msas/{staged_msa.name}"
+                        manifest_row["staged_msa_path"] = str(staged_msa)
                         metrics["rf3_target_msa_injected_count"] += 1
+                        if status == "real_msa":
+                            metrics["rf3_target_msa_real_count"] += 1
+                        elif status == "query_only":
+                            metrics["rf3_target_msa_query_only_count"] += 1
                         used_msa_records.add(record_chain)
-                    else:
-                        metrics["rf3_target_msa_missing_count"] += 1
+            if "msa_path" not in component:
+                staged_msa = msa_dir / f"{safe_id}_chain_{_safe_id(chain)}_query.a3m"
+                staged_msa.write_text(f">{safe_id}_chain_{_safe_id(chain)}\n{sequence}\n")
+                component["msa_path"] = f"/work/artifacts/raw/rf3/inputs/msas/{staged_msa.name}"
+                manifest_row["msa_status"] = "query_only_fallback"
+                manifest_row["staged_msa_path"] = str(staged_msa)
+                manifest_row["msa_sequence_count"] = 1
+                metrics["rf3_query_only_msa_fallback_count"] += 1
+            manifest_records.append(manifest_row)
             components.append(component)
         input_path = input_dir / f"{safe_id}.json"
         write_json(input_path, {"name": safe_id, "components": components})
         rf3_inputs[safe_id] = input_path
+    manifest_path = input_dir / "msa_manifest.json"
+    write_json(
+        manifest_path,
+        {
+            "engine": "rf3",
+            "use_target_msa": bool(use_target_msa),
+            "summary": metrics,
+            "records": manifest_records,
+        },
+    )
+    metrics["rf3_msa_manifest"] = str(manifest_path)
     return rf3_inputs, metrics
 
 
@@ -334,12 +450,15 @@ def _write_protenix_json_inputs(
     protenix_inputs: dict[str, Path] = {}
     metrics = {
         "protenix_target_msa_injected_count": 0,
+        "protenix_target_msa_real_count": 0,
+        "protenix_target_msa_query_only_count": 0,
         "protenix_target_msa_missing_count": 0,
         "protenix_target_msa_sequence_mismatch_count": 0,
         "protenix_binder_query_only_msa_count": 0,
         "protenix_target_query_only_msa_fallback_count": 0,
     }
     job_run_dir = json_root.parents[3]
+    manifest_records: list[dict[str, Any]] = []
 
     def attach_msa(protein: dict[str, Any], chain_dir: Path) -> None:
         protein["msa"] = {
@@ -359,13 +478,17 @@ def _write_protenix_json_inputs(
 
     for safe_id, staged_path in staged.items():
         source = next(item for item in source_candidates if safe_id == _safe_id(item.get("candidate_id")))
+        candidate_id = str(source.get("candidate_id") or safe_id)
+        raw = source.get("raw_metadata") if isinstance(source.get("raw_metadata"), dict) else {}
+        capacity_target_only = bool(raw.get("capacity_target_only"))
         binder_chains = _candidate_chains(source, "binder_chains", ["A"])
         target_chains = _candidate_chains(source, "target_chains", [])
-        if not target_chains:
+        if capacity_target_only:
+            target_chains = []
+        elif not target_chains:
             _inferred_binder, target_chains = _infer_chain_roles(source_run_dir, source)
-        target_set = set(target_chains)
+        target_set = set(binder_chains if capacity_target_only else target_chains)
         sequences = _pdb_sequences_by_chain(staged_path)
-        raw = source.get("raw_metadata") if isinstance(source.get("raw_metadata"), dict) else {}
         row = raw.get("repo_run_csv_row") if isinstance(raw.get("repo_run_csv_row"), dict) else {}
         declared_sequences: dict[str, str] = {}
         for chain in binder_chains:
@@ -384,44 +507,87 @@ def _write_protenix_json_inputs(
         for chain, sequence in sequences.items():
             protein: dict[str, Any] = {"sequence": sequence, "count": 1}
             chain_dir = msa_root / safe_id / f"chain_{_safe_id(chain)}"
+            role = "target" if chain in target_set else "binder"
+            manifest_row: dict[str, Any] = {
+                "candidate_id": candidate_id,
+                "safe_id": safe_id,
+                "engine_chain": chain,
+                "role": role,
+                "sequence_length": len(_clean_sequence(sequence)),
+                "msa_status": "disabled" if not use_target_msa else "no_msa_expected",
+                "source_record_chain": None,
+                "source_match": None,
+                "source_msa_path": None,
+                "staged_msa_path": None,
+                "msa_sequence_count": 0,
+            }
             if use_target_msa and chain in target_set:
-                record_chain = chain if chain in msa_records else ""
-                if not record_chain:
-                    for candidate_chain, record in msa_records.items():
-                        if candidate_chain in used_msa_records:
-                            continue
-                        if _clean_sequence(record.get("sequence")) == _clean_sequence(sequence):
-                            record_chain = candidate_chain
-                            break
-                record = msa_records.get(record_chain) if record_chain else None
+                record_chain, record, match_mode = _resolve_msa_record(
+                    chain=chain,
+                    sequence=sequence,
+                    msa_records=msa_records,
+                    used_msa_records=used_msa_records,
+                )
+                manifest_row["source_record_chain"] = record_chain or None
+                manifest_row["source_match"] = match_mode
                 if record is None:
+                    manifest_row["msa_status"] = "missing"
                     metrics["protenix_target_msa_missing_count"] += 1
-                elif _clean_sequence(record.get("sequence")) and _clean_sequence(record.get("sequence")) != _clean_sequence(sequence):
-                    metrics["protenix_target_msa_sequence_mismatch_count"] += 1
                 else:
                     source_msa = Path(str(record.get("msa_path") or ""))
-                    if source_msa.exists():
+                    status, sequence_count = _msa_status(
+                        source_msa,
+                        expected_sequence=sequence,
+                        record_sequence=record.get("sequence"),
+                    )
+                    manifest_row["msa_status"] = status
+                    manifest_row["source_msa_path"] = str(source_msa)
+                    manifest_row["msa_sequence_count"] = sequence_count
+                    if status == "sequence_mismatch":
+                        metrics["protenix_target_msa_sequence_mismatch_count"] += 1
+                    elif status in {"real_msa", "query_only"}:
                         chain_dir.mkdir(parents=True, exist_ok=True)
                         for filename in ["pairing.a3m", "non_pairing.a3m"]:
                             shutil.copy2(source_msa, chain_dir / filename)
                         attach_msa(protein, chain_dir)
+                        manifest_row["staged_msa_path"] = str(chain_dir)
                         metrics["protenix_target_msa_injected_count"] += 1
+                        if status == "real_msa":
+                            metrics["protenix_target_msa_real_count"] += 1
+                        elif status == "query_only":
+                            metrics["protenix_target_msa_query_only_count"] += 1
                         used_msa_records.add(record_chain)
                     else:
                         metrics["protenix_target_msa_missing_count"] += 1
             if use_target_msa and "msa" not in protein:
                 write_query_only_msa(chain_dir, safe_id, chain, sequence)
                 attach_msa(protein, chain_dir)
+                manifest_row["staged_msa_path"] = str(chain_dir)
+                manifest_row["msa_sequence_count"] = 1
                 if chain in target_set:
+                    manifest_row["msa_status"] = "query_only_fallback"
                     metrics["protenix_target_query_only_msa_fallback_count"] += 1
                 else:
+                    manifest_row["msa_status"] = "query_only_placeholder"
                     metrics["protenix_binder_query_only_msa_count"] += 1
+            manifest_records.append(manifest_row)
             sequence_entries.append({"proteinChain": protein})
         candidate_json_dir = json_root / safe_id
         candidate_json_dir.mkdir(parents=True, exist_ok=True)
         input_path = candidate_json_dir / f"{safe_id}.json"
         write_json(input_path, [{"sequences": sequence_entries, "name": safe_id}])
         protenix_inputs[safe_id] = candidate_json_dir
+    manifest_path = msa_root / "msa_manifest.json"
+    write_json(
+        manifest_path,
+        {
+            "engine": "protenix",
+            "use_target_msa": bool(use_target_msa),
+            "summary": metrics,
+            "records": manifest_records,
+        },
+    )
+    metrics["protenix_msa_manifest"] = str(manifest_path)
     return protenix_inputs, metrics
 
 
@@ -873,6 +1039,8 @@ def _infer_chain_roles(source_run_dir: Path, candidate: dict[str, Any], complex_
 def _complex_pdb_for_candidate(source_run_dir: Path, candidate: dict[str, Any], input_dir: Path) -> Path:
     source_complex = _resolve_candidate_path(source_run_dir, candidate.get("complex_pdb"))
     binder = None
+    raw = candidate.get("raw_metadata") or {}
+    capacity_target_only = bool(raw.get("capacity_target_only"))
 
     def normalized_complex_from(path: Path, suffix: str = "") -> Path | None:
         safe_id = _safe_id(candidate.get("candidate_id"))
@@ -906,9 +1074,24 @@ def _complex_pdb_for_candidate(source_run_dir: Path, candidate: dict[str, Any], 
         output = input_dir / f"{_safe_id(candidate.get('candidate_id'))}_from_cif.pdb"
         return _cif_to_pdb(source_complex, output)
     if source_complex and source_complex.exists() and len(_structure_chains(source_complex)) == 1:
+        if capacity_target_only:
+            safe_id = _safe_id(candidate.get("candidate_id"))
+            output = input_dir / f"{safe_id}.pdb"
+            source_chain = _structure_chains(source_complex)[0]
+            chain_lines, _next_atom = _renumber_structure_chain(source_complex, "A", 1, {source_chain})
+            if not chain_lines:
+                raise ValueError(f"Candidate {candidate.get('candidate_id')} does not contain a usable target-only chain.")
+            output.write_text("\n".join(chain_lines + ["TER", "END", ""]))
+            _write_engine_chain_map(
+                input_dir,
+                safe_id,
+                binder_source_chains=[source_chain],
+                target_source_chains=[],
+                target_engine_chains=[],
+            )
+            return output
         binder = source_complex
 
-    raw = candidate.get("raw_metadata") or {}
     upstream_run_dir = raw.get("upstream_source_run_dir")
     input_complex = raw.get("input_complex")
     if upstream_run_dir and input_complex:
@@ -984,6 +1167,84 @@ def _stage_complex_inputs(source_run_dir: Path, source_candidates: list[dict[str
                 target_source_chains=target_chains,
                 target_engine_chains=target_chains,
             )
+        staged[safe_id] = staged_path
+    return staged
+
+
+def _stage_target_template_inputs(
+    source_run_dir: Path,
+    source_candidates: list[dict[str, Any]],
+    input_dir: Path,
+) -> dict[str, Path]:
+    """Stage target coordinates and binder sequences without binder coordinates."""
+    input_dir.mkdir(parents=True, exist_ok=True)
+    reference_dir = input_dir / "references"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    staged: dict[str, Path] = {}
+    for candidate in source_candidates:
+        candidate_id = str(candidate.get("candidate_id") or "")
+        safe_id = _safe_id(candidate_id)
+        raw = candidate.get("raw_metadata") if isinstance(candidate.get("raw_metadata"), dict) else {}
+        capacity_target_only = bool(raw.get("capacity_target_only"))
+        target_path = _target_pdb_for_candidate(source_run_dir, candidate)
+        if target_path is None or not target_path.exists():
+            raise ValueError(f"Candidate {candidate_id} does not have a readable target PDB.")
+
+        available_chains = _structure_chains(target_path)
+        if capacity_target_only:
+            requested_chains = _candidate_chains(candidate, "binder_chains", available_chains)
+        else:
+            requested_chains = _candidate_chains(candidate, "target_chains", available_chains)
+        source_chains = [chain for chain in requested_chains if chain in available_chains] or available_chains
+        if not source_chains:
+            raise ValueError(f"Candidate {candidate_id} target PDB has no readable protein chains.")
+
+        engine_chains = ["A"] if capacity_target_only else _target_output_chain_ids(source_chains)
+        target_lines: list[str] = []
+        next_atom = 1
+        for source_chain, engine_chain in zip(source_chains, engine_chains):
+            chain_lines, next_atom = _renumber_structure_chain(
+                target_path,
+                engine_chain,
+                next_atom,
+                {source_chain},
+            )
+            if chain_lines:
+                target_lines.extend(chain_lines + ["TER"])
+        if not target_lines:
+            raise ValueError(
+                f"Candidate {candidate_id} target chains could not be staged."
+            )
+
+        staged_path = input_dir / f"{safe_id}.pdb"
+        staged_path.write_text("\n".join(target_lines + ["END", ""]))
+        binder_sequence = _candidate_binder_sequence(source_run_dir, candidate)
+        (input_dir / f"{safe_id}.binder_sequence.txt").write_text(
+            f"{binder_sequence}\n",
+            encoding="utf-8",
+        )
+        (input_dir / f"{safe_id}.target_chains.txt").write_text(
+            f"{'' if capacity_target_only else ','.join(engine_chains)}\n",
+            encoding="utf-8",
+        )
+        binder_source_chains = _candidate_chains(candidate, "binder_chains", ["A"])
+        reference_complex = _resolve_candidate_path(
+            source_run_dir,
+            candidate.get("complex_pdb") or candidate.get("binder_pdb"),
+        )
+        if reference_complex and reference_complex.exists() and reference_complex.suffix.lower() == ".pdb":
+            shutil.copy2(reference_complex, reference_dir / f"{safe_id}.pdb")
+            (input_dir / f"{safe_id}.binder_source_chains.txt").write_text(
+                f"{','.join(binder_source_chains)}\n",
+                encoding="utf-8",
+            )
+        _write_engine_chain_map(
+            input_dir,
+            safe_id,
+            binder_source_chains=binder_source_chains,
+            target_source_chains=[] if capacity_target_only else source_chains,
+            target_engine_chains=[] if capacity_target_only else engine_chains,
+        )
         staged[safe_id] = staged_path
     return staged
 
@@ -1447,11 +1708,12 @@ def run_monomer_refolding_contract(
     candidates_jsonl: Path,
     tool: str = "af2_monomer",
     min_plddt: float = 70.0,
+    gpu_device: object = "0",
 ) -> Path:
     if tool == "esmfold":
-        return run_esmfold_monomer_refolding(source_run_dir, candidates_jsonl, min_plddt=min_plddt)
+        return run_esmfold_monomer_refolding(source_run_dir, candidates_jsonl, min_plddt=min_plddt, gpu_device=gpu_device)
     if tool == "boltz2_monomer":
-        return run_boltz2_monomer_refolding(source_run_dir, candidates_jsonl, min_plddt=min_plddt)
+        return run_boltz2_monomer_refolding(source_run_dir, candidates_jsonl, min_plddt=min_plddt, gpu_device=gpu_device)
 
     source_run_dir = Path(source_run_dir)
     candidates_jsonl = Path(candidates_jsonl)
@@ -1510,6 +1772,7 @@ def run_esmfold_monomer_refolding(
     candidates_jsonl: Path,
     min_plddt: float = 70.0,
     num_recycles: int = 4,
+    gpu_device: object = "0",
 ) -> Path:
     source_run_dir = Path(source_run_dir)
     candidates_jsonl = Path(candidates_jsonl)
@@ -1522,7 +1785,13 @@ def run_esmfold_monomer_refolding(
         job_type="monomer_refolding",
         tool="esmfold",
         inputs={"source_run_dir": str(source_run_dir), "candidates_jsonl": str(candidates_jsonl)},
-        params={"min_plddt": min_plddt, "num_recycles": num_recycles, "backend": "docker", "image": "ovo-esm:latest"},
+        params={
+            "min_plddt": min_plddt,
+            "num_recycles": num_recycles,
+            "backend": "docker",
+            "image": "ovo-esm:latest",
+            "gpu_device": normalize_gpu_device(gpu_device),
+        },
     )
     raw_root = job.run_dir / "artifacts" / "raw" / "esmfold"
     input_dir = raw_root / "inputs"
@@ -1543,8 +1812,7 @@ def run_esmfold_monomer_refolding(
                 "docker",
                 "run",
                 "--rm",
-                "--gpus",
-                "all",
+                *docker_gpu_args(gpu_device),
                 "--shm-size=64G",
                 "-v",
                 f"{job.run_dir}:/work",
@@ -1616,6 +1884,7 @@ def run_boltz2_monomer_refolding(
     source_run_dir: Path,
     candidates_jsonl: Path,
     min_plddt: float = 0.7,
+    gpu_device: object = "0",
 ) -> Path:
     source_run_dir = Path(source_run_dir)
     candidates_jsonl = Path(candidates_jsonl)
@@ -1633,6 +1902,7 @@ def run_boltz2_monomer_refolding(
             "backend": "docker",
             "image": "ovoex-boltz2:latest",
             "models_dir": str(BOLTZ_MODELS_DIR),
+            "gpu_device": normalize_gpu_device(gpu_device),
         },
     )
     raw_root = job.run_dir / "artifacts" / "raw" / "boltz2_monomer"
@@ -1666,8 +1936,7 @@ def run_boltz2_monomer_refolding(
                 "docker",
                 "run",
                 "--rm",
-                "--gpus",
-                "all",
+                *docker_gpu_args(gpu_device),
                 "-v",
                 f"{job.run_dir}:/work",
                 "-v",
@@ -1767,6 +2036,7 @@ def run_complex_refolding_contract(
     seed: int = 0,
     device: str = "auto",
     contact_cutoff: float = 8.0,
+    gpu_device: object = "0",
 ) -> Path:
     if tool == "af2_initial_guess":
         use_binder_template = template_mode in {"target_binder_template", "complex_template"}
@@ -1778,6 +2048,7 @@ def run_complex_refolding_contract(
             multimer=multimer,
             use_binder_template=use_binder_template,
             use_interface_template=template_mode == "complex_template",
+            gpu_device=gpu_device,
         )
     if tool == "boltz2_initial_guess":
         return run_boltz2_complex_refolding(
@@ -1785,6 +2056,7 @@ def run_complex_refolding_contract(
             candidates_jsonl,
             require_monomer_success=require_monomer_success,
             use_target_template=template_mode == "target_template",
+            gpu_device=gpu_device,
         )
     if tool in {"esmfold2_complex_validation", "esmfold2_initial_guess_validation"}:
         return run_esmfold2_complex_validation(
@@ -2107,17 +2379,67 @@ def run_esmfold2_complex_validation(
         raise
 
 
+def _rank_af2_initial_guess_outputs(
+    output_dir: Path,
+    safe_id: str,
+    *,
+    binder_chains: list[str],
+    target_chains: list[str],
+) -> list[Path]:
+    """Prefer complex AF2-IG outputs over binder-only helper folds."""
+    if not output_dir.exists():
+        return []
+    patterns = [
+        f"{safe_id}_af2_initial_guess.pdb",
+        f"{safe_id}_af2_initial_guess_model*.pdb",
+        f"{safe_id}_af2ig_*.pdb",
+        f"{safe_id}_af2_initial_guess_binder_model*.pdb",
+    ]
+    ranked: list[Path] = []
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for path in sorted(output_dir.glob(pattern)):
+            if path in seen or not path.exists():
+                continue
+            seen.add(path)
+            ranked.append(path)
+    if not target_chains:
+        return ranked
+
+    complex_outputs: list[Path] = []
+    fallback_outputs: list[Path] = []
+    required = [chain for chain in [*binder_chains, *target_chains] if chain]
+    for path in ranked:
+        chains = set(_structure_chains(path))
+        if all(chain in chains for chain in required) or {"A", "B"}.issubset(chains):
+            complex_outputs.append(path)
+        else:
+            fallback_outputs.append(path)
+    return complex_outputs + fallback_outputs
+
+
 def run_af2_initial_guess_complex_refolding(
     source_run_dir: Path,
     candidates_jsonl: Path,
     require_monomer_success: bool = True,
     num_recycles: int = 3,
+    model_count: int = 1,
     multimer: bool = True,
+    binder_multimer: bool | None = None,
+    use_initial_guess: bool = False,
     use_binder_template: bool = False,
     use_interface_template: bool = False,
     docker_image: str = "ovo-colabdesign:latest",
     internal_parent_run_dir: Path | None = None,
+    gpu_device: object = "0",
 ) -> Path:
+    if binder_multimer is None:
+        binder_multimer = multimer
+    if not use_initial_guess and (use_binder_template or use_interface_template):
+        raise ValueError(
+            "Binder/interface templates require legacy whole-complex initial-guess mode. "
+            "Target-template mode uses only the selected target structure plus binder sequence."
+        )
     source_run_dir = Path(source_run_dir)
     candidates_jsonl = Path(candidates_jsonl)
     allowed = {STAGE_MONOMER_REFOLDING} if require_monomer_success else {
@@ -2127,6 +2449,11 @@ def run_af2_initial_guess_complex_refolding(
         STAGE_COMPLEX_REFOLDING,
     }
     source_candidates = _source_candidates(candidates_jsonl, allowed)
+    capacity_target_only_run = bool(source_candidates) and all(
+        bool((candidate.get("raw_metadata") or {}).get("capacity_target_only"))
+        for candidate in source_candidates
+        if isinstance(candidate.get("raw_metadata"), dict)
+    )
     job = create_job(
         REFOLDING_GROUP,
         job_type="complex_refolding",
@@ -2135,12 +2462,24 @@ def run_af2_initial_guess_complex_refolding(
         params={
             "require_monomer_success": require_monomer_success,
             "num_recycles": num_recycles,
+            "model_count": model_count,
             "multimer": multimer,
+            "binder_multimer": binder_multimer,
+            "prediction_input_mode": (
+                "single_chain_template_fold"
+                if capacity_target_only_run
+                else
+                "legacy_whole_complex_initial_guess"
+                if use_initial_guess
+                else "target_only_initial_guess"
+            ),
+            "use_initial_guess": use_initial_guess,
             "use_binder_template": use_binder_template,
             "use_interface_template": use_interface_template,
             "backend": "docker",
             "image": docker_image,
             "alphafold_models_dir": str(ALPHAFOLD_MODELS_DIR),
+            "gpu_device": normalize_gpu_device(gpu_device),
         },
     )
     if internal_parent_run_dir is not None:
@@ -2154,14 +2493,17 @@ def run_af2_initial_guess_complex_refolding(
     raw_root = job.run_dir / "artifacts" / "raw" / "af2_initial_guess"
     input_dir = raw_root / "inputs"
     output_dir = raw_root / "output"
-    staged = _stage_complex_inputs(source_run_dir, source_candidates, input_dir)
+    staged = (
+        _stage_complex_inputs(source_run_dir, source_candidates, input_dir)
+        if use_initial_guess
+        else _stage_target_template_inputs(source_run_dir, source_candidates, input_dir)
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     command = [
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        "all",
+        *docker_gpu_args(gpu_device),
         "--shm-size=64G",
         "-v",
         f"{job.run_dir}:/work",
@@ -2180,11 +2522,19 @@ def run_af2_initial_guess_complex_refolding(
         "/models",
         "--num-recycles",
         str(num_recycles),
+        "--model-count",
+        str(max(1, min(5, int(model_count)))),
         "--designed_chains",
         "A",
     ]
-    if multimer:
+    if multimer and not capacity_target_only_run:
         command.append("--multimer")
+    if binder_multimer and not capacity_target_only_run:
+        command.append("--binder-multimer")
+    if capacity_target_only_run:
+        command.append("--single-chain-template-only")
+    if not use_initial_guess:
+        command.append("--target-template-only")
     if use_binder_template:
         command.append("--use-binder-template")
     if use_interface_template:
@@ -2204,7 +2554,13 @@ def run_af2_initial_guess_complex_refolding(
     if rc == 0:
         for safe_id, staged_path in staged.items():
             source = next(candidate for candidate in source_candidates if safe_id == _safe_id(candidate.get("candidate_id")))
-            pdb_matches = sorted((output_dir / "af2_initial_guess").glob(f"{safe_id}*.pdb"))
+            output_target_chains = [] if capacity_target_only_run else ["B"]
+            pdb_matches = _rank_af2_initial_guess_outputs(
+                output_dir / "af2_initial_guess",
+                safe_id,
+                binder_chains=["A"],
+                target_chains=output_target_chains,
+            )
             predicted_pdb = pdb_matches[0] if pdb_matches else None
             pae_path = predicted_pdb.with_name(f"{predicted_pdb.stem}_pae.json") if predicted_pdb else None
             candidate_id = _complex_candidate_id(
@@ -2226,6 +2582,21 @@ def run_af2_initial_guess_complex_refolding(
             _update_source_monomer_rmsd(source_run_dir, source, metrics)
             metrics.update(metrics_by_id.get(safe_id, {}))
             metrics["complex_refolding_backend"] = "af2_initial_guess"
+            metrics["prediction_input_mode"] = (
+                "single_chain_template_fold"
+                if capacity_target_only_run
+                else
+                "legacy_whole_complex_initial_guess"
+                if use_initial_guess
+                else "target_only_initial_guess"
+            )
+            metrics["initial_guess_used"] = True
+            metrics["initial_guess_scope"] = (
+                "single_chain_template"
+                if capacity_target_only_run
+                else "whole_complex" if use_initial_guess else "target_only"
+            )
+            metrics["whole_complex_initial_guess_used"] = bool(use_initial_guess)
             candidates.append(
                 {
                     **source,
@@ -2234,7 +2605,7 @@ def run_af2_initial_guess_complex_refolding(
                     "source_tool": "af2_initial_guess",
                     "tool": "af2_initial_guess",
                     "binder_chains": ["A"],
-                    "target_chains": ["B"],
+                    "target_chains": output_target_chains,
                     "complex_pdb": _rel_path(job.run_dir, predicted_pdb) if predicted_pdb else _rel_path(job.run_dir, staged_path),
                     "metrics": metrics,
                     "parents": [str(source.get("candidate_id") or "")],
@@ -2244,7 +2615,27 @@ def run_af2_initial_guess_complex_refolding(
                         "input_binder_chains": source.get("binder_chains"),
                         "input_target_chains": source.get("target_chains"),
                         "backend_status": "docker",
-                        "input_complex": _rel_path(job.run_dir, staged_path),
+                        "prediction_input_mode": (
+                            "single_chain_template_fold"
+                            if capacity_target_only_run
+                            else
+                            "legacy_whole_complex_initial_guess"
+                            if use_initial_guess
+                            else "target_only_initial_guess"
+                        ),
+                        "initial_guess_used": True,
+                        "initial_guess_scope": (
+                            "single_chain_template"
+                            if capacity_target_only_run
+                            else "whole_complex" if use_initial_guess else "target_only"
+                        ),
+                        "whole_complex_initial_guess_used": bool(use_initial_guess),
+                        "input_complex_role": (
+                            "coordinate_initial_guess" if use_initial_guess else "post_hoc_reference_only"
+                        ),
+                        "prediction_input_pdb": _rel_path(job.run_dir, staged_path),
+                        "input_complex": _rel_path(job.run_dir, staged_path) if use_initial_guess else None,
+                        "target_template_pdb": _rel_path(job.run_dir, staged_path) if not use_initial_guess else None,
                         "prediction_dir": _rel_path(job.run_dir, output_dir / "af2_initial_guess"),
                         "pae_path": _rel_path(job.run_dir, pae_path) if pae_path and pae_path.exists() else None,
                     },
@@ -2278,6 +2669,7 @@ def run_boltz2_complex_refolding(
     write_full_pae: bool = True,
     internal_parent_run_dir: Path | None = None,
     benchmark_run_csv: Path | None = None,
+    gpu_device: object = "0",
 ) -> Path:
     source_run_dir = Path(source_run_dir)
     candidates_jsonl = Path(candidates_jsonl)
@@ -2304,6 +2696,7 @@ def run_boltz2_complex_refolding(
             "diffusion_samples": diffusion_samples,
             "write_full_pae": write_full_pae,
             "benchmark_run_csv": str(benchmark_run_csv) if benchmark_run_csv else None,
+            "gpu_device": normalize_gpu_device(gpu_device),
         },
     )
     if internal_parent_run_dir is not None:
@@ -2318,6 +2711,11 @@ def run_boltz2_complex_refolding(
     input_pdb_dir = raw_root / "input_pdbs"
     yaml_dir = raw_root / "yaml_inputs"
     output_dir = raw_root / "output"
+    target_only_by_id = {
+        _safe_id(candidate.get("candidate_id")): bool((candidate.get("raw_metadata") or {}).get("capacity_target_only"))
+        for candidate in source_candidates
+    }
+    effective_use_target_template = bool(use_target_template) and not any(target_only_by_id.values())
     staged = _stage_complex_inputs(source_run_dir, source_candidates, input_pdb_dir)
     yaml_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2330,7 +2728,7 @@ def run_boltz2_complex_refolding(
             target_template = _target_pdb_for_candidate(source_run_dir, source)
     write_json(raw_root / "candidate_id_map.json", source_by_id)
     staged_template_arg = "--no-template "
-    if use_target_template and target_template and target_template.exists():
+    if effective_use_target_template and target_template and target_template.exists():
         staged_template = yaml_dir / "target_template.pdb"
         shutil.copy2(target_template, staged_template)
         staged_template_arg = "--template /work/artifacts/raw/boltz2_initial_guess/yaml_inputs/target_template.pdb "
@@ -2362,8 +2760,7 @@ def run_boltz2_complex_refolding(
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        "all",
+        *docker_gpu_args(gpu_device),
         "--shm-size=32G",
         "-v",
         f"{job.run_dir}:/work",
@@ -2389,27 +2786,29 @@ def run_boltz2_complex_refolding(
     ]
     if write_full_pae:
         predict_command.append("--write_full_pae")
-    cleanup_command = [
-        "docker",
-        "run",
-        "--rm",
-        "-v",
-        f"{job.run_dir}:/work",
-        "-w",
-        "/work",
-        "--entrypoint",
-        "/bin/bash",
-        "ovoex-boltz2:latest",
-        "-lc",
-        (
-            "cp /work/artifacts/raw/boltz2_initial_guess/yaml_inputs/target_template.cif "
-            "/work/artifacts/raw/boltz2_initial_guess/target_template.cif && "
-            "rm -f /work/artifacts/raw/boltz2_initial_guess/yaml_inputs/target_template.pdb "
-            "/work/artifacts/raw/boltz2_initial_guess/yaml_inputs/target_template.cif && "
-            "sed -i 's#cif: target_template.cif#cif: /work/artifacts/raw/boltz2_initial_guess/target_template.cif#g' "
-            "/work/artifacts/raw/boltz2_initial_guess/yaml_inputs/*.yaml"
-        ),
-    ]
+    cleanup_command = None
+    if effective_use_target_template and target_template and target_template.exists():
+        cleanup_command = [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{job.run_dir}:/work",
+            "-w",
+            "/work",
+            "--entrypoint",
+            "/bin/bash",
+            "ovoex-boltz2:latest",
+            "-lc",
+            (
+                "cp /work/artifacts/raw/boltz2_initial_guess/yaml_inputs/target_template.cif "
+                "/work/artifacts/raw/boltz2_initial_guess/target_template.cif && "
+                "rm -f /work/artifacts/raw/boltz2_initial_guess/yaml_inputs/target_template.pdb "
+                "/work/artifacts/raw/boltz2_initial_guess/yaml_inputs/target_template.cif && "
+                "sed -i 's#cif: target_template.cif#cif: /work/artifacts/raw/boltz2_initial_guess/target_template.cif#g' "
+                "/work/artifacts/raw/boltz2_initial_guess/yaml_inputs/*.yaml"
+            ),
+        ]
     rc = _run_shell_steps(
         job.run_dir,
         [
@@ -2423,13 +2822,11 @@ def run_boltz2_complex_refolding(
             raw_root=raw_root,
             benchmark_run_csv=benchmark_run_csv,
         )
-        rc = _run_shell_steps(
-            job.run_dir,
-            [
-                {"name": "boltz2-clean-template-pdb", "command": cleanup_command},
-                {"name": "boltz2-initial-guess", "command": predict_command},
-            ],
-        )
+        predict_steps = []
+        if cleanup_command is not None:
+            predict_steps.append({"name": "boltz2-clean-template-pdb", "command": cleanup_command})
+        predict_steps.append({"name": "boltz2-initial-guess", "command": predict_command})
+        rc = _run_shell_steps(job.run_dir, predict_steps)
     predictions_root = job.run_dir / "boltz_results_yaml_inputs" / "predictions"
     if predictions_root.exists():
         target_root = output_dir / "predictions"
@@ -2446,6 +2843,7 @@ def run_boltz2_complex_refolding(
             cif_matches = sorted(prediction_dir.glob("*.cif")) if prediction_dir.exists() else []
             confidence_matches = sorted(prediction_dir.glob("confidence*.json")) if prediction_dir.exists() else []
             metrics = dict(source.get("metrics") or {})
+            target_only = bool(target_only_by_id.get(safe_id))
             _update_source_monomer_rmsd(source_run_dir, source, metrics)
             metrics["complex_refolding_backend"] = "boltz2_initial_guess"
             if confidence_matches:
@@ -2462,13 +2860,13 @@ def run_boltz2_complex_refolding(
                     "candidate_id": _complex_candidate_id(
                         source,
                         "boltz2_initial_guess",
-                        "target_template" if use_target_template else "no_template",
+                        "target_template" if effective_use_target_template and not target_only else "no_template",
                     ),
                     "stage": STAGE_COMPLEX_REFOLDING,
                     "source_tool": "boltz2_initial_guess",
                     "tool": "boltz2_initial_guess",
                     "binder_chains": ["A"],
-                    "target_chains": ["B"],
+                    "target_chains": [] if target_only else ["B"],
                     "complex_pdb": _rel_path(job.run_dir, cif_matches[0]) if cif_matches else source.get("complex_pdb"),
                     "metrics": metrics,
                     "parents": [str(source.get("candidate_id") or "")],
@@ -2646,7 +3044,11 @@ def _finish_external_complex_refolding(
             prediction = _first_prediction_file(candidate_output, safe_id)
             pae_source = _prediction_pae_file(candidate_output, tool)
             pae_path = _standard_pae_json_path(pae_source, candidate_output, safe_id, tool) if pae_source else None
-            binder_chains, target_chains = _infer_chain_roles(source_run_dir, source, prediction or staged_path)
+            raw_metadata = source.get("raw_metadata") if isinstance(source.get("raw_metadata"), dict) else {}
+            if raw_metadata.get("capacity_target_only"):
+                binder_chains, target_chains = ["A"], []
+            else:
+                binder_chains, target_chains = _infer_chain_roles(source_run_dir, source, prediction or staged_path)
             metrics = dict(source.get("metrics") or {})
             metrics.update(_prediction_summary_metrics(candidate_output, tool))
             metrics["complex_refolding_backend"] = tool
@@ -2668,7 +3070,7 @@ def _finish_external_complex_refolding(
                     "metrics": metrics,
                     "parents": [str(source.get("candidate_id") or "")],
                     "raw_metadata": {
-                        **dict(source.get("raw_metadata") or {}),
+                        **dict(raw_metadata),
                         "source_candidate": source,
                         "input_complex": _rel_path(job_run_dir, staged_path),
                         "prediction_dir": _rel_path(job_run_dir, candidate_output),
@@ -2711,6 +3113,7 @@ def run_rf3_complex_refolding(
     seed: int = 0,
     benchmark_run_csv: Path | None = None,
     internal_parent_run_dir: Path | None = None,
+    gpu_device: object = "0",
 ) -> Path:
     source_run_dir = Path(source_run_dir)
     allowed = {STAGE_MONOMER_REFOLDING} if require_monomer_success else {
@@ -2736,6 +3139,7 @@ def run_rf3_complex_refolding(
             "diffusion_batch_size": diffusion_batch_size,
             "seed": seed,
             "benchmark_run_csv": str(benchmark_run_csv) if benchmark_run_csv else None,
+            "gpu_device": normalize_gpu_device(gpu_device),
         },
     )
     if internal_parent_run_dir is not None:
@@ -2768,8 +3172,7 @@ def run_rf3_complex_refolding(
                     "docker",
                     "run",
                     "--rm",
-                    "--gpus",
-                    "all",
+                    *docker_gpu_args(gpu_device),
                     "--shm-size=32G",
                     "-v",
                     f"{job.run_dir}:/work",
@@ -2823,6 +3226,8 @@ def run_protenix_complex_refolding(
     diffusion_steps: int = 200,
     samples: int = 5,
     internal_parent_run_dir: Path | None = None,
+    existing_job: JobPaths | None = None,
+    gpu_device: object = "0",
 ) -> Path:
     source_run_dir = Path(source_run_dir)
     allowed = {STAGE_MONOMER_REFOLDING} if require_monomer_success else {
@@ -2832,7 +3237,7 @@ def run_protenix_complex_refolding(
         STAGE_COMPLEX_REFOLDING,
     }
     source_candidates = _source_candidates(Path(candidates_jsonl), allowed)
-    job = create_job(
+    job = existing_job or create_job(
         REFOLDING_GROUP,
         "complex_refolding",
         "protenix",
@@ -2846,9 +3251,12 @@ def run_protenix_complex_refolding(
             "diffusion_steps": diffusion_steps,
             "samples": samples,
             "initial_guess_supported": False,
+            "gpu_device": normalize_gpu_device(gpu_device),
         },
     )
-    if internal_parent_run_dir is not None:
+    if existing_job is not None:
+        update_status(job.run_dir, "running", recovery_resumed=True)
+    elif internal_parent_run_dir is not None:
         mark_internal_job(
             job.run_dir,
             parent_run_dir=Path(internal_parent_run_dir),
@@ -2870,7 +3278,15 @@ def run_protenix_complex_refolding(
     output_root = raw_root / "output"
     steps: list[dict[str, Any]] = []
     for safe_id, protenix_input_dir in protenix_inputs.items():
-        (output_root / safe_id).mkdir(parents=True, exist_ok=True)
+        candidate_output_dir = output_root / safe_id
+        candidate_output_dir.mkdir(parents=True, exist_ok=True)
+        completed_structures = [
+            path
+            for path in candidate_output_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".cif", ".pdb"}
+        ]
+        if existing_job is not None and len(completed_structures) >= max(1, int(samples)):
+            continue
         protenix_code = "\n".join(
             [
                 "import copy, os",
@@ -2922,8 +3338,7 @@ def run_protenix_complex_refolding(
                         "docker",
                         "run",
                         "--rm",
-                        "--gpus",
-                        "all",
+                        *docker_gpu_args(gpu_device),
                         "--shm-size=32G",
                         "-v",
                         f"{job.run_dir}:/work",
@@ -2968,6 +3383,7 @@ def run_boltzgen_fold_complex_refolding(
     sampling_steps: int = 200,
     diffusion_samples: int = 5,
     internal_parent_run_dir: Path | None = None,
+    gpu_device: object = "0",
 ) -> Path:
     """Run BoltzGen's template-conditioned folding stage on existing complexes."""
     source_run_dir = Path(source_run_dir)
@@ -2991,6 +3407,7 @@ def run_boltzgen_fold_complex_refolding(
             "recycling_steps": recycling_steps,
             "sampling_steps": sampling_steps,
             "diffusion_samples": diffusion_samples,
+            "gpu_device": normalize_gpu_device(gpu_device),
         },
     )
     if internal_parent_run_dir is not None:
@@ -3026,8 +3443,7 @@ def run_boltzgen_fold_complex_refolding(
         "docker",
         "run",
         "--rm",
-        "--gpus",
-        "all",
+        *docker_gpu_args(gpu_device),
         "--shm-size=32G",
         "-v",
         f"{job.run_dir}:/work",
@@ -3041,6 +3457,7 @@ def run_boltzgen_fold_complex_refolding(
         boltzgen_config_path,
         "data.design_dir=/work/artifacts/raw/boltzgen_fold/inputs",
         "data.cfg.suffix=.pdb",
+        "data.cfg.target_id_regex=^(.+)$",
         "data.cfg.num_workers=1",
         "data.cfg.moldir=/cache/datasets--boltzgen--inference-data/snapshots/c3d36fd276e9caf098c75d4113c6d5eb320b1a4c/mols.zip",
         "output=/work/artifacts/raw/boltzgen_fold/output",

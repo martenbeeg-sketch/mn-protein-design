@@ -10,6 +10,7 @@ dependencies:
   - pyyaml
   - openjdk=17
   - nextflow
+  - openpyxl
   - streamlit
   - typer
   - pip

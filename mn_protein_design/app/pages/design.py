@@ -12,7 +12,7 @@ from mn_protein_design.app.components.molstar_viewer import (
     StructureVisualization,
     molstar_custom_component,
 )
-from mn_protein_design.app.pages.common import result_link
+from mn_protein_design.app.pages.common import gpu_run_panel, result_link
 from mn_protein_design.core.candidates import candidate_stage_counts, read_candidates
 from mn_protein_design.core.jobs import read_json
 from mn_protein_design.core.structures import filter_pdb_text
@@ -33,6 +33,7 @@ run_protpardelle_1c = design_workflow.run_protpardelle_1c
 run_pxdesign = design_workflow.run_pxdesign
 run_rfdiffusion3_foundry = design_workflow.run_rfdiffusion3_foundry
 run_rfdiffusion_classic = design_workflow.run_rfdiffusion_classic
+run_esmfold2_native_binder_design = esm_binder_workflow.run_esmfold2_native_binder_design
 run_esmfold2_binder_screening = esm_binder_workflow.run_esmfold2_binder_screening
 target_label = design_workflow.target_label
 normalize_rfdiffusion3_contig = design_workflow._normalize_rfdiffusion3_contig
@@ -478,7 +479,7 @@ campaign_name = st.text_input(
     placeholder="for example PDL1 RFdiffusion 75aa soluble MPNN",
     key=f"campaign_name_{source_key}",
 )
-campaign_cols = st.columns(2)
+campaign_cols = st.columns(3)
 with campaign_cols[0]:
     binder_length = st.text_input(
         "Binder length",
@@ -496,6 +497,10 @@ with campaign_cols[1]:
         help="How many generator attempts to launch. For BindCraft this is the max trajectories setting.",
         key=f"num_candidates_{source_key}",
     )
+with campaign_cols[2]:
+    st.caption("GPU")
+with st.expander("Compute", expanded=True):
+    design_gpu_device = gpu_run_panel(key=f"design_{source_key}", default=str(loaded_params.get("gpu_device") or "0"))
 
 st.subheader("Generator")
 rfdiffusion_tab, bindcraft_tab, foundry_tab, boltzgen_tab, pxdesign_tab, genie3_tab, esm_tab, protpardelle_tab, complexa_tab = st.tabs(
@@ -1176,6 +1181,7 @@ with rfdiffusion_tab:
                             else {}
                         ),
                     },
+                    gpu_device=design_gpu_device,
                 )
             st.success("RFdiffusion job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
@@ -1369,6 +1375,7 @@ with bindcraft_tab:
                     max_trajectories=int(bindcraft_max_trajectories),
                     filter_settings=bindcraft_filter_settings,
                     advanced_settings_file=bindcraft_advanced_settings_file,
+                    gpu_device=design_gpu_device,
                 )
             st.success("BindCraft job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
@@ -1549,6 +1556,7 @@ with foundry_tab:
                     mpnn_model_type=foundry_mpnn_model_type,
                     mpnn_checkpoint_path=foundry_mpnn_checkpoint,
                     prepare_target_msa=bool(foundry_prepare_target_msa),
+                    gpu_device=design_gpu_device,
                 )
             st.success("RFdiffusion3 / Foundry job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
@@ -1653,6 +1661,7 @@ with boltzgen_tab:
                     budget=int(boltzgen_budget),
                     sampling_steps=int(boltzgen_sampling_steps),
                     run_vanilla_pipeline=boltzgen_vanilla_pipeline,
+                    gpu_device=design_gpu_device,
                 )
             st.success("BoltzGen job finished.")
             st.link_button("Open BoltzGen result", result_link("design", run_dir.name))
@@ -1828,6 +1837,7 @@ with pxdesign_tab:
                     use_fast_ln=bool(pxdesign_use_fast_ln),
                     use_deepspeed_evo_attention=bool(pxdesign_use_deepspeed),
                     prepare_target_msa=bool(pxdesign_prepare_msa),
+                    gpu_device=design_gpu_device,
                 )
             st.success("PXDesign job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
@@ -2031,6 +2041,7 @@ with genie3_tab:
                     run_mode=str(genie3_mode or "full_vanilla_pipeline"),
                     enable_beam_search=bool(genie3_beam),
                     beam_width=int(genie3_beam_width),
+                    gpu_device=design_gpu_device,
                 )
             st.success("Genie3 job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
@@ -2038,111 +2049,214 @@ with genie3_tab:
             st.error(str(exc))
 
 with esm_tab:
-    st.caption(
-        "Experimental local ESMFold2 screening loop. It folds target+binder sequence proposals and ranks them by "
-        "ESMFold2 confidence and hotspot/interface geometry. This is not Biohub's unreleased ESMFold2 inversion protocol."
+    esm_mode = st.segmented_control(
+        "ESM workflow",
+        ["Native binder design", "Sequence screening"],
+        default="Native binder design",
+        key=f"esm_workflow_mode_{source_key}",
     )
-    st.subheader("ESMFold2 Binder Screening")
-    esm_cols = st.columns(4)
-    with esm_cols[0]:
-        esm_num_designs = st.number_input(
-            "Sequence proposals",
-            1,
-            100,
-            int(loaded_params.get("num_designs") or min(max(int(num_candidates), 1), 8)),
-            key=f"esm_num_designs_{source_key}",
-            help="If no sequences are pasted below, the workflow samples this many simple soluble sequence proposals.",
-        )
-    with esm_cols[1]:
-        esm_num_steps = st.number_input(
-            "Sampling steps",
-            1,
-            200,
-            int(loaded_params.get("num_sampling_steps") or 32),
-            key=f"esm_num_sampling_steps_{source_key}",
-        )
-    with esm_cols[2]:
-        esm_num_loops = st.number_input(
-            "Recycling loops",
-            1,
-            10,
-            int(loaded_params.get("num_loops") or 3),
-            key=f"esm_num_loops_{source_key}",
-        )
-    with esm_cols[3]:
-        esm_seed = st.number_input(
-            "Seed",
-            0,
-            999999,
-            int(loaded_params.get("seed") or 11),
-            key=f"esm_seed_{source_key}",
-        )
-    esm_binder_sequences = st.text_area(
-        "Optional binder sequences",
-        value=str(loaded_params.get("binder_sequences_text") or ""),
-        placeholder="Paste FASTA or one sequence per line. Leave empty to sample simple sequence proposals.",
-        height=140,
-        key=f"esm_binder_sequences_{source_key}",
-    )
-    esm_device = st.selectbox(
-        "Device",
-        ["auto", "cuda", "cpu"],
-        index=["auto", "cuda", "cpu"].index(str(loaded_params.get("device") or "auto"))
-        if str(loaded_params.get("device") or "auto") in {"auto", "cuda", "cpu"}
-        else 0,
-        key=f"esm_device_{source_key}",
-        help="ESMFold2 is GPU-oriented. CPU is mainly useful for import/debug checks.",
-    )
-    esm_contact_cutoff = st.number_input(
-        "Contact cutoff",
-        min_value=3.0,
-        max_value=20.0,
-        value=float(loaded_params.get("contact_cutoff") or 8.0),
-        step=0.5,
-        key=f"esm_contact_cutoff_{source_key}",
-    )
-    _tool_payload_expander(
-        "ESMFold2 experimental payload",
-        {
-            "model_dir": str(esm_binder_workflow.ESMFOLD2_MODEL_DIR),
-            "target": {
-                "pdb": str(target_pdb),
-                "chains": target_chains,
-                "hotspots": hotspots,
-            },
-            "binder": {
-                "length": binder_length,
-                "num_designs": int(esm_num_designs),
-                "uses_pasted_sequences": bool(esm_binder_sequences.strip()),
-            },
-            "folding": {
-                "num_sampling_steps": int(esm_num_steps),
-                "num_loops": int(esm_num_loops),
-                "device": esm_device,
-            },
-        },
-    )
-    if st.button("Run ESMFold2 experimental screening", type="primary", disabled=not target_chains):
-        try:
-            with st.spinner("Running ESMFold2 screening..."):
-                run_dir = run_esmfold2_binder_screening(
-                    target_pdb=target_pdb,
-                    target_chains=target_chains,
-                    hotspots=hotspots,
-                    binder_length=binder_length,
-                    num_designs=int(esm_num_designs),
-                    binder_sequences_text=esm_binder_sequences,
-                    campaign_name=campaign_name,
-                    num_loops=int(esm_num_loops),
-                    num_sampling_steps=int(esm_num_steps),
-                    seed=int(esm_seed),
-                    device=esm_device,
-                    contact_cutoff=float(esm_contact_cutoff),
+    if esm_mode == "Native binder design":
+        st.subheader("ESMFold2 Binder Design")
+        native_cols = st.columns(4)
+        with native_cols[0]:
+            esm_target_chain = st.selectbox(
+                "Target chain",
+                target_chains,
+                key=f"esm_native_target_chain_{source_key}",
+            )
+        with native_cols[1]:
+            requested_lengths = design_workflow.parse_binder_lengths(binder_length)
+            esm_native_length = st.number_input(
+                "Binder length",
+                min_value=40,
+                max_value=200,
+                value=int(requested_lengths[0]),
+                step=1,
+                key=f"esm_native_binder_length_{source_key}",
+            )
+        with native_cols[2]:
+            esm_native_designs = st.number_input(
+                "Design attempts",
+                min_value=1,
+                max_value=20,
+                value=int(loaded_params.get("num_designs") or min(int(num_candidates), 2)),
+                step=1,
+                key=f"esm_native_num_designs_{source_key}",
+            )
+        with native_cols[3]:
+            esm_native_seed = st.number_input(
+                "Seed",
+                min_value=0,
+                max_value=999999,
+                value=int(loaded_params.get("seed") or 0),
+                step=1,
+                key=f"esm_native_seed_{source_key}",
+            )
+        native_advanced = st.expander("Advanced ESM binder parameters")
+        with native_advanced:
+            advanced_cols = st.columns(3)
+            with advanced_cols[0]:
+                esm_native_steps = st.number_input(
+                    "Optimization steps",
+                    min_value=1,
+                    max_value=500,
+                    value=int(loaded_params.get("optimization_steps") or 150),
+                    step=5,
+                    key=f"esm_native_steps_{source_key}",
                 )
-            st.success("ESMFold2 screening job finished.")
-            st.link_button("Open result", result_link("design", run_dir.name))
-        except Exception as exc:
-            st.error(str(exc))
+            with advanced_cols[1]:
+                esm_native_lr = st.number_input(
+                    "Learning rate",
+                    min_value=0.001,
+                    max_value=1.0,
+                    value=float(loaded_params.get("learning_rate") or 0.1),
+                    step=0.01,
+                    format="%.3f",
+                    key=f"esm_native_learning_rate_{source_key}",
+                )
+            with advanced_cols[2]:
+                esm_native_model = st.selectbox(
+                    "Experimental checkpoint",
+                    [esm_binder_workflow.DEFAULT_BINDER_MODEL],
+                    key=f"esm_native_model_{source_key}",
+                )
+            esm_native_compile = st.checkbox(
+                "Compile model",
+                value=bool(loaded_params.get("compile_model") or False),
+                key=f"esm_native_compile_{source_key}",
+            )
+            esm_native_checkpoint_lm = st.checkbox(
+                "Activation-checkpoint ESMC",
+                value=bool(loaded_params.get("checkpoint_lm") or False),
+                key=f"esm_native_checkpoint_lm_{source_key}",
+            )
+        st.caption(
+            "Lean shared-model profile for a 24 GB GPU. Native ESM design uses one target chain; "
+            "selected hotspots are preserved for downstream scoring."
+        )
+        _tool_payload_expander(
+            "ESMFold2 native binder-design payload",
+            {
+                "image": esm_binder_workflow.ESMFOLD2_BINDER_IMAGE,
+                "checkpoint": str(
+                    esm_binder_workflow.ESMFOLD2_BINDER_MODEL_ROOT / esm_native_model
+                ),
+                "target": {
+                    "pdb": str(target_pdb),
+                    "chain": esm_target_chain,
+                    "hotspots_for_downstream_scoring": hotspots,
+                },
+                "binder": {
+                    "length": int(esm_native_length),
+                    "num_designs": int(esm_native_designs),
+                },
+                "optimization": {
+                    "steps": int(esm_native_steps),
+                    "learning_rate": float(esm_native_lr),
+                    "seed": int(esm_native_seed),
+                    "compile": bool(esm_native_compile),
+                    "checkpoint_lm": bool(esm_native_checkpoint_lm),
+                    "memory_profile": "lean_shared_model",
+                },
+            },
+        )
+        if st.button("Run ESMFold2 binder design", type="primary", disabled=not target_chains):
+            try:
+                with st.spinner("Running native ESMFold2 binder design..."):
+                    run_dir = run_esmfold2_native_binder_design(
+                        target_pdb=target_pdb,
+                        target_chain=esm_target_chain,
+                        hotspots=hotspots,
+                        binder_length=int(esm_native_length),
+                        num_designs=int(esm_native_designs),
+                        campaign_name=campaign_name,
+                        optimization_steps=int(esm_native_steps),
+                        learning_rate=float(esm_native_lr),
+                        seed=int(esm_native_seed),
+                        model_name=esm_native_model,
+                        compile_model=bool(esm_native_compile),
+                        checkpoint_lm=bool(esm_native_checkpoint_lm),
+                        gpu_device=design_gpu_device,
+                    )
+                result = read_json(run_dir / "result.json")
+                if result.get("success"):
+                    st.success("ESMFold2 binder-design job finished.")
+                else:
+                    st.error("ESMFold2 binder-design job failed. Open the logs for details.")
+                st.link_button("Open result", result_link("design", run_dir.name))
+            except Exception as exc:
+                st.error(str(exc))
+    else:
+        st.subheader("ESMFold2 Binder Screening")
+        esm_cols = st.columns(4)
+        with esm_cols[0]:
+            esm_num_designs = st.number_input(
+                "Sequence proposals",
+                1,
+                100,
+                int(loaded_params.get("num_designs") or min(max(int(num_candidates), 1), 8)),
+                key=f"esm_num_designs_{source_key}",
+            )
+        with esm_cols[1]:
+            esm_num_steps = st.number_input(
+                "Sampling steps",
+                1,
+                200,
+                int(loaded_params.get("num_sampling_steps") or 32),
+                key=f"esm_num_sampling_steps_{source_key}",
+            )
+        with esm_cols[2]:
+            esm_num_loops = st.number_input(
+                "Recycling loops",
+                1,
+                10,
+                int(loaded_params.get("num_loops") or 3),
+                key=f"esm_num_loops_{source_key}",
+            )
+        with esm_cols[3]:
+            esm_seed = st.number_input(
+                "Seed",
+                0,
+                999999,
+                int(loaded_params.get("seed") or 11),
+                key=f"esm_seed_{source_key}",
+            )
+        esm_binder_sequences = st.text_area(
+            "Optional binder sequences",
+            value=str(loaded_params.get("binder_sequences_text") or ""),
+            placeholder="Paste FASTA or one sequence per line.",
+            height=140,
+            key=f"esm_binder_sequences_{source_key}",
+        )
+        esm_contact_cutoff = st.number_input(
+            "Contact cutoff",
+            min_value=3.0,
+            max_value=20.0,
+            value=float(loaded_params.get("contact_cutoff") or 8.0),
+            step=0.5,
+            key=f"esm_contact_cutoff_{source_key}",
+        )
+        if st.button("Run ESMFold2 screening", type="primary", disabled=not target_chains):
+            try:
+                with st.spinner("Running ESMFold2 screening..."):
+                    run_dir = run_esmfold2_binder_screening(
+                        target_pdb=target_pdb,
+                        target_chains=target_chains,
+                        hotspots=hotspots,
+                        binder_length=binder_length,
+                        num_designs=int(esm_num_designs),
+                        binder_sequences_text=esm_binder_sequences,
+                        campaign_name=campaign_name,
+                        num_loops=int(esm_num_loops),
+                        num_sampling_steps=int(esm_num_steps),
+                        seed=int(esm_seed),
+                        device="auto",
+                        contact_cutoff=float(esm_contact_cutoff),
+                    )
+                st.success("ESMFold2 screening job finished.")
+                st.link_button("Open result", result_link("design", run_dir.name))
+            except Exception as exc:
+                st.error(str(exc))
 
 with protpardelle_tab:
     st.caption(
@@ -2288,6 +2402,7 @@ with protpardelle_tab:
                     crop_cond_start=float(protpardelle_crop_cond_start),
                     batch_size=int(protpardelle_batch_size),
                     seed=int(protpardelle_seed),
+                    gpu_device=design_gpu_device,
                 )
             st.success("Protpardelle-1c job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))
@@ -2376,6 +2491,7 @@ with complexa_tab:
                     replicas=int(complexa_replicas),
                     seed=int(complexa_seed),
                     batch_size=int(complexa_batch_size),
+                    gpu_device=design_gpu_device,
                 )
             st.success("Proteina-Complexa job finished.")
             st.link_button("Open result", result_link("design", run_dir.name))

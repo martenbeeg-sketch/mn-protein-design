@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 
 from mn_protein_design.core.candidates import STAGE_GENERATION_BACKBONE
-from mn_protein_design.app.pages.common import result_link, run_steps_after_source, show_pipeline_links, source_from_run_dir
+from mn_protein_design.app.pages.common import gpu_run_panel, result_link, run_steps_after_source, show_pipeline_links, source_from_run_dir
 from mn_protein_design.workflows.modules import candidate_sources, load_source_candidates
 from mn_protein_design.workflows.sequence_design import run_foundry_mpnn_sequence_design, run_ligandmpnn_sequence_design
 
@@ -199,6 +199,9 @@ if continue_downstream:
         }
     )
 
+with st.expander("Compute", expanded=True):
+    sequence_gpu_device = gpu_run_panel(key="sequence_design", default="0")
+
 if st.button("Run sequence design", type="primary"):
     try:
         with st.spinner("Running sequence design..."):
@@ -212,6 +215,7 @@ if st.button("Run sequence design", type="primary"):
                     sampling_temp=float(sampling_temp),
                     omit_aas=omit_aas,
                     seed=int(seed) if int(seed) else None,
+                    gpu_device=sequence_gpu_device,
                 )
             else:
                 run_dir = run_foundry_mpnn_sequence_design(
@@ -220,6 +224,7 @@ if st.button("Run sequence design", type="primary"):
                     number_of_batches=int(foundry_batches),
                     batch_size=int(foundry_batch_size),
                     checkpoint_path=foundry_checkpoint,
+                    gpu_device=sequence_gpu_device,
                 )
         st.success("Sequence design job finished.")
         st.link_button("Open result", result_link("design", run_dir.name))

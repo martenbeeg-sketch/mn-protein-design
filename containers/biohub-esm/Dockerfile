@@ -37,14 +37,19 @@ RUN python3 -m venv "$VIRTUAL_ENV" \
 COPY tools_to_implement/esm/ /opt/esm/
 
 RUN python -m pip install "huggingface_hub[cli]" \
+    && python -m pip install modal \
     && python -m pip install -e /opt/esm
 
 COPY containers/biohub-esm/entrypoint.sh /usr/local/bin/biohub-esm-entrypoint
 COPY containers/biohub-esm/smoke_test.py /usr/local/bin/biohub-esm-smoke-test
+COPY containers/biohub-esm/binder_design.py /usr/local/bin/biohub-esm-binder-design
 
 RUN mkdir -p "$HF_HOME" \
     && chmod 777 /cache /cache/huggingface \
-    && chmod +x /usr/local/bin/biohub-esm-entrypoint /usr/local/bin/biohub-esm-smoke-test
+    && chmod +x \
+        /usr/local/bin/biohub-esm-entrypoint \
+        /usr/local/bin/biohub-esm-smoke-test \
+        /usr/local/bin/biohub-esm-binder-design
 
 ENTRYPOINT ["biohub-esm-entrypoint"]
 CMD ["biohub-esm-smoke-test"]
