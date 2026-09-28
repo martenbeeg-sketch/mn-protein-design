@@ -9,6 +9,7 @@ import streamlit as st
 from mn_protein_design.app.components.molstar_viewer import StructureVisualization, molstar_custom_component
 from mn_protein_design.app.pages.common import (
     gpu_run_panel,
+    refresh_results_button,
     result_link,
     selected_dataframe_rows,
     show_delete_jobs_dialog,
@@ -23,6 +24,7 @@ from mn_protein_design.workflows.detection import (
     chains_for_pdb,
     detection_jobs_for_target,
     enqueue_masif_seed,
+    enqueue_pesto,
     enqueue_scannet,
     enqueue_surf2spot,
     ppi_target_jobs,
@@ -139,7 +141,7 @@ def _load_detection_targets() -> list[dict]:
 
 targets = _load_detection_targets()
 if not targets:
-    st.info("Prepare a target first, then return here to run ScanNet, MaSIF, or Surf2Spot.")
+    st.info("Prepare a target first, then return here to run ScanNet, PeSTo, MaSIF, or Surf2Spot.")
     st.stop()
 
 
@@ -147,6 +149,7 @@ def _category_label(category: str) -> str:
     labels = {
         "trimmed": "Trimmed prepared targets",
         "cleaned": "Cleaned prepared targets",
+        "mutated": "Mutated targets",
         "cropped": "Cropped targets",
         "benchmark": "Benchmark targets",
         "imported": "Imported dataset targets",
@@ -156,8 +159,9 @@ def _category_label(category: str) -> str:
 
 
 def _source_categories(rows: list[dict]) -> list[str]:
-    preferred = ["imported", "trimmed", "cleaned", "cropped", "benchmark", "unknown"]
+    preferred = ["imported", "trimmed", "cleaned", "mutated", "cropped", "benchmark", "unknown"]
     present = {str(row.get("source_category") or row.get("prepared_kind") or "unknown") for row in rows}
+    present.add("mutated")
     ordered = [category for category in preferred if category in present]
     ordered.extend(sorted(category for category in present if category not in preferred))
     return ordered
@@ -251,6 +255,7 @@ with dataset_tab:
     if st.session_state.get("ppi_detection_active_target_token") != target_token:
         st.session_state["ppi_detection_active_target_token"] = target_token
         st.session_state["ppi_detection_scannet_chains"] = list(chains)
+        st.session_state["ppi_detection_pesto_chains"] = list(chains)
         st.session_state["ppi_detection_masif_chain"] = chains[0] if chains else ""
 
     st.subheader("Input")
@@ -296,8 +301,13 @@ with methods_tab:
     st.subheader("Methods")
     st.caption("Enable one or more detection tools. Each tool keeps its own parameters grouped below.")
 
-    tool_keys = ["ppi_enable_scannet", "ppi_enable_surf2spot", "ppi_enable_masif"]
-    defaults = {"ppi_enable_scannet": True, "ppi_enable_surf2spot": True, "ppi_enable_masif": True}
+    tool_keys = ["ppi_enable_scannet", "ppi_enable_pesto", "ppi_enable_surf2spot", "ppi_enable_masif"]
+    defaults = {
+        "ppi_enable_scannet": True,
+        "ppi_enable_pesto": True,
+        "ppi_enable_surf2spot": True,
+        "ppi_enable_masif": True,
+    }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
     bulk_cols = st.columns([1, 1, 5])
@@ -346,6 +356,32 @@ with methods_tab:
         st.caption("Outputs residue-level PPI/interface predictions for the selected chain set.")
         if not enable_scannet:
             scannet_chains = []
+
+    with st.expander("PeSTo PPI Settings", expanded=bool(st.session_state.get("ppi_enable_pesto"))):
+        enable_pesto = st.checkbox(
+            "Run PeSTo PPI",
+            value=True,
+            key="ppi_enable_pesto",
+            help="Predicts residue-level protein-protein interaction interfaces with the PeSTo i_v4_1 model.",
+        )
+        pesto_cols = st.columns(3)
+        pesto_chain_key = f"pesto_chains_{st.session_state.get('ppi_detection_active_target_token', 'none')}"
+        if pesto_chain_key not in st.session_state:
+            st.session_state[pesto_chain_key] = [
+                chain for chain in st.session_state.get("ppi_detection_pesto_chains", chains) if chain in chains
+            ] or list(chains)
+        pesto_chains = pesto_cols[0].multiselect(
+            "Chains",
+            options=chains,
+            key=pesto_chain_key,
+            disabled=not enable_pesto or not target_ready,
+        )
+        st.session_state["ppi_detection_pesto_chains"] = list(pesto_chains)
+        pesto_cols[1].text_input("Interface class", value="protein-protein", disabled=True)
+        pesto_cols[2].text_input("Model", value="i_v4_1", disabled=True)
+        st.caption("Outputs original-numbered residue probabilities and a score-annotated PDB for Mol* visualization.")
+        if not enable_pesto:
+            pesto_chains = []
 
     with st.expander("Surf2Spot Hotspot Detection Settings", expanded=bool(st.session_state.get("ppi_enable_surf2spot"))):
         enable_surf2spot = st.checkbox(
@@ -398,6 +434,8 @@ with run_tab:
     run_rows = []
     if enable_scannet:
         run_rows.append({"method": "ScanNet", "chains": ",".join(scannet_chains), "mode": scannet_mode})
+    if enable_pesto:
+        run_rows.append({"method": "PeSTo", "chains": ",".join(pesto_chains), "mode": "protein_interface"})
     if enable_surf2spot:
         run_rows.append({"method": "Surf2Spot", "chains": ",".join(chains), "mode": "HS"})
     if enable_masif:
@@ -407,7 +445,13 @@ with run_tab:
     else:
         st.info("Enable at least one method in the Methods tab.")
 
-    run_disabled = not target_ready or not run_rows or (enable_scannet and not scannet_chains) or (enable_masif and not masif_chain)
+    run_disabled = (
+        not target_ready
+        or not run_rows
+        or (enable_scannet and not scannet_chains)
+        or (enable_pesto and not pesto_chains)
+        or (enable_masif and not masif_chain)
+    )
     if not target_ready:
         st.warning("Select a readable target with at least one protein chain in the Dataset tab before running methods.")
     if st.button("Run selected methods", type="primary", disabled=run_disabled):
@@ -422,6 +466,15 @@ with run_tab:
                     launch_status.append({"method": "ScanNet", "status": "queued", "run_id": run_dir.name, "message": ""})
                 except Exception as exc:
                     launch_status.append({"method": "ScanNet", "status": "failed to queue", "run_id": "", "message": str(exc)})
+        if enable_pesto:
+            with st.spinner("Queueing PeSTo PPI prediction..."):
+                try:
+                    run_dir = enqueue_pesto(target_pdb, pesto_chains, gpu_device=ppi_gpu_device)
+                    spawn_worker_for_run(run_dir)
+                    queued_runs.append(run_dir)
+                    launch_status.append({"method": "PeSTo", "status": "queued", "run_id": run_dir.name, "message": ""})
+                except Exception as exc:
+                    launch_status.append({"method": "PeSTo", "status": "failed to queue", "run_id": "", "message": str(exc)})
         if enable_surf2spot:
             with st.spinner("Queueing Surf2Spot hotspot prediction..."):
                 try:
@@ -455,6 +508,7 @@ with run_tab:
 
 with results_tab:
     st.subheader("Results")
+    refresh_results_button("ppi_detection_refresh_results")
     df = _detection_results_table()
     if df.empty:
         st.info("No PPI/hotspot detection jobs yet.")
@@ -471,13 +525,11 @@ with results_tab:
             filtered_df = filtered_df[filtered_df["source_category"].astype(str) == str(selected_source_category)].copy()
 
         target_filters = ["All targets", *filtered_df["target_filter"].dropna().astype(str).drop_duplicates().tolist()]
-        current_target_filter = _target_info_for_pdb(Path(str(target.get("target_pdb") or ""))).get("target_filter")
-        default_filter_index = target_filters.index(current_target_filter) if current_target_filter in target_filters else 0
         selected_target_filter = st.selectbox(
             "Target filter",
             target_filters,
-            index=default_filter_index,
-            key="ppi_detection_results_target_filter",
+            index=0,
+            key="ppi_detection_results_target_filter_v2",
         )
         if selected_target_filter != "All targets":
             filtered_df = filtered_df[filtered_df["target_filter"].astype(str) == selected_target_filter].copy()

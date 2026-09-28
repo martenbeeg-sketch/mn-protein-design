@@ -24,7 +24,15 @@ KNOWN_BENCHMARK_PDB_DIR = KNOWN_BENCHMARK_ROOT / "input_pdbs"
 
 def _parse_chain_list(value: object) -> list[str]:
     if isinstance(value, (list, tuple, set)):
-        return [str(item).strip() for item in value if str(item).strip()]
+        chains: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                chain_id = str(item.get("chain_id") or item.get("chain") or "").strip()
+            else:
+                chain_id = str(item).strip()
+            if chain_id:
+                chains.append(chain_id)
+        return chains
     text = str(value or "").strip()
     if not text:
         return []
@@ -33,7 +41,7 @@ def _parse_chain_list(value: object) -> list[str]:
     except (SyntaxError, ValueError):
         parsed = None
     if isinstance(parsed, (list, tuple, set)):
-        return [str(item).strip() for item in parsed if str(item).strip()]
+        return _parse_chain_list(parsed)
     return [item.strip() for item in text.split(",") if item.strip()]
 
 
@@ -64,11 +72,18 @@ def _safe_target_token(value: object, fallback: str = "target") -> str:
     return token or fallback
 
 
+def _normalize_target_category(value: object) -> str:
+    category = str(value or "").strip() or "prepared"
+    if category == "masked":
+        return "mutated"
+    return category
+
+
 def _add_target_row(rows: list[dict], seen: set[tuple[str, tuple[str, ...]]], row: dict) -> None:
     target_pdb = Path(str(row.get("target_pdb") or "")).expanduser()
     if not target_pdb.exists():
         return
-    chains = [str(chain) for chain in row.get("chains") or [] if str(chain)]
+    chains = _parse_chain_list(row.get("chains") or [])
     if not chains:
         try:
             chains = chains_for_pdb(target_pdb)
@@ -85,7 +100,8 @@ def _add_target_row(rows: list[dict], seen: set[tuple[str, tuple[str, ...]]], ro
     row["target_pdb"] = str(target_pdb)
     row["chains"] = chains
     row.setdefault("records", 1)
-    row.setdefault("source_category", row.get("prepared_kind") or "prepared")
+    row["prepared_kind"] = _normalize_target_category(row.get("prepared_kind") or row.get("source_category") or "prepared")
+    row["source_category"] = _normalize_target_category(row.get("source_category") or row.get("prepared_kind") or "prepared")
     rows.append(row)
 
 
@@ -98,10 +114,19 @@ def _prepared_target_rows(rows: list[dict], seen: set[tuple[str, tuple[str, ...]
         target = (result.get("outputs") or {}).get("target") or {}
         downstream = result.get("downstream_artifacts", {})
         target_pdb = run_dir / downstream.get("target_trimmed_pdb", "artifacts/target_trimmed.pdb")
-        prepared_kind = "trimmed"
+        prepared_kind = _normalize_target_category(target.get("prepared_kind") or "trimmed")
         if not target_pdb.exists():
             target_pdb = run_dir / downstream.get("target_clean_pdb", "artifacts/target_clean.pdb")
-            prepared_kind = "cleaned"
+            prepared_kind = _normalize_target_category(target.get("prepared_kind") or "cleaned")
+        source_label = target.get("source_label")
+        if not source_label:
+            source_label = (
+                "Target mutation"
+                if prepared_kind == "mutated"
+                else "Target fragment split"
+                if prepared_kind == "split_fragments"
+                else "Target preparation"
+            )
         _add_target_row(
             rows,
             seen,
@@ -113,7 +138,9 @@ def _prepared_target_rows(rows: list[dict], seen: set[tuple[str, tuple[str, ...]
                 "residue_count": target.get("residue_count"),
                 "source_category": prepared_kind,
                 "prepared_kind": prepared_kind,
-                "source_label": "Target preparation",
+                "source_label": source_label,
+                "target_entities": target.get("target_entities") or [],
+                "fragment_split": target.get("fragment_split") or {},
             },
         )
 
@@ -153,6 +180,9 @@ def _imported_target_rows(rows: list[dict], seen: set[tuple[str, tuple[str, ...]
         result = read_json(run_dir / "result.json")
         inputs = result.get("inputs") if isinstance(result.get("inputs"), dict) else {}
         target = (result.get("outputs") or {}).get("target") or {}
+        prepared_kind = _normalize_target_category(target.get("prepared_kind") or "")
+        if row.get("tool") == "target_fragment_splitter" or prepared_kind == "split_fragments":
+            continue
         source_pdb = Path(str(inputs.get("source_pdb") or target.get("source_pdb") or "")).expanduser()
         if not source_pdb.exists():
             target_input = run_dir / "artifacts" / "target_input.pdb"
@@ -391,6 +421,106 @@ def run_scannet(
             "outputs": {"artifacts": artifacts},
             "metrics": {"return_code": rc, "artifact_count": len(artifacts)},
             "downstream_artifacts": {"residue_scores": [a["path"] for a in artifacts if a["type"] == "residue_score_table"]},
+        },
+    )
+    return job.run_dir
+
+
+def enqueue_pesto(target_pdb: Path, chain_ids: list[str], gpu_device: object = "0") -> Path:
+    load_manifest("pesto")
+    normalized_gpu = normalize_gpu_device(gpu_device)
+    job = create_job(
+        DETECTION_GROUP,
+        job_type="ppi_detection",
+        tool="pesto",
+        inputs={"target_pdb": str(target_pdb), "chains": chain_ids},
+        params={
+            "mode": "protein_interface",
+            "gpu_device": normalized_gpu,
+            "queue_resource": gpu_queue_resource(normalized_gpu),
+        },
+    )
+    _write_detection_worker_request(job)
+    return job.run_dir
+
+
+def run_pesto(
+    target_pdb: Path,
+    chain_ids: list[str],
+    gpu_device: object = "0",
+    existing_job: JobPaths | None = None,
+) -> Path:
+    manifest = load_manifest("pesto")
+    normalized_gpu = normalize_gpu_device(gpu_device)
+    job = existing_job or create_job(
+        DETECTION_GROUP,
+        job_type="ppi_detection",
+        tool="pesto",
+        inputs={"target_pdb": str(target_pdb), "chains": chain_ids},
+        params={
+            "mode": "protein_interface",
+            "gpu_device": normalized_gpu,
+            "queue_resource": gpu_queue_resource(normalized_gpu),
+        },
+    )
+    root = job.run_dir / "artifacts" / "pesto"
+    input_pdb = artifact_path(job.run_dir, "pesto", "input", "target.pdb")
+    input_pdb.write_text(
+        filter_pdb_text(
+            target_pdb.read_text(errors="ignore"),
+            keep_chains=set(chain_ids) or None,
+            remove_waters=True,
+            remove_hetero=True,
+        )
+    )
+    output_dir = artifact_path(job.run_dir, "pesto", "output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    steps = [
+        {
+            "name": "pesto",
+            "command": [
+                "docker",
+                "run",
+                "--rm",
+                *docker_gpu_args(normalized_gpu),
+                "-v",
+                f"{job.run_dir}:/work",
+                "-v",
+                "/mnt/db/reference_files/pesto:/models:ro",
+                manifest["image"],
+            ]
+            + [
+                "--input",
+                "/work/artifacts/pesto/input/target.pdb",
+                "--output-dir",
+                "/work/artifacts/pesto/output",
+                "--interface",
+                "protein",
+                "--device",
+                "cuda",
+                "--checkpoint",
+                "/models/i_v4_1/model_ckpt.pt",
+            ],
+        }
+    ]
+    rc = _run_shell_steps(job.run_dir, steps)
+    artifacts = _collect_artifacts(
+        job.run_dir,
+        root,
+        [("output/*.csv", "residue_score_table"), ("output/*.pdb", "pdb")],
+    )
+    residue_score_artifacts = [a["path"] for a in artifacts if a["type"] == "residue_score_table"]
+    scored_pdb_artifacts = [a["path"] for a in artifacts if a["type"] == "pdb"]
+    finish_job(
+        job.run_dir,
+        rc == 0 and bool(residue_score_artifacts) and bool(scored_pdb_artifacts),
+        {
+            "outputs": {"artifacts": artifacts},
+            "metrics": {"return_code": rc, "artifact_count": len(artifacts)},
+            "downstream_artifacts": {
+                "residue_scores": residue_score_artifacts,
+                "scored_pdbs": scored_pdb_artifacts,
+            },
         },
     )
     return job.run_dir

@@ -15,6 +15,7 @@ from mn_protein_design.core.jobs import (
     collect_jobs,
     create_job,
     finish_job,
+    _release_resource_lock,
     prepare_job_for_resume,
     read_json,
     update_status,
@@ -32,7 +33,14 @@ from mn_protein_design.workflows.benchmark import (
     enqueue_candidate_refolding_evaluation,
 )
 from mn_protein_design.workflows.esm_binder import ESMFOLD2_MODEL_DIR
-from mn_protein_design.workflows.refolding import BOLTZ_MODELS_DIR, RF3_CHECKPOINT, _sequences_by_chain
+from mn_protein_design.workflows.refolding import (
+    BOLTZ_MODELS_DIR,
+    OPENFOLD3_CHECKPOINT,
+    PROTENIX_V1_MODEL,
+    PROTENIX_V2_MODEL,
+    RF3_CHECKPOINT,
+    _sequences_by_chain,
+)
 
 
 CAPACITY_GROUP = "benchmark"
@@ -40,6 +48,21 @@ CAPACITY_JOB_TYPE = "refolding_capacity_benchmark"
 CAPACITY_TOOL = "refolding_capacity_matrix"
 CAPACITY_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "stopped", "skipped"}
 CAPACITY_ACTIVE_STATUSES = {"queued", "running", "preparing"}
+DESIGN_CAPACITY_JOB_TYPE = "design_generator_capacity_benchmark"
+DESIGN_CAPACITY_TOOL = "design_generator_capacity_ladder"
+DESIGN_CAPACITY_CHILD_ROLE = "design_capacity_cell"
+
+DESIGN_GENERATOR_LABELS = {
+    "rfdiffusion_classic": "RFdiffusion classic",
+    "bindcraft": "BindCraft",
+    "rfdiffusion3_foundry": "RFdiffusion3 / Foundry",
+    "boltzgen": "BoltzGen",
+    "pxdesign": "PXDesign",
+    "genie3": "Genie3",
+    "esmfold2_binder_design": "ESMFold2 binder design",
+    "protpardelle_1c": "Protpardelle-1c",
+    "proteina_complexa": "Proteina-Complexa",
+}
 
 AA3 = {
     "A": "ALA",
@@ -71,7 +94,10 @@ ENGINE_LABELS = {
     "esmfold2": "ESMFold2",
     "boltz2_initial_guess": "Boltz-2",
     "rf3": "RF3",
-    "protenix": "Protenix",
+    "openfold3": "OpenFold-3",
+    "protenix": "Protenix v0.5",
+    "protenix_v1": "Protenix v1",
+    "protenix_v2": "Protenix v2",
     "boltzgen_fold": "BoltzGen Fold",
 }
 
@@ -290,6 +316,9 @@ def _engine_kwargs(engine: str, gpu_device: str, preset: str, params: dict[str, 
         rf3_recycles = 2
         rf3_steps = 10
         rf3_samples = 1
+        openfold3_recycles = 1
+        openfold3_samples = 1
+        openfold3_seeds = 1
         protenix_cycle = 1
         protenix_steps = 10
         protenix_samples = 1
@@ -309,6 +338,9 @@ def _engine_kwargs(engine: str, gpu_device: str, preset: str, params: dict[str, 
         rf3_recycles = 10
         rf3_steps = 50
         rf3_samples = 5
+        openfold3_recycles = 3
+        openfold3_samples = 5
+        openfold3_seeds = 1
         protenix_cycle = 3
         protenix_steps = 50
         protenix_samples = 5
@@ -328,13 +360,20 @@ def _engine_kwargs(engine: str, gpu_device: str, preset: str, params: dict[str, 
         rf3_recycles = 10
         rf3_steps = 50
         rf3_samples = 5
+        openfold3_recycles = 3
+        openfold3_samples = 5
+        openfold3_seeds = 1
         protenix_cycle = 3
         protenix_steps = 50
         protenix_samples = 5
         boltzgen_recycles = 3
         boltzgen_steps = 200
         boltzgen_samples = 5
-    use_real_target_msa = practical or full_workflow
+    conditioning_mode = str(params.get("conditioning_mode") or "default")
+    use_target_templates = conditioning_mode != "msa_only"
+    use_real_target_msa = bool(practical or full_workflow or conditioning_mode in {"template_msa", "msa_only"})
+    if conditioning_mode == "template_only":
+        use_real_target_msa = False
     base = {
         "models": [],
         "run_common_interface_metrics": bool(full_workflow),
@@ -353,6 +392,7 @@ def _engine_kwargs(engine: str, gpu_device: str, preset: str, params: dict[str, 
         "colabfold_cache_dir": COLABFOLD_CACHE_DIR,
         "alphafast_batch_size": 0,
         "alphafast_num_recycles": int(params.get("alphafast_num_recycles", alphafast_recycles)),
+        "alphafast_use_target_templates": bool(use_target_templates),
         "alphafast_query_only_msa": not bool(use_real_target_msa),
         "af2_num_recycles": int(params.get("af2_num_recycles", af2_recycles)),
         "af2_multimer": True,
@@ -361,9 +401,10 @@ def _engine_kwargs(engine: str, gpu_device: str, preset: str, params: dict[str, 
         "af2_use_interface_template": False,
         "colabfold_num_recycles": int(params.get("colabfold_num_recycles", colabfold_recycles)),
         "colabfold_num_models": int(params.get("colabfold_num_models", colabfold_models)),
-        "colabfold_use_target_templates": False,
+        "colabfold_use_target_templates": bool(use_target_templates),
+        "colabfold_use_target_msa": bool(use_real_target_msa),
         "colabfold_max_template_hits": 4,
-        "boltz2_use_target_template": True,
+        "boltz2_use_target_template": bool(use_target_templates),
         "boltz2_use_target_msa": bool(use_real_target_msa),
         "boltz2_recycling_steps": int(params.get("boltz2_recycling_steps", boltz_recycles)),
         "boltz2_sampling_steps": int(params.get("boltz2_sampling_steps", boltz_steps)),
@@ -376,14 +417,35 @@ def _engine_kwargs(engine: str, gpu_device: str, preset: str, params: dict[str, 
         "seed": int(params.get("seed", 0)),
         "rf3_checkpoint_path": RF3_CHECKPOINT,
         "rf3_use_target_msa": bool(use_real_target_msa),
+        "rf3_use_target_template": bool(use_target_templates),
         "rf3_recycles": int(params.get("rf3_recycles", rf3_recycles)),
         "rf3_num_steps": int(params.get("rf3_num_steps", rf3_steps)),
         "rf3_diffusion_batch_size": int(params.get("rf3_samples", rf3_samples)),
         "rf3_seed": int(params.get("seed", 0)),
+        "openfold3_checkpoint_path": OPENFOLD3_CHECKPOINT,
+        "openfold3_use_target_msa": bool(use_real_target_msa),
+        "openfold3_num_diffusion_samples": int(params.get("openfold3_samples", openfold3_samples)),
+        "openfold3_num_model_seeds": int(params.get("openfold3_seeds", openfold3_seeds)),
+        "openfold3_num_recycles": int(params.get("openfold3_recycles", openfold3_recycles)),
+        "openfold3_use_msa_server": False,
         "protenix_use_msa": bool(use_real_target_msa),
         "protenix_cycle": int(params.get("protenix_cycle", protenix_cycle)),
         "protenix_diffusion_steps": int(params.get("protenix_steps", protenix_steps)),
         "protenix_samples": int(params.get("protenix_samples", protenix_samples)),
+        "protenix_v1_model_name": str(params.get("protenix_v1_model_name") or PROTENIX_V1_MODEL),
+        "protenix_v1_use_msa": bool(use_real_target_msa),
+        "protenix_v1_use_template": bool(use_target_templates),
+        "protenix_v1_use_default_params": True,
+        "protenix_v1_cycle": int(params.get("protenix_v1_cycle", protenix_cycle)),
+        "protenix_v1_diffusion_steps": int(params.get("protenix_v1_steps", protenix_steps)),
+        "protenix_v1_samples": int(params.get("protenix_v1_samples", protenix_samples)),
+        "protenix_v2_model_name": str(params.get("protenix_v2_model_name") or PROTENIX_V2_MODEL),
+        "protenix_v2_use_msa": bool(use_real_target_msa),
+        "protenix_v2_use_template": bool(use_target_templates),
+        "protenix_v2_use_default_params": True,
+        "protenix_v2_cycle": int(params.get("protenix_v2_cycle", protenix_cycle)),
+        "protenix_v2_diffusion_steps": int(params.get("protenix_v2_steps", protenix_steps)),
+        "protenix_v2_samples": int(params.get("protenix_v2_samples", protenix_samples)),
         "boltzgen_recycling_steps": int(params.get("boltzgen_recycling_steps", boltzgen_recycles)),
         "boltzgen_sampling_steps": int(params.get("boltzgen_sampling_steps", boltzgen_steps)),
         "boltzgen_diffusion_samples": int(params.get("boltzgen_samples", boltzgen_samples)),
@@ -405,8 +467,14 @@ def _engine_kwargs(engine: str, gpu_device: str, preset: str, params: dict[str, 
         base["models"] = ["boltz"]
     elif engine == "rf3":
         base["run_rf3"] = True
+    elif engine == "openfold3":
+        base["run_openfold3"] = True
     elif engine == "protenix":
         base["run_protenix"] = True
+    elif engine == "protenix_v1":
+        base["run_protenix_v1"] = True
+    elif engine == "protenix_v2":
+        base["run_protenix_v2"] = True
     elif engine == "boltzgen_fold":
         base["run_boltzgen_fold"] = True
     else:
@@ -522,6 +590,7 @@ def create_refolding_capacity_benchmark(
     engines: list[str],
     gpu_device: str = "0",
     preset: str = "capacity_only",
+    conditioning_mode: str = "default",
     launch: bool = True,
     engine_params: dict[str, Any] | None = None,
     target_pdb: Path | None = None,
@@ -550,6 +619,7 @@ def create_refolding_capacity_benchmark(
         "engines": list(engines),
         "capacity_device": str(gpu_device),
         "preset": preset,
+        "conditioning_mode": str(conditioning_mode or "default"),
         "launch": bool(launch),
         "model_dir": str(ESMFOLD2_MODEL_DIR),
         "target_pdb": str(target_pdb) if target_pdb else "",
@@ -585,7 +655,8 @@ def create_refolding_capacity_benchmark(
             raise ValueError(f"Could not extract a protein sequence from chain {source_chain} in {target_pdb}.")
         if not copy_counts:
             raise ValueError("Provide at least one multimer copy count.")
-        target_artifact = None
+        target_artifact = _copy_target_artifact(job.run_dir, target_pdb, [source_chain])
+        shutil.copy2(target_artifact, job.run_dir / "artifacts" / "capacity_target.pdb")
         target_length_values = []
     elif matrix_mode == "target_panel":
         target_artifact = None
@@ -966,8 +1037,11 @@ def create_practical_capacity_benchmark_from_parent(
             "practical_seed_rows": practical_seed_rows,
             "practical_safe_settings": {
                 "explicit_repeated_chains": True,
-                "colabfold_use_target_templates": False,
-                "alphafast_query_only_msa": True,
+                "alphafast_use_target_templates": True,
+                "colabfold_use_target_templates": True,
+                "protenix_v1_use_template": True,
+                "protenix_v2_use_template": True,
+                "alphafast_query_only_msa": False,
                 "rf3_min_recycles": 2,
                 "viewer_structures_preserve_chains": True,
                 "cell_failures_do_not_fail_parent": True,
@@ -1359,6 +1433,359 @@ def _mark_capacity_child_skipped(child_run_dir: Path, reason: str) -> None:
     result = read_json(child_run_dir / "result.json")
     result.update({"success": None, "skipped": True, "skip_reason": reason})
     write_json(child_run_dir / "result.json", result)
+
+
+def _design_capacity_child_rows(batch_id: str) -> list[tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    rows: list[tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    for job in collect_jobs("design-campaign", include_hidden=True):
+        run_dir = Path(str(job.get("run_dir") or ""))
+        input_payload = read_json(run_dir / "input.json")
+        params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+        if str(params.get("capacity_batch_id") or "") != str(batch_id):
+            continue
+        metadata = read_json(run_dir / "metadata.json")
+        result = read_json(run_dir / "result.json")
+        rows.append((run_dir, metadata, input_payload, result))
+    return rows
+
+
+def _mark_design_capacity_child_skipped(child_run_dir: Path, reason: str) -> None:
+    metadata = read_json(child_run_dir / "metadata.json")
+    now = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+    metadata.update(
+        {
+            "status": "skipped",
+            "updated_at": now,
+            "completed_at": now,
+            "skip_reason": reason,
+            "current_phase": reason,
+        }
+    )
+    write_json(child_run_dir / "metadata.json", metadata)
+    result = read_json(child_run_dir / "result.json")
+    result.update({"success": None, "skipped": True, "skip_reason": reason, "metrics": result.get("metrics") or {}})
+    write_json(child_run_dir / "result.json", result)
+
+
+def _design_capacity_generator_config(generator: str, binder_length: int, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    merged = {
+        "campaign_workflow_recipe": "staged_backbone_sequence_refold",
+        "binder_length": str(int(binder_length)),
+        **dict(config or {}),
+    }
+    if generator == "genie3":
+        merged.setdefault("cond_strategy", "extended")
+        merged.setdefault("direction_scale", 0.0)
+    if generator == "proteina_complexa":
+        merged.setdefault("replicas", 1)
+        merged.setdefault("batch_size", 1)
+    return merged
+
+
+def _design_capacity_target_length(target_pdb: Path, target_chains: list[str]) -> int | None:
+    try:
+        return _target_length(Path(target_pdb), list(target_chains))
+    except Exception:
+        return None
+
+
+def _create_design_capacity_child_job(
+    parent_run_dir: Path,
+    *,
+    batch_id: str,
+    benchmark_name: str,
+    target_pdb: Path,
+    target_chains: list[str],
+    target_name: str,
+    hotspots: str,
+    generator: str,
+    binder_length: int,
+    gpu_device: str,
+    engine_config: dict[str, Any] | None = None,
+) -> Path:
+    from mn_protein_design.workflows.design_campaigns import DESIGN_CAMPAIGN_GROUP, ENGINE_ORDER
+
+    selected_engines = [engine for engine in ENGINE_ORDER if engine == generator]
+    generator_label = DESIGN_GENERATOR_LABELS.get(generator, generator)
+    normalized_config = _design_capacity_generator_config(generator, binder_length, engine_config)
+    target_length = _design_capacity_target_length(target_pdb, target_chains)
+    total_length = (int(target_length) + int(binder_length)) if target_length is not None else None
+    params = {
+        "campaign_name": f"{benchmark_name} | {generator_label} | L{int(binder_length)}",
+        "binder_length": str(int(binder_length)),
+        "hotspots": str(hotspots or "").strip(),
+        "design_attempts": 1,
+        "sequences_per_backbone": 1,
+        "random_seed": 0,
+        "engines": selected_engines,
+        "engine_configs": {generator: normalized_config},
+        "workflow_recipe": "staged",
+        "survivors_per_engine": 1_000_000,
+        "passing_only": False,
+        "keep_best_failed": True,
+        "continue_after_failure": True,
+        "common_validation": {"enabled": False},
+        "sequence_refinement": {"mode": "none", "staged_two_step": {"enabled": False}},
+        "evaluation": {"mode": "none"},
+        "gpu_device": str(gpu_device),
+        "capacity_kind": "design_generator",
+        "capacity_batch_id": str(batch_id),
+        "capacity_benchmark_name": str(benchmark_name),
+        "capacity_generator": str(generator),
+        "capacity_generator_label": generator_label,
+        "capacity_binder_length": int(binder_length),
+        "capacity_target_length": target_length,
+        "capacity_total_length": total_length,
+        "capacity_target_name": str(target_name),
+    }
+    job = create_job(
+        DESIGN_CAMPAIGN_GROUP,
+        "multi_engine_design_campaign",
+        "design_campaign",
+        {"target_pdb": str(target_pdb), "target_chains": list(target_chains)},
+        params,
+    )
+    write_json(job.run_dir / "worker_request.json", {"kind": "design_campaign", "kwargs": {}, "path_kwargs": []})
+    write_json(
+        job.run_dir / "command.json",
+        {
+            "mode": "local_worker",
+            "command": [
+                "python",
+                "-m",
+                "mn_protein_design.core.local_worker",
+                "--run-dir",
+                str(job.run_dir),
+            ],
+        },
+    )
+    metadata = read_json(job.run_dir / "metadata.json")
+    metadata.update(
+        {
+            "campaign_name": params["campaign_name"],
+            "hidden": True,
+            "parent_task_group": CAPACITY_GROUP,
+            "parent_run_id": parent_run_dir.name,
+            "parent_run_dir": str(parent_run_dir),
+            "parent_role": DESIGN_CAPACITY_CHILD_ROLE,
+            "capacity_parent_run_id": parent_run_dir.name,
+            "capacity_parent_run_dir": str(parent_run_dir),
+            "capacity_kind": "design_generator",
+            "capacity_batch_id": str(batch_id),
+            "capacity_benchmark_name": str(benchmark_name),
+            "capacity_generator": str(generator),
+            "capacity_generator_label": generator_label,
+            "capacity_binder_length": int(binder_length),
+            "capacity_target_length": target_length,
+            "capacity_total_length": total_length,
+            "capacity_target_name": str(target_name),
+            "capacity_gpu_device": str(gpu_device),
+            "current_phase": "Waiting for design-capacity ladder scheduler",
+        }
+    )
+    write_json(job.run_dir / "metadata.json", metadata)
+    return job.run_dir
+
+
+def create_design_capacity_benchmark(
+    *,
+    benchmark_name: str,
+    target_pdb: Path,
+    target_chains: list[str],
+    target_name: str,
+    hotspots: str,
+    binder_lengths: list[int],
+    generators: list[str],
+    gpu_device: str = "0",
+    engine_configs: dict[str, dict[str, Any]] | None = None,
+    batch_id: str | None = None,
+) -> Path:
+    batch_id = str(batch_id or f"design-capacity-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}")
+    cleaned_lengths = sorted({int(length) for length in binder_lengths if int(length) > 0})
+    cleaned_generators = [str(generator) for generator in generators if str(generator)]
+    job = create_job(
+        CAPACITY_GROUP,
+        DESIGN_CAPACITY_JOB_TYPE,
+        DESIGN_CAPACITY_TOOL,
+        {"target_pdb": str(target_pdb), "target_chains": list(target_chains)},
+        {
+            "benchmark_name": str(benchmark_name or "Design capacity benchmark"),
+            "batch_id": batch_id,
+            "target_name": str(target_name or Path(target_pdb).stem),
+            "target_chains": list(target_chains),
+            "hotspots": str(hotspots or ""),
+            "binder_lengths": cleaned_lengths,
+            "generators": cleaned_generators,
+            "child_device": str(gpu_device),
+            "engine_configs": dict(engine_configs or {}),
+            "stop_generator_after_first_failure": True,
+        },
+    )
+    update_status(job.run_dir, "queued", campaign_name=str(benchmark_name or "Design capacity benchmark"))
+    for binder_length in cleaned_lengths:
+        for generator in cleaned_generators:
+            _create_design_capacity_child_job(
+                job.run_dir,
+                batch_id=batch_id,
+                benchmark_name=str(benchmark_name or "Design capacity benchmark"),
+                target_pdb=Path(target_pdb),
+                target_chains=list(target_chains),
+                target_name=str(target_name or Path(target_pdb).stem),
+                hotspots=str(hotspots or ""),
+                generator=generator,
+                binder_length=int(binder_length),
+                gpu_device=str(gpu_device),
+                engine_config=(engine_configs or {}).get(generator),
+            )
+    write_json(
+        job.run_dir / "worker_request.json",
+        {
+            "kind": "design_capacity_scheduler",
+            "kwargs": {"poll_seconds": 2},
+            "path_kwargs": [],
+        },
+    )
+    write_json(
+        job.run_dir / "command.json",
+        {
+            "mode": "local_worker",
+            "command": [
+                "python",
+                "-m",
+                "mn_protein_design.core.local_worker",
+                "--run-dir",
+                str(job.run_dir),
+            ],
+        },
+    )
+    spawn_worker_for_run(job.run_dir)
+    return job.run_dir
+
+
+def run_design_capacity_scheduler(run_dir: Path, poll_seconds: int = 10) -> None:
+    run_dir = Path(run_dir)
+    payload = read_json(run_dir / "input.json")
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    if params.get("gpu_device") and not params.get("child_device"):
+        params["child_device"] = params.pop("gpu_device")
+        payload["params"] = params
+        write_json(run_dir / "input.json", payload)
+    parent_metadata = read_json(run_dir / "metadata.json")
+    if parent_metadata.get("queue_lock_acquired"):
+        _release_resource_lock(run_dir)
+    parent_metadata = read_json(run_dir / "metadata.json")
+    changed_parent_metadata = False
+    for key in ("queue_resource", "queue_started_at", "queue_wait_started_at"):
+        if key in parent_metadata:
+            parent_metadata.pop(key, None)
+            changed_parent_metadata = True
+    if changed_parent_metadata:
+        write_json(run_dir / "metadata.json", parent_metadata)
+    batch_id = str(params.get("batch_id") or "")
+    if not batch_id:
+        finish_job(run_dir, False, {"metrics": {"error": "missing design capacity batch_id"}})
+        return
+    while True:
+        parent_metadata = read_json(run_dir / "metadata.json")
+        if str(parent_metadata.get("status") or "") in {"cancelled", "stopped", "paused"}:
+            return
+        rows = _design_capacity_child_rows(batch_id)
+        if not rows:
+            finish_job(run_dir, False, {"metrics": {"error": "no design capacity child cells found"}})
+            return
+        by_generator: dict[str, list[tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]]] = {}
+        for child_run_dir, metadata, input_payload, result in rows:
+            child_params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+            generator = str(child_params.get("capacity_generator") or metadata.get("capacity_generator") or "")
+            by_generator.setdefault(generator, []).append((child_run_dir, metadata, input_payload, result))
+        for generator_rows in by_generator.values():
+            generator_rows.sort(
+                key=lambda item: int(
+                    float(
+                        str(
+                            (item[2].get("params") if isinstance(item[2].get("params"), dict) else {}).get("capacity_binder_length")
+                            or item[1].get("capacity_binder_length")
+                            or 0
+                        )
+                    )
+                )
+            )
+        completed = sum(1 for _path, metadata, _input, _result in rows if str(metadata.get("status") or "") == "completed")
+        failed = sum(1 for _path, metadata, _input, _result in rows if str(metadata.get("status") or "") == "failed")
+        skipped = sum(1 for _path, metadata, _input, _result in rows if str(metadata.get("status") or "") == "skipped")
+        active = sum(
+            1
+            for _path, metadata, _input, _result in rows
+            if str(metadata.get("status") or "") in {"running", "preparing"}
+            or (str(metadata.get("status") or "") == "queued" and metadata.get("worker_pid"))
+        )
+        update_status(
+            run_dir,
+            "running",
+            current_phase=f"Design capacity cells: {completed} completed, {failed} failed, {skipped} skipped",
+        )
+        if active:
+            time.sleep(max(1, int(poll_seconds or 10)))
+            continue
+
+        launched_any = False
+        for generator, generator_rows in by_generator.items():
+            statuses = [str(metadata.get("status") or "") for _path, metadata, _input, _result in generator_rows]
+            if "failed" in statuses:
+                failed_lengths = [
+                    int(metadata.get("capacity_binder_length") or 0)
+                    for _path, metadata, _input, _result in generator_rows
+                    if str(metadata.get("status") or "") == "failed"
+                ]
+                first_failed = min([value for value in failed_lengths if value > 0] or [0])
+                for child_run_dir, metadata, _input, _result in generator_rows:
+                    if str(metadata.get("status") or "") == "queued" and not metadata.get("worker_pid"):
+                        _mark_design_capacity_child_skipped(
+                            child_run_dir,
+                            f"Skipped after {DESIGN_GENERATOR_LABELS.get(generator, generator)} failed at binder length {first_failed}",
+                        )
+                continue
+            pending = [
+                (child_run_dir, metadata)
+                for child_run_dir, metadata, _input, _result in generator_rows
+                if str(metadata.get("status") or "") == "queued" and not metadata.get("worker_pid")
+            ]
+            if pending:
+                child_run_dir, metadata = pending[0]
+                update_status(child_run_dir, "queued", current_phase="Queued by design-capacity ladder scheduler")
+                spawn_worker_for_run(child_run_dir)
+                launched_any = True
+                break
+
+        if launched_any:
+            time.sleep(max(1, int(poll_seconds or 10)))
+            continue
+
+        rows = _design_capacity_child_rows(batch_id)
+        terminal = sum(
+            1
+            for _path, metadata, _input, _result in rows
+            if str(metadata.get("status") or "") in CAPACITY_TERMINAL_STATUSES
+        )
+        if terminal >= len(rows):
+            completed = sum(1 for _path, metadata, _input, _result in rows if str(metadata.get("status") or "") == "completed")
+            failed = sum(1 for _path, metadata, _input, _result in rows if str(metadata.get("status") or "") == "failed")
+            skipped = sum(1 for _path, metadata, _input, _result in rows if str(metadata.get("status") or "") == "skipped")
+            finish_job(
+                run_dir,
+                True,
+                {
+                    "metrics": {
+                        "batch_id": batch_id,
+                        "cell_count": len(rows),
+                        "completed_cells": completed,
+                        "failed_cells": failed,
+                        "skipped_cells": skipped,
+                    }
+                },
+            )
+            return
+        time.sleep(max(1, int(poll_seconds or 10)))
 
 
 def _mark_capacity_child_inherited_failure(

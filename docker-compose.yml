@@ -17,6 +17,14 @@ services:
       args:
         INSTALL_ESMFOLD: "false"
 
+  pesto:
+    image: mnprot-pesto-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/pesto/Dockerfile
+      platforms: ["linux/x86_64"]
+    gpus: all
+
   masif-seed:
     image: masif_seed:latest
     build:
@@ -40,6 +48,16 @@ services:
       context: .
       dockerfile: containers/pxdesign/Dockerfile
       platforms: ["linux/x86_64"]
+
+  protenix:
+    image: mnprot-protenix-cu128:latest
+    build:
+      context: .
+      dockerfile: containers/protenix/Dockerfile
+      platforms: ["linux/x86_64"]
+    gpus: all
+    volumes:
+      - /mnt/db/reference_files/protenix:/ref/protenix:rw
 
   protpardelle-1c:
     image: mnprot-protpardelle-1c-cu128:latest
@@ -65,6 +83,18 @@ services:
       context: .
       dockerfile: containers/colabfold/Dockerfile
       platforms: ["linux/x86_64"]
+
+  openfold3:
+    image: mnprot-openfold3-cu13:latest
+    build:
+      context: .
+      dockerfile: containers/openfold3/Dockerfile
+      platforms: ["linux/x86_64"]
+      args:
+        PIXI_ENV: openfold3-cuda13
+    gpus: all
+    volumes:
+      - /mnt/db/reference_files/openfold3:/ref/openfold3:rw
 
   ligandmpnn:
     image: ovo-ligandmpnn:latest

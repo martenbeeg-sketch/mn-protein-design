@@ -1,0 +1,21 @@
+tool: pesto
+group: detection
+image: mnprot-pesto-cu128:latest
+gpu: true
+description: PeSTo residue-level protein interaction interface prediction.
+inputs:
+  target_pdb:
+    type: pdb
+    required: true
+params:
+  interface:
+    type: enum
+    default: protein
+    choices: [protein]
+outputs:
+  residue_scores:
+    path: artifacts/pesto/output/pesto_residue_scores.csv
+    type: residue_score_table
+  scored_pdb:
+    path: artifacts/pesto/output/pesto_scored.pdb
+    type: pdb

@@ -14,6 +14,7 @@ from mn_protein_design.app.components.molstar_viewer import (
 )
 from mn_protein_design.app.pages.common import gpu_run_panel, result_link
 from mn_protein_design.core.candidates import candidate_stage_counts, read_candidates
+from mn_protein_design.core.detection_annotations import detection_score_sources, sidechain_sasa_by_residue
 from mn_protein_design.core.jobs import read_json
 from mn_protein_design.core.structures import filter_pdb_text
 from mn_protein_design.workflows import design as design_workflow
@@ -24,7 +25,9 @@ esm_binder_workflow = importlib.reload(esm_binder_workflow)
 build_rfdiffusion_run_parameters = design_workflow.build_rfdiffusion_run_parameters
 default_target_contig = design_workflow.default_target_contig
 design_jobs_for_target = design_workflow.design_jobs_for_target
+prepare_rfdiffusion_scaffold_library = design_workflow.prepare_rfdiffusion_scaffold_library
 prepared_design_targets = design_workflow.prepared_design_targets
+rfdiffusion_scaffold_library_status = design_workflow.rfdiffusion_scaffold_library_status
 run_boltzgen = design_workflow.run_boltzgen
 run_bindcraft = design_workflow.run_bindcraft
 run_genie3 = design_workflow.run_genie3
@@ -39,6 +42,14 @@ target_label = design_workflow.target_label
 normalize_rfdiffusion3_contig = design_workflow._normalize_rfdiffusion3_contig
 
 ResidueId = tuple[str, int]
+
+
+DETECTION_TOOL_STYLES = {
+    "pesto": {"label": "PeSTo", "color": "0xd946ef"},
+    "masif_seed": {"label": "MaSIF", "color": "0xf97316"},
+    "scannet": {"label": "ScanNet", "color": "0x22c55e"},
+    "surf2spot": {"label": "Surf2Spot", "color": "0x2563eb"},
+}
 
 
 RFDIFFUSION_GUIDANCE_PRESETS = {
@@ -181,6 +192,47 @@ def _chain_visualizations(residues: set[ResidueId]) -> list[ChainVisualization] 
         )
         for chain, values in sorted(by_chain.items())
     ]
+
+
+def _detection_tool_visualizations(scores: pd.DataFrame) -> list[ChainVisualization] | None:
+    if scores.empty or "include" not in scores or "tool" not in scores:
+        return None
+    included = scores[scores["include"]].copy()
+    if included.empty:
+        return None
+    chains: list[ChainVisualization] = []
+    for tool, tool_rows in included.groupby("tool", sort=True):
+        style = DETECTION_TOOL_STYLES.get(str(tool), {"label": str(tool), "color": "0x64748b"})
+        for chain, chain_rows in tool_rows.groupby("chain", sort=True):
+            residues = sorted({int(residue) for residue in chain_rows["residue"].dropna()})
+            if not residues:
+                continue
+            chains.append(
+                ChainVisualization(
+                    chain_id=str(chain),
+                    residues=residues,
+                    color="uniform",
+                    color_params={"value": style["color"]},
+                    representation_type="cartoon+ball-and-stick",
+                    label=f"{style['label']} predicted residues",
+                )
+            )
+    return chains or None
+
+
+def _detection_tool_legend(tools: set[str]) -> None:
+    if not tools:
+        return
+    chips = []
+    for tool in sorted(tools):
+        style = DETECTION_TOOL_STYLES.get(tool, {"label": tool, "color": "0x64748b"})
+        color = "#" + style["color"].replace("0x", "")
+        chips.append(
+            f"<span style='display:inline-flex;align-items:center;margin-right:1rem;'>"
+            f"<span style='width:0.8rem;height:0.8rem;border-radius:999px;background:{color};"
+            f"display:inline-block;margin-right:0.35rem;'></span>{style['label']}</span>"
+        )
+    st.markdown(" ".join(chips), unsafe_allow_html=True)
 
 
 def _target_chain_ids(target: dict) -> list[str]:
@@ -362,7 +414,7 @@ st.title("Design")
 
 targets = prepared_design_targets()
 if not targets:
-    st.info("Prepare or crop a target before starting a design campaign.")
+    st.info("Add, prepare, crop, or select an installed benchmark target before starting a design campaign.")
     st.stop()
 
 labels = [target_label(row) for row in targets]
@@ -422,6 +474,59 @@ elif settings_source and st.session_state.get(f"{hotspot_state_key}_source") != 
 st.subheader("Target And Hotspots")
 st.caption("Click residues in the structure or sequence viewer, then add them as design hotspots.")
 active_hotspots: set[ResidueId] = set(st.session_state[hotspot_state_key])
+sources = detection_score_sources(target_pdb, target_chains)
+detected_residues: set[ResidueId] = set()
+show_existing_hotspots = False
+detection_view_token = "none"
+if sources:
+    with st.expander("Detection-guided hotspots", expanded=True):
+        source_names = st.multiselect("Detection results", list(sources), default=list(sources), key=f"design_detection_sources_{target_pdb}")
+        threshold_cols = st.columns(2)
+        prediction_threshold = threshold_cols[0].number_input("Prediction threshold", 0.0, 1.0, 0.50, 0.01, key=f"design_detection_threshold_{target_pdb}")
+        masif_threshold = threshold_cols[1].number_input("MaSIF score threshold", 0.0, 1.0, 0.50, 0.01, key=f"design_masif_threshold_{target_pdb}")
+        sasa_threshold = st.number_input("Minimum side-chain SASA (A2)", 0.0, 500.0, 5.0, 1.0, key=f"design_detection_sasa_{target_pdb}")
+        show_existing_hotspots = st.checkbox("Also show existing hotspots", value=False, key=f"design_detection_existing_{target_pdb}")
+        scores = pd.concat([sources[name].assign(source=name) for name in source_names], ignore_index=True) if source_names else pd.DataFrame(columns=["chain", "residue", "amino_acid", "score", "source"])
+        scores["tool"] = scores["source"].str.split(" | ").str[0]
+        scores["score_threshold"] = scores["tool"].map(lambda tool: masif_threshold if tool == "masif_seed" else prediction_threshold)
+        sasa = sidechain_sasa_by_residue(target_pdb)
+        scores["sidechain_sasa_a2"] = [sasa.get((row.chain, int(row.residue)), 0.0) for row in scores.itertuples()]
+        scores["solvent_facing"] = scores["sidechain_sasa_a2"] >= sasa_threshold
+        selected_scores = scores[(scores["score"] >= scores["score_threshold"]) & scores["solvent_facing"]].copy()
+        agreement = selected_scores.groupby(["chain", "residue"], as_index=False).agg(
+            detected_by_tools=("tool", lambda values: ", ".join(sorted(set(values)))),
+            tool_count=("tool", "nunique"),
+        )
+        selected_scores = selected_scores.merge(agreement, on=["chain", "residue"], how="left")
+        selected_scores["include"] = True
+        edited_scores = st.data_editor(selected_scores, hide_index=True, width="stretch", key=f"design_detection_rows_{target_pdb}")
+        include_mask = edited_scores["include"].fillna(False) if "include" in edited_scores else pd.Series(False, index=edited_scores.index)
+        checked_scores = edited_scores[include_mask].copy()
+        detected_residues = {(str(row.chain), int(row.residue)) for row in checked_scores.itertuples()}
+        detection_view_token = f"{','.join(source_names)}:{prediction_threshold:.2f}:{masif_threshold:.2f}:{sasa_threshold:.1f}"
+        if st.button("Add selected predicted residues as hotspots", key=f"design_detection_add_{target_pdb}"):
+            st.session_state[hotspot_state_key] = active_hotspots | detected_residues
+            st.rerun()
+        _detection_tool_legend(set(checked_scores["tool"].dropna().astype(str)) if "tool" in checked_scores else set())
+        st.caption(f"{len(detected_residues)} checked residues will be highlighted and added as hotspots.")
+        detection_chains = _detection_tool_visualizations(checked_scores) or []
+        if show_existing_hotspots:
+            detection_chains.extend(_chain_visualizations(active_hotspots) or [])
+        molstar_custom_component(
+            [
+                StructureVisualization(
+                    pdb=target_view_text,
+                    color="uniform",
+                    color_params={"value": "0xe8b3ad"},
+                    representation_type="cartoon",
+                    chains=detection_chains or None,
+                )
+            ],
+            key=f"design_detection_viewer_{target['run_id']}_{detection_view_token}",
+            height=420,
+            show_controls=True,
+            selection_mode=False,
+        )
 viewer_value = molstar_custom_component(
     [
         StructureVisualization(
@@ -433,7 +538,7 @@ viewer_value = molstar_custom_component(
             chains=_chain_visualizations(active_hotspots),
         )
     ],
-    key=f"design_target_viewer_{target['run_id']}",
+    key=f"design_target_viewer_{target['run_id']}_{detection_view_token}",
     height=620,
     show_controls=True,
     selection_mode=True,
@@ -681,6 +786,72 @@ with rfdiffusion_tab:
                 placeholder="0",
                 key=f"rfdiffusion_noise_scale_frame_{source_key}",
             )
+        scaffold_status = rfdiffusion_scaffold_library_status()
+        scaffold_ready = bool(scaffold_status.get("ready"))
+        st.caption(
+            "Scaffold-guided RFdiffusion can bias the binder backbone toward folds from a scaffold library "
+            f"({scaffold_status.get('ss_count', 0)} SS files, {scaffold_status.get('adj_count', 0)} adjacency files)."
+        )
+        install_cols = st.columns([1, 3])
+        with install_cols[0]:
+            if st.button(
+                "Install scaffold subset",
+                disabled=scaffold_ready or not bool(scaffold_status.get("bundled_tar_exists")),
+                key=f"rfdiffusion_install_scaffolds_{source_key}",
+                help=f"Unpacks the bundled RFdiffusion ppi_scaffolds_subset.tar.gz into {scaffold_status.get('path')}.",
+            ):
+                try:
+                    scaffold_status = prepare_rfdiffusion_scaffold_library()
+                    scaffold_ready = bool(scaffold_status.get("ready"))
+                    st.success(f"Installed RFdiffusion scaffold subset in {scaffold_status.get('path')}.")
+                except Exception as exc:
+                    st.error(f"Could not install RFdiffusion scaffold subset: {exc}")
+        with install_cols[1]:
+            if scaffold_ready:
+                st.caption(f"Scaffold library ready: `{scaffold_status.get('path')}`")
+            elif scaffold_status.get("bundled_tar_exists"):
+                st.caption(f"Scaffold library not installed yet. Bundled archive: `{scaffold_status.get('bundled_tar')}`")
+            else:
+                st.caption(f"Bundled scaffold archive missing: `{scaffold_status.get('bundled_tar')}`")
+        scaffoldguided = st.checkbox(
+            "Use RFdiffusion scaffold-guided binder folds",
+            value=bool(loaded_params.get("scaffoldguided", False)),
+            disabled=not scaffold_ready,
+            help=(
+                "Adds scaffold-guided RFdiffusion settings. At launch, the app chooses one random scaffold "
+                "from the installed library unless rfdiffusion_run_parameters.txt already contains scaffoldguided.scaffold_list."
+            ),
+            key=f"rfdiffusion_scaffoldguided_{source_key}",
+        )
+        if scaffoldguided:
+            st.caption(
+                "A single scaffold will be chosen randomly at launch and recorded in "
+                "`rfdiffusion_scaffold_selection.json`."
+            )
+        scaffold_options = st.columns(3)
+        with scaffold_options[0]:
+            scaffold_target_pdb = st.checkbox(
+                "Use target PDB in scaffold mode",
+                value=bool(loaded_params.get("scaffold_target_pdb", True)),
+                disabled=not scaffoldguided,
+                key=f"rfdiffusion_scaffold_target_pdb_{source_key}",
+            )
+        with scaffold_options[1]:
+            scaffold_target_ss = st.text_input(
+                "Target SS .pt",
+                value=str(loaded_params.get("scaffold_target_ss") or ""),
+                placeholder="optional, e.g. /models/target_folds/target_ss.pt",
+                disabled=not scaffoldguided,
+                key=f"rfdiffusion_scaffold_target_ss_{source_key}",
+            )
+        with scaffold_options[2]:
+            scaffold_target_adj = st.text_input(
+                "Target adjacency .pt",
+                value=str(loaded_params.get("scaffold_target_adj") or ""),
+                placeholder="optional, e.g. /models/target_folds/target_adj.pt",
+                disabled=not scaffoldguided,
+                key=f"rfdiffusion_scaffold_target_adj_{source_key}",
+            )
         backbone_filters = st.text_input(
             "Backbone hard filters",
             value=str(loaded_params.get("backbone_filters") or ""),
@@ -724,7 +895,7 @@ with rfdiffusion_tab:
     st.markdown("#### 2. Sequence Design")
     with st.expander("MPNN settings", expanded=True):
         sequence_design_options = {
-            "ligandmpnn": "LigandMPNN (ProteinMPNN weights)",
+            "ligandmpnn": "ProteinMPNN model (LigandMPNN implementation)",
             "fastrelax": "ProteinMPNN-FastRelax",
         }
         if full_pipeline:
@@ -733,9 +904,9 @@ with rfdiffusion_tab:
                 "MPNN model",
                 ["protein_mpnn", "soluble_mpnn", "ligand_mpnn"],
                 format_func={
-                    "protein_mpnn": "ProteinMPNN",
-                    "soluble_mpnn": "SolubleMPNN",
-                    "ligand_mpnn": "LigandMPNN",
+                    "protein_mpnn": "ProteinMPNN model (LigandMPNN implementation)",
+                    "soluble_mpnn": "Soluble ProteinMPNN model (LigandMPNN implementation)",
+                    "ligand_mpnn": "LigandMPNN model (LigandMPNN implementation)",
                 }.get,
                 key=f"rfdiffusion_full_mpnn_model_{source_key}",
             )
@@ -985,6 +1156,10 @@ with rfdiffusion_tab:
             deterministic=bool(deterministic),
             noise_scale_ca=noise_scale_ca,
             noise_scale_frame=noise_scale_frame,
+            scaffoldguided=bool(scaffoldguided),
+            scaffold_target_pdb=bool(scaffold_target_pdb),
+            scaffold_target_ss=scaffold_target_ss,
+            scaffold_target_adj=scaffold_target_adj,
             extra_run_parameters=extra_run_parameters,
         )
     except ValueError as exc:
@@ -994,8 +1169,18 @@ with rfdiffusion_tab:
     with st.expander("Editable files and final settings sent to RFdiffusion", expanded=True):
         st.caption("These editable copies are written into the run folder under artifacts before Docker starts.")
         editable_run_parameters_key = f"rfdiffusion_editable_run_parameters_{source_key}"
+        scaffold_signature_key = f"rfdiffusion_scaffold_signature_{source_key}"
+        scaffold_signature = (
+            bool(scaffoldguided),
+            bool(scaffold_target_pdb),
+            scaffold_target_ss.strip(),
+            scaffold_target_adj.strip(),
+        )
         if st.session_state.pop(f"rfdiffusion_guidance_preset_{source_key}_changed", False):
             st.session_state[editable_run_parameters_key] = generated_run_parameters
+        if st.session_state.get(scaffold_signature_key) != scaffold_signature:
+            st.session_state[editable_run_parameters_key] = generated_run_parameters
+            st.session_state[scaffold_signature_key] = scaffold_signature
         edited_run_parameters = st.text_area(
             "rfdiffusion_run_parameters.txt",
             value=str(loaded_params.get("rfdiffusion_run_parameters") or generated_run_parameters),
@@ -1019,6 +1204,11 @@ with rfdiffusion_tab:
             "hotspot": hotspots,
             "rfdiffusion_guidance_preset": selected_guidance_preset,
             "rfdiffusion_run_parameters": edited_run_parameters,
+            "scaffoldguided": bool(scaffoldguided),
+            "scaffold_dir": design_workflow.RFDIFFUSION_SCAFFOLD_LIBRARY_CONTAINER_DIR,
+            "scaffold_target_pdb": bool(scaffold_target_pdb),
+            "scaffold_target_ss": scaffold_target_ss.strip(),
+            "scaffold_target_adj": scaffold_target_adj.strip(),
             "backbone_filters": backbone_filters or "none",
             "backbone_hotspot_prefilter": {
                 "enabled": bool(apply_backbone_hotspot_prefilter),
@@ -1075,6 +1265,8 @@ with rfdiffusion_tab:
                 "inference.write_trajectory": bool(save_trajectory),
                 "rfdiffusion_guidance_preset": selected_guidance_preset,
                 "rfdiffusion_run_parameters": edited_run_parameters,
+                "scaffoldguided": bool(scaffoldguided),
+                "scaffold_dir": design_workflow.RFDIFFUSION_SCAFFOLD_LIBRARY_CONTAINER_DIR,
                 "backbone_hotspot_prefilter": bool(apply_backbone_hotspot_prefilter),
             },
             "full_pipeline": {
@@ -1144,6 +1336,11 @@ with rfdiffusion_tab:
                     deterministic=bool(deterministic),
                     noise_scale_ca=noise_scale_ca,
                     noise_scale_frame=noise_scale_frame,
+                    scaffoldguided=bool(scaffoldguided),
+                    scaffold_dir=design_workflow.RFDIFFUSION_SCAFFOLD_LIBRARY_CONTAINER_DIR,
+                    scaffold_target_pdb=bool(scaffold_target_pdb),
+                    scaffold_target_ss=scaffold_target_ss,
+                    scaffold_target_adj=scaffold_target_adj,
                     save_trajectory=bool(save_trajectory),
                     editable_run_parameters=edited_run_parameters,
                     edited_target_pdb_text=edited_target_text,

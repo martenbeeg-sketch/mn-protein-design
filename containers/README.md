@@ -1,9 +1,9 @@
 # Docker Tool Integration Notes
 
 This directory contains Docker wrappers for tools that should become tasks in
-the `mn-protein-design` Streamlit app. The overall app plan lives in
-[../APP_BUILD_PLAN.md](../APP_BUILD_PLAN.md). The app should treat each
-container as a tool backend with a small, explicit contract:
+the `mn-protein-design` Streamlit app. The current workflows are documented in
+[../APP_FEATURES.md](../APP_FEATURES.md). The app should treat each container
+as a tool backend with a small, explicit contract:
 
 - one input job directory
 - one output job directory
@@ -81,7 +81,8 @@ Then run normal jobs with references mounted read-only.
 | Surf2Spot | `mnprot-surf2spot-cu128:latest` | Yes, CUDA 12.8 | Hotspot detection | Real HS pipeline smoke test passed |
 | PXDesign | `mnprot-pxdesign-cu128:latest` | Yes, CUDA 12.8 | Binder design / target preparation | Real target-parse and tiny inference smoke tests passed |
 | Protpardelle-1c | `mnprot-protpardelle-1c-cu128:latest` | Yes, CUDA 12.8 | Binder backbone design / motif scaffolding | PDL1 binder backbone smoke test |
-| Biohub ESM | `mnprot-biohub-esm-cu128:latest` | Yes, CUDA 12.8 | ESMFold2 complex folding / experimental binder screening | Docker image added; import smoke test passed |
+| Biohub ESM | `mnprot-biohub-esm-cu128:latest` | Yes, CUDA 12.8 | ESMFold2 complex folding / native binder design / screening | Native one-step binder-design smoke passed |
+| OpenFold-3 | `mnprot-openfold3-cu13:latest` | Yes, CUDA 13 | Complex refolding / validation | Docker image scaffolded for RTX 5090 |
 
 Build all images:
 
@@ -99,6 +100,60 @@ docker compose build pxdesign
 docker compose build protpardelle-1c
 docker compose build biohub-esm
 docker compose build colabfold
+docker compose build openfold3
+```
+
+## OpenFold-3
+
+Purpose in app:
+
+- AlphaFold3-style open-source complex refolding
+- binder sequence plus selected target chains
+- optional reuse of prepared target-chain MSAs from the shared repository
+
+Image:
+
+```text
+mnprot-openfold3-cu13:latest
+```
+
+Runtime:
+
+- GPU required for useful runs
+- Pixi `openfold3-cuda13` environment
+- suitable for RTX 5090 / Blackwell hosts with a recent NVIDIA driver
+- `TORCH_CUDA_ARCH_LIST` includes `12.0+PTX`
+- app jobs write a runner YAML that disables DeepSpeed Evo attention for broader GPU compatibility
+
+Reference files:
+
+```text
+/mnt/db/reference_files/openfold3/of3-p2-155k.pt
+```
+
+One-time parameter setup:
+
+```bash
+docker compose build openfold3
+docker run --rm \
+  -v /mnt/db/reference_files/openfold3:/ref/openfold3:rw \
+  mnprot-openfold3-cu13:latest \
+  python -c "from pathlib import Path; from openfold3.entry_points.parameters import download_model_parameters; download_model_parameters(Path('/ref/openfold3'), 'openfold3-p2-155k', skip_confirmation=True)"
+```
+
+Normal app runtime should mount the reference folder read-only:
+
+```bash
+docker run --rm --gpus all \
+  -v /mnt/db/reference_files/openfold3:/ref/openfold3:ro \
+  -v /tmp/mn-protein-design-jobs/<job_id>:/work \
+  mnprot-openfold3-cu13:latest \
+  run_openfold predict \
+    --runner-yaml /work/artifacts/raw/openfold3/runner.yaml \
+    --query-json /work/input/query.json \
+    --inference-ckpt-path /ref/openfold3/of3-p2-155k.pt \
+    --use-msa-server false \
+    --output-dir /work/output/openfold3
 ```
 
 ## ScanNet
@@ -258,6 +313,7 @@ docker run --rm \
 Purpose in app:
 
 - local ESMFold2 target+binder complex folding
+- Biohub ESMFold2 gradient-guided binder sequence design
 - experimental ESMFold2 binder screening
 - ESMC / ESM3 utility scripts when the required references are mounted
 
@@ -285,6 +341,17 @@ Reference files:
 /mnt/db/reference_files/biohub-esm/ESM3/
 /mnt/db/reference_files/biohub-esm/ESMC-6B/
 /mnt/db/reference_files/biohub-esm/ESMC-6B-sae-k64-codebook16384/
+/mnt/db/reference_files/biohub-esm/binder-design/ESMFold2-Experimental-Fast/
+```
+
+Binder-design checkpoint setup:
+
+```bash
+docker run --rm \
+  -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm \
+  mnprot-biohub-esm-cu128:latest \
+  hf download biohub/ESMFold2-Experimental-Fast \
+  --local-dir /ref/biohub-esm/binder-design/ESMFold2-Experimental-Fast
 ```
 
 Build:

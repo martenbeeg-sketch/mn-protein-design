@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import gzip
 import hashlib
 import json
 import shlex
@@ -16,6 +17,7 @@ from mn_protein_design.app.pages.common import (
     esmfold2_preset_label,
     esmfold2_preset_selector,
     gpu_run_panel,
+    refresh_results_button,
     result_link,
     run_steps_after_source,
     selected_dataframe_rows,
@@ -57,7 +59,10 @@ STRUCTURE_ENGINE_TABLES = [
     ("BoltzGen Fold", "boltzgen_fold", "boltzgen_fold_metrics.csv"),
     ("ColabFold", "colabfold", "colabfold_metrics.csv"),
     ("ESMFold2", "esmfold2", "esmfold2_metrics.csv"),
+    ("OpenFold-3", "openfold3", "openfold3_metrics.csv"),
     ("Protenix", "protenix", "protenix_metrics.csv"),
+    ("Protenix v1", "protenix_v1", "protenix_v1_metrics.csv"),
+    ("Protenix v2", "protenix_v2", "protenix_v2_metrics.csv"),
     ("RF3", "rf3", "rf3_metrics.csv"),
 ]
 STRUCTURE_ENGINE_BY_LABEL = {label: (engine_key, csv_name) for label, engine_key, csv_name in STRUCTURE_ENGINE_TABLES}
@@ -78,7 +83,10 @@ STRUCTURE_ENGINE_METRIC_PDB_KEYS = {
     "boltzgen_fold": "boltzgen_fold",
     "colabfold": "colab",
     "esmfold2": "esmfold2",
+    "openfold3": "openfold3",
     "protenix": "protenix",
+    "protenix_v1": "protenix_v1",
+    "protenix_v2": "protenix_v2",
     "rf3": "rf3",
 }
 
@@ -133,6 +141,7 @@ def _estimate_rows_dataframe(estimate: dict) -> pd.DataFrame:
                 "engine": row.get("label"),
                 "estimated_time": row.get("estimated_time"),
                 "seconds_per_candidate": row.get("seconds_per_candidate"),
+                "seconds_per_residue": row.get("seconds_per_residue"),
                 "basis": row.get("basis"),
                 "history_runs": row.get("history_runs"),
             }
@@ -324,6 +333,14 @@ def _refolding_target_summary(run_dir: Path, input_json: dict) -> dict[str, obje
 
 def _refolding_result_rows() -> list[dict[str, object]]:
     rows = []
+
+    def _first_positive_int(*values: object) -> int | None:
+        for value in values:
+            number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+            if pd.notna(number) and int(number) > 0:
+                return int(number)
+        return None
+
     for job in collect_jobs("benchmark"):
         run_dir = Path(job["run_dir"])
         input_json = read_json(run_dir / "input.json")
@@ -331,18 +348,34 @@ def _refolding_result_rows() -> list[dict[str, object]]:
             continue
         inputs = input_json.get("inputs") if isinstance(input_json.get("inputs"), dict) else {}
         params = input_json.get("params") if isinstance(input_json.get("params"), dict) else {}
+        result = read_json(run_dir / "result.json")
+        result_metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
         worker_payload = read_json(run_dir / "worker_request.json")
         worker_kwargs = worker_payload.get("kwargs") if isinstance(worker_payload.get("kwargs"), dict) else {}
         esm_loops = params.get("num_loops", worker_kwargs.get("num_loops"))
         esm_steps = params.get("num_sampling_steps", worker_kwargs.get("num_sampling_steps"))
-        result = read_json(run_dir / "result.json")
         target_summary = _refolding_target_summary(run_dir, input_json)
         selected_candidate_ids = inputs.get("selected_candidate_ids") if isinstance(inputs.get("selected_candidate_ids"), list) else []
-        source_job = _short_path(inputs.get("source_run_dir"))
+        candidate_count = _first_positive_int(
+            len(selected_candidate_ids) if selected_candidate_ids else None,
+            params.get("selected_candidate_count"),
+            params.get("candidate_count"),
+            params.get("staged_count"),
+            result_metrics.get("record_count"),
+            result_metrics.get("staged_metadata_rows"),
+            result_metrics.get("chain_msa_record_count"),
+        )
+        source_run_dir_text = str(inputs.get("source_run_dir") or "").strip()
+        source_run_dir = Path(source_run_dir_text) if source_run_dir_text else None
+        source_run_id = source_run_dir.name if source_run_dir is not None else ""
+        source_metadata = read_json(source_run_dir / "metadata.json") if source_run_dir is not None else {}
+        source_job_code = str(source_metadata.get("job_code") or "").strip()
+        source_task_group = str(source_metadata.get("task_group") or (source_run_dir.parent.name if source_run_dir is not None else "")).strip()
+        source_job = _short_path(source_run_dir_text)
         candidate_signature = hashlib.sha1(
             "\n".join(sorted(str(candidate_id).lower() for candidate_id in selected_candidate_ids)).encode("utf-8")
         ).hexdigest()[:8] if selected_candidate_ids else "unknown"
-        design_set = f"{source_job or 'unknown source'} | {len(selected_candidate_ids) or 'unknown'} designs | {candidate_signature}"
+        design_set = f"{source_job or 'unknown source'} | {candidate_count or 'unknown'} designs | {candidate_signature}"
         rows.append(
             {
                 "result": result_link("benchmark", str(job.get("run_id"))),
@@ -351,12 +384,15 @@ def _refolding_result_rows() -> list[dict[str, object]]:
                 "design_set": design_set,
                 "design_set_hash": candidate_signature,
                 "source_job": source_job,
-                "candidates": len(selected_candidate_ids) or None,
+                "source_job_code": source_job_code,
+                "source_run_id": source_run_id,
+                "source_task_group": source_task_group,
+                "candidates": candidate_count,
                 **target_summary,
                 "esmfold2_preset": esmfold2_preset_label(esm_loops, esm_steps),
                 "esmfold2_loops": esm_loops,
                 "esmfold2_steps": esm_steps,
-                "records": (result.get("metrics") or {}).get("record_count"),
+                "records": result_metrics.get("record_count"),
                 "current_phase": job.get("current_phase"),
                 "current_engine": job.get("current_engine"),
                 "created_at": job.get("created_at"),
@@ -551,6 +587,14 @@ def _resolve_run_relative_path(run_dir: Path, value: object) -> Path | None:
     return None
 
 
+def _viewer_structure_path(run_dir: Path, engine_key: str, design_id: str) -> Path | None:
+    metric_key = STRUCTURE_ENGINE_METRIC_PDB_KEYS.get(engine_key)
+    if not metric_key:
+        return None
+    path = run_dir / "artifacts" / "benchmark" / "predicted_viewer_structures" / metric_key / f"{design_id}.pdb"
+    return path if path.exists() else None
+
+
 def _metric_structure_path(run_dir: Path, engine_key: str, design_id: str) -> Path | None:
     metric_key = STRUCTURE_ENGINE_METRIC_PDB_KEYS.get(engine_key)
     if not metric_key:
@@ -581,6 +625,7 @@ def _alphafast_model_from_summary(run_dir: Path, value: object) -> Path | None:
 
 def _colabfold_model_for_design(run_dir: Path, design_id: str) -> Path | None:
     for root in [
+        run_dir / "artifacts" / "benchmark" / "predicted_viewer_structures" / "colab",
         run_dir / "artifacts" / "engines" / "colabfold",
         run_dir / "artifacts" / "raw" / "colabfold",
         run_dir / "artifacts" / "benchmark" / "predicted_metric_pdbs" / "colab",
@@ -598,7 +643,7 @@ def _engine_structure_for_design(run_dir: Path, engine_label: str, design_id: st
     if not engine_key or not csv_name:
         return None, "unsupported engine"
     benchmark_dir = run_dir / "artifacts" / "benchmark"
-    path = _metric_structure_path(run_dir, engine_key, design_id)
+    path = _viewer_structure_path(run_dir, engine_key, design_id) or _metric_structure_path(run_dir, engine_key, design_id)
     table_path = benchmark_dir / csv_name
     if table_path.exists():
         try:
@@ -659,19 +704,37 @@ def _mmcif_text_with_default_occupancy(text: str) -> str:
     return "\n".join(output) + "\n"
 
 
+def _structure_path_is_cif(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith((".cif", ".mmcif", ".cif.gz", ".mmcif.gz"))
+
+
+def _read_structure_text(path: Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            magic = handle.read(2)
+    except OSError:
+        magic = b""
+    if path.name.lower().endswith(".gz") or magic == b"\x1f\x8b":
+        with gzip.open(path, "rt", errors="ignore") as handle:
+            return handle.read()
+    return path.read_text(errors="ignore")
+
+
 def _parse_structure_file(path: Path):
     from Bio.PDB import MMCIFParser, PDBParser
 
-    if path.suffix.lower() in {".cif", ".mmcif"}:
+    text = _read_structure_text(path)
+    if _structure_path_is_cif(path):
         parser = MMCIFParser(QUIET=True)
         try:
-            return parser.get_structure(path.stem, str(path))
+            return parser.get_structure(path.stem, StringIO(text))
         except KeyError as exc:
             if str(exc).strip("'\"") != "_atom_site.occupancy":
                 raise
-            patched_text = _mmcif_text_with_default_occupancy(path.read_text(errors="ignore"))
+            patched_text = _mmcif_text_with_default_occupancy(text)
             return parser.get_structure(path.stem, StringIO(patched_text))
-    return PDBParser(QUIET=True).get_structure(path.stem, str(path))
+    return PDBParser(QUIET=True).get_structure(path.stem, StringIO(text))
 
 
 def _target_ca_atoms(structure: object, target_chains: list[str]) -> list[object]:
@@ -1366,7 +1429,7 @@ with dataset_tab:
         st.caption(
             "Optional. Use this when the imported design complex contains a target conformation or construct "
             "that should not be used for the new refolding run. Binder sequences still come from the candidate table; "
-            "the selected target PDB is staged as target chain B and onward for every engine."
+            "the selected target PDB is staged as target chain A and onward, while binder chains are staged from Z backward."
         )
         target_library = _source_target_library(source, candidates) + _benchmark_target_library()
         if target_library:
@@ -1477,7 +1540,7 @@ with dataset_tab:
             override_chain_options,
             disabled=not override_enabled or not override_chain_options,
             key=override_chains_key,
-            help="These source chains are copied into the engine inputs as B, C, and following chains.",
+            help="These source chains are copied into the engine inputs as A, B, and following target chains; binder chains are assigned from Z backward.",
         )
         if override_enabled:
             if override_target_path is None or not override_target_path.exists():
@@ -1500,7 +1563,10 @@ with engines_tab:
         "refolding_eval_run_esmfold2",
         "refolding_eval_run_boltz2",
         "refolding_eval_run_rf3",
+        "refolding_eval_run_openfold3",
         "refolding_eval_run_protenix",
+        "refolding_eval_run_protenix_v1",
+        "refolding_eval_run_protenix_v2",
         "refolding_eval_run_boltzgen",
     ]
     if "refolding_engine_defaults_all_selected_v1" not in st.session_state:
@@ -1513,7 +1579,29 @@ with engines_tab:
     for engine_key in refolding_engine_keys:
         st.session_state.setdefault(engine_key, True)
 
-    bulk_cols = st.columns([1, 1, 6])
+    template_msa_engine_keys = {
+        "refolding_eval_run_af3",
+        "refolding_eval_run_colab",
+        "refolding_eval_run_esmfold2",
+        "refolding_eval_run_boltz2",
+        "refolding_eval_run_rf3",
+        "refolding_eval_run_protenix_v1",
+        "refolding_eval_run_protenix_v2",
+    }
+    template_only_engine_keys = set(template_msa_engine_keys)
+    template_only_engine_keys.add("refolding_eval_run_af2")
+    msa_engine_keys = {
+        "refolding_eval_run_af3",
+        "refolding_eval_run_colab",
+        "refolding_eval_run_esmfold2",
+        "refolding_eval_run_boltz2",
+        "refolding_eval_run_rf3",
+        "refolding_eval_run_openfold3",
+        "refolding_eval_run_protenix",
+        "refolding_eval_run_protenix_v1",
+        "refolding_eval_run_protenix_v2",
+    }
+    bulk_cols = st.columns([1, 1, 1.5, 1.5, 1.35, 2.65])
     if bulk_cols[0].button("Select all engines", key="refolding_select_all_engines"):
         for engine_key in refolding_engine_keys:
             st.session_state[engine_key] = True
@@ -1522,8 +1610,100 @@ with engines_tab:
         for engine_key in refolding_engine_keys:
             st.session_state[engine_key] = False
         st.rerun()
+    if bulk_cols[2].button("Template + MSA engines", key="refolding_select_template_msa_engines"):
+        for engine_key in refolding_engine_keys:
+            st.session_state[engine_key] = engine_key in template_msa_engine_keys
+        st.session_state["refolding_eval_af3_templates"] = True
+        st.session_state["refolding_eval_af3_msa"] = True
+        st.session_state["refolding_eval_colab_templates"] = True
+        st.session_state["refolding_eval_colab_msa"] = True
+        st.session_state["refolding_eval_af2_legacy_initial_guess"] = True
+        st.session_state["refolding_eval_esm_modes"] = ["initial_guess"]
+        st.session_state["refolding_eval_esm_msa"] = True
+        st.session_state["refolding_eval_af2_binder_template"] = True
+        st.session_state["refolding_eval_af2_interface_template"] = True
+        st.session_state["refolding_eval_boltz_template"] = True
+        st.session_state["refolding_eval_boltz_msa"] = True
+        st.session_state["refolding_eval_rf3_template"] = True
+        st.session_state["refolding_eval_rf3_msa"] = True
+        st.session_state["refolding_eval_protenix_v1_template"] = True
+        st.session_state["refolding_eval_protenix_v1_msa"] = True
+        st.session_state["refolding_eval_protenix_v2_template"] = True
+        st.session_state["refolding_eval_protenix_v2_msa"] = True
+        st.session_state["refolding_eval_openfold3_msa"] = False
+        st.session_state["refolding_eval_protenix_msa"] = False
+        st.session_state["refolding_eval_require_real_target_msa"] = True
+        st.rerun()
+    if bulk_cols[3].button("Template-only engines", key="refolding_select_template_only_engines"):
+        for engine_key in refolding_engine_keys:
+            st.session_state[engine_key] = engine_key in template_only_engine_keys
+        st.session_state["refolding_eval_af3_templates"] = True
+        st.session_state["refolding_eval_af3_msa"] = False
+        st.session_state["refolding_eval_colab_templates"] = True
+        st.session_state["refolding_eval_colab_msa"] = False
+        st.session_state["refolding_eval_af2_legacy_initial_guess"] = True
+        st.session_state["refolding_eval_esm_modes"] = ["initial_guess"]
+        st.session_state["refolding_eval_esm_msa"] = False
+        st.session_state["refolding_eval_af2_binder_template"] = True
+        st.session_state["refolding_eval_af2_interface_template"] = True
+        st.session_state["refolding_eval_boltz_template"] = True
+        st.session_state["refolding_eval_boltz_msa"] = False
+        st.session_state["refolding_eval_rf3_template"] = True
+        st.session_state["refolding_eval_rf3_msa"] = False
+        st.session_state["refolding_eval_protenix_v1_template"] = True
+        st.session_state["refolding_eval_protenix_v1_msa"] = False
+        st.session_state["refolding_eval_protenix_v2_template"] = True
+        st.session_state["refolding_eval_protenix_v2_msa"] = False
+        st.session_state["refolding_eval_openfold3_msa"] = False
+        st.session_state["refolding_eval_protenix_msa"] = False
+        st.session_state["refolding_eval_require_real_target_msa"] = False
+        st.rerun()
+    if bulk_cols[4].button("MSA-only engines", key="refolding_select_msa_only_engines"):
+        for engine_key in refolding_engine_keys:
+            st.session_state[engine_key] = engine_key in msa_engine_keys
+        st.session_state["refolding_eval_af3_templates"] = False
+        st.session_state["refolding_eval_af3_msa"] = True
+        st.session_state["refolding_eval_colab_templates"] = False
+        st.session_state["refolding_eval_colab_msa"] = True
+        st.session_state["refolding_eval_boltz_template"] = False
+        st.session_state["refolding_eval_boltz_msa"] = True
+        st.session_state["refolding_eval_rf3_template"] = False
+        st.session_state["refolding_eval_rf3_msa"] = True
+        st.session_state["refolding_eval_protenix_v1_template"] = False
+        st.session_state["refolding_eval_protenix_v1_msa"] = True
+        st.session_state["refolding_eval_protenix_v2_template"] = False
+        st.session_state["refolding_eval_protenix_v2_msa"] = True
+        st.session_state["refolding_eval_esm_modes"] = ["sequence"]
+        st.session_state["refolding_eval_esm_msa"] = True
+        st.session_state["refolding_eval_openfold3_msa"] = True
+        st.session_state["refolding_eval_protenix_msa"] = True
+        st.session_state["refolding_eval_require_real_target_msa"] = True
+        st.rerun()
+    if bulk_cols[5].button("No MSA + no template", key="refolding_disable_msa_template"):
+        st.session_state["refolding_eval_run_af2"] = False
+        st.session_state["refolding_eval_af3_templates"] = False
+        st.session_state["refolding_eval_af3_msa"] = False
+        st.session_state["refolding_eval_colab_templates"] = False
+        st.session_state["refolding_eval_colab_msa"] = False
+        st.session_state["refolding_eval_esm_modes"] = ["sequence"]
+        st.session_state["refolding_eval_esm_msa"] = False
+        st.session_state["refolding_eval_af2_legacy_initial_guess"] = True
+        st.session_state["refolding_eval_af2_binder_template"] = False
+        st.session_state["refolding_eval_af2_interface_template"] = False
+        st.session_state["refolding_eval_boltz_template"] = False
+        st.session_state["refolding_eval_boltz_msa"] = False
+        st.session_state["refolding_eval_rf3_template"] = False
+        st.session_state["refolding_eval_rf3_msa"] = False
+        st.session_state["refolding_eval_openfold3_msa"] = False
+        st.session_state["refolding_eval_protenix_msa"] = False
+        st.session_state["refolding_eval_protenix_v1_template"] = False
+        st.session_state["refolding_eval_protenix_v1_msa"] = False
+        st.session_state["refolding_eval_protenix_v2_template"] = False
+        st.session_state["refolding_eval_protenix_v2_msa"] = False
+        st.session_state["refolding_eval_require_real_target_msa"] = False
+        st.rerun()
 
-    engine_cols = st.columns(8)
+    engine_cols = st.columns(11)
     with engine_cols[0]:
         eval_run_af3 = st.checkbox("AlphaFast AF3", value=True, key="refolding_eval_run_af3")
     with engine_cols[1]:
@@ -1533,8 +1713,10 @@ with engines_tab:
             "AF2 target-only initial guess",
             value=True,
             key="refolding_eval_run_af2",
-            help="Uses binder sequence plus the selected target PDB coordinates. Whole-complex coordinate initialization is available only as an explicit legacy option below.",
+            help="Runs AF2 with initial-guess conditioning. Deselect AF2 for no-template/no-MSA comparisons.",
         )
+    if eval_run_af2:
+        st.session_state["refolding_eval_af2_legacy_initial_guess"] = True
     with engine_cols[3]:
         eval_run_esmfold2 = st.checkbox("ESMFold2", value=True, key="refolding_eval_run_esmfold2")
     with engine_cols[4]:
@@ -1542,8 +1724,14 @@ with engines_tab:
     with engine_cols[5]:
         eval_run_rf3 = st.checkbox("RF3", value=True, key="refolding_eval_run_rf3")
     with engine_cols[6]:
-        eval_run_protenix = st.checkbox("Protenix", value=True, key="refolding_eval_run_protenix")
+        eval_run_openfold3 = st.checkbox("OpenFold-3", value=True, key="refolding_eval_run_openfold3")
     with engine_cols[7]:
+        eval_run_protenix = st.checkbox("Protenix", value=True, key="refolding_eval_run_protenix")
+    with engine_cols[8]:
+        eval_run_protenix_v1 = st.checkbox("Protenix v1", value=False, key="refolding_eval_run_protenix_v1")
+    with engine_cols[9]:
+        eval_run_protenix_v2 = st.checkbox("Protenix v2", value=False, key="refolding_eval_run_protenix_v2")
+    with engine_cols[10]:
         eval_run_boltzgen = st.checkbox(
             "BoltzGen fold (coordinate-conditioned)",
             value=False,
@@ -1565,17 +1753,25 @@ with engines_tab:
     st.caption(f"Prediction engines will process {selected_count:,} selected candidates.")
 
     eval_boltz_target_msa = bool(st.session_state.get("refolding_eval_boltz_msa", True))
+    eval_af3_msa = bool(st.session_state.get("refolding_eval_af3_msa", True))
     eval_esm_msa = bool(st.session_state.get("refolding_eval_esm_msa", False))
     eval_rf3_msa = bool(st.session_state.get("refolding_eval_rf3_msa", True))
+    eval_openfold3_msa = bool(st.session_state.get("refolding_eval_openfold3_msa", True))
     eval_protenix_msa = bool(st.session_state.get("refolding_eval_protenix_msa", True))
+    eval_protenix_v1_msa = bool(st.session_state.get("refolding_eval_protenix_v1_msa", True))
+    eval_protenix_v2_msa = bool(st.session_state.get("refolding_eval_protenix_v2_msa", True))
+    eval_colab_msa_state = bool(st.session_state.get("refolding_eval_colab_msa", True))
     with st.expander("MSA Reference Data", expanded=True):
         msa_consuming_engine_selected = bool(
-            eval_run_af3
-            or eval_run_colab
+            (eval_run_af3 and eval_af3_msa)
+            or (eval_run_colab and eval_colab_msa_state)
             or (eval_run_boltz2 and eval_boltz_target_msa)
             or (eval_run_esmfold2 and eval_esm_msa)
             or (eval_run_rf3 and eval_rf3_msa)
+            or (eval_run_openfold3 and eval_openfold3_msa)
             or (eval_run_protenix and eval_protenix_msa)
+            or (eval_run_protenix_v1 and eval_protenix_v1_msa)
+            or (eval_run_protenix_v2 and eval_protenix_v2_msa)
         )
         msa_cols = st.columns(4)
         eval_msa_source = msa_cols[0].segmented_control(
@@ -1637,28 +1833,43 @@ with engines_tab:
     eval_models = default_models or ["af3", "boltz", "colabfold"]
 
     with st.expander("AlphaFast AF3 Settings", expanded=eval_run_af3):
-        af3_cols = st.columns(2)
+        af3_cols = st.columns(4)
         eval_alphafast_weights = af3_cols[0].text_input("AF3 weights dir", value=str(ALPHAFAST_WEIGHTS_DIR), disabled=not eval_run_af3, key="refolding_eval_alphafast_weights")
         eval_af3_recycles = af3_cols[1].number_input("AF3 recycles", min_value=1, max_value=48, value=10, step=1, key="refolding_eval_af3_recycles", disabled=not eval_run_af3)
+        eval_af3_templates = af3_cols[2].checkbox(
+            "Use templates",
+            value=True,
+            key="refolding_eval_af3_templates",
+            disabled=not eval_run_af3,
+            help="Embeds the staged input target chains as AF3 templates. Binder chains and binder-interface geometry are not templated.",
+        )
+        eval_af3_msa = af3_cols[3].checkbox(
+            "Use target MSAs",
+            value=eval_af3_msa,
+            key="refolding_eval_af3_msa",
+            disabled=not eval_run_af3,
+            help="When off, AlphaFast AF3 runs with query-only/no target MSA input.",
+        )
 
     with st.expander("ColabFold Settings", expanded=eval_run_colab):
         colab_cols = st.columns(5)
         eval_colab_cache = colab_cols[0].text_input("ColabFold / AF2 model cache", value=str(COLABFOLD_CACHE_DIR), disabled=not eval_run_colab, key="refolding_eval_colab_cache")
         eval_colab_recycles = colab_cols[1].number_input("ColabFold recycles", min_value=1, max_value=48, value=3, step=1, key="refolding_eval_colab_recycles", disabled=not eval_run_colab)
         eval_colab_models = colab_cols[2].number_input("ColabFold models", min_value=1, max_value=5, value=3, step=1, key="refolding_eval_colab_models", disabled=not eval_run_colab)
-        eval_colab_templates = colab_cols[3].checkbox("Use target PDB templates", value=True, key="refolding_eval_colab_templates", disabled=not eval_run_colab, help="Passes target-chain-only PDB templates to ColabFold. Binder chains and binder-interface geometry are not templated.")
-        eval_colab_max_template_hits = colab_cols[4].number_input("Max template hits", min_value=1, max_value=20, value=4, step=1, key="refolding_eval_colab_max_template_hits", disabled=not eval_run_colab or not eval_colab_templates)
+        eval_colab_templates = colab_cols[3].checkbox("Use templates", value=True, key="refolding_eval_colab_templates", disabled=not eval_run_colab, help="Uses the staged input target as the template. Binder chains and binder-interface geometry are not templated.")
+        eval_colab_msa = colab_cols[4].checkbox("Use target MSAs", value=True, key="refolding_eval_colab_msa", disabled=not eval_run_colab, help="When off, ColabFold does not request or inject real target MSAs.")
+        eval_colab_max_template_hits = 4
 
     with st.expander("AF2 Target-Only Initial Guess Settings", expanded=eval_run_af2):
         af2_cols = st.columns(4)
         eval_af2_recycles = af2_cols[0].number_input("AF2 recycles", min_value=1, max_value=24, value=3, step=1, key="refolding_eval_af2_recycles", disabled=not eval_run_af2)
         eval_af2_multimer = af2_cols[1].checkbox("AF2 multimer", value=True, key="refolding_eval_af2_multimer", disabled=not eval_run_af2)
         eval_af2_legacy_initial_guess = af2_cols[2].checkbox(
-            "Whole-complex initial guess (legacy)",
-            value=False,
+            "Whole-complex initial guess",
+            value=True,
             key="refolding_eval_af2_legacy_initial_guess",
-            disabled=not eval_run_af2,
-            help="Opt-in compatibility mode. This consumes the staged binder-target coordinates. Leave off for binder sequence plus selected target template only.",
+            disabled=True,
+            help="AF2 runs in this workflow always use initial-guess conditioning. Deselect AF2 to omit it from no-template/no-MSA runs.",
         )
         eval_af2_binder_template = af2_cols[3].checkbox(
             "Binder/interface template (legacy)",
@@ -1693,7 +1904,17 @@ with engines_tab:
         )
         esm_cols_eval = st.columns(5)
         esm_cols_eval[0].text_input("ESMFold2 model dir", value=str(ESMFOLD2_MODEL_DIR), disabled=True, key="refolding_eval_esm_model_dir")
-        eval_esm_msa = esm_cols_eval[1].checkbox("Use target MSAs", value=False, key="refolding_eval_esm_msa", disabled=not eval_run_esmfold2, help="Default off. Enable to pass prepared per-target-chain A3M files into ESMFold2 ProteinInput objects.")
+        eval_esm_msa = esm_cols_eval[1].checkbox(
+            "Use ESMFold2 target MSAs",
+            value=False,
+            key="refolding_eval_esm_msa",
+            disabled=not eval_run_esmfold2,
+            help=(
+                "Default off. Pass prepared per-target-chain A3M files into ESMFold2 ProteinInput.msa. "
+                "This is per-chain target MSA conditioning, not a ColabFold-style paired multimer A3M; "
+                "missing, query-only, or mismatched MSAs are skipped and noted in the ESMFold2 metrics."
+            ),
+        )
         eval_esm_steps = esm_cols_eval[2].number_input("ESMFold2 sampling steps", min_value=1, max_value=256, value=68, step=1, key="refolding_eval_esm_steps", disabled=not eval_run_esmfold2)
         eval_esm_loops = esm_cols_eval[3].number_input("ESMFold2 recycling loops", min_value=1, max_value=64, value=10, step=1, key="refolding_eval_esm_loops", disabled=not eval_run_esmfold2)
         eval_esm_seed = esm_cols_eval[4].number_input("ESMFold2 seed", min_value=0, max_value=999999, value=0, step=1, key="refolding_eval_esm_seed", disabled=not eval_run_esmfold2)
@@ -1701,7 +1922,7 @@ with engines_tab:
     with st.expander("Boltz-2 Settings", expanded=eval_run_boltz2):
         boltz_cols = st.columns(6)
         boltz_cols[0].text_input("Boltz-2 model cache", value=str(BOLTZ_MODELS_DIR), disabled=True, key="refolding_eval_boltz_model_cache")
-        eval_boltz_target_template = boltz_cols[1].checkbox("Use target template", value=True, key="refolding_eval_boltz_template", disabled=not eval_run_boltz2)
+        eval_boltz_target_template = boltz_cols[1].checkbox("Use templates", value=True, key="refolding_eval_boltz_template", disabled=not eval_run_boltz2, help="Uses the staged input target as the template.")
         eval_boltz_target_msa = boltz_cols[2].checkbox("Use target MSAs", value=True, key="refolding_eval_boltz_msa", disabled=not eval_run_boltz2, help="Default on. Binder chains stay no-MSA; each declared target chain uses its prepared MSA when available.")
         eval_boltz_recycles = boltz_cols[3].number_input("Recycling steps", min_value=1, max_value=48, value=10, step=1, key="refolding_eval_boltz_recycles", disabled=not eval_run_boltz2)
         eval_boltz_sampling = boltz_cols[4].number_input("Sampling steps", min_value=1, max_value=1000, value=200, step=1, key="refolding_eval_boltz_sampling", disabled=not eval_run_boltz2)
@@ -1709,14 +1930,68 @@ with engines_tab:
         eval_boltz_write_full_pae = st.checkbox("Write full PAE", value=True, key="refolding_eval_boltz_write_full_pae", disabled=not eval_run_boltz2)
 
     with st.expander("RF3 Settings", expanded=eval_run_rf3):
-        rf3_cols = st.columns(6)
+        rf3_cols = st.columns(7)
         eval_rf3_checkpoint = rf3_cols[0].text_input("RF3 checkpoint", value=str(refolding_workflow.RF3_CHECKPOINT), key="refolding_eval_rf3_checkpoint", disabled=not eval_run_rf3)
-        eval_rf3_msa = rf3_cols[1].checkbox("Use target MSAs", value=True, key="refolding_eval_rf3_msa", disabled=not eval_run_rf3, help="Default on. Each declared target chain receives its prepared A3M; binder chains remain MSA-free.")
-        eval_rf3_recycles = rf3_cols[2].number_input("RF3 recycles", min_value=1, max_value=48, value=10, step=1, key="refolding_eval_rf3_recycles", disabled=not eval_run_rf3)
-        eval_rf3_steps = rf3_cols[3].number_input("RF3 diffusion steps", min_value=1, max_value=1000, value=50, step=1, key="refolding_eval_rf3_steps", disabled=not eval_run_rf3)
-        eval_rf3_samples = rf3_cols[4].number_input("RF3 samples", min_value=1, max_value=20, value=5, step=1, key="refolding_eval_rf3_samples", disabled=not eval_run_rf3)
-        eval_rf3_seed = rf3_cols[5].number_input("RF3 seed", min_value=0, max_value=999999, value=0, step=1, key="refolding_eval_rf3_seed", disabled=not eval_run_rf3)
-        st.caption("RF3 folds the complex from sequences and per-chain target MSAs. These controls map to RF3 Hydra settings: n_recycles, num_steps, diffusion_batch_size, and seed.")
+        eval_rf3_template = rf3_cols[1].checkbox("Use templates", value=True, key="refolding_eval_rf3_template", disabled=not eval_run_rf3, help="Uses the staged input target chains as RF3 template coordinates.")
+        eval_rf3_msa = rf3_cols[2].checkbox("Use target MSAs", value=True, key="refolding_eval_rf3_msa", disabled=not eval_run_rf3, help="Default on. Each declared target chain receives its prepared A3M; binder chains remain MSA-free.")
+        eval_rf3_recycles = rf3_cols[3].number_input("RF3 recycles", min_value=1, max_value=48, value=10, step=1, key="refolding_eval_rf3_recycles", disabled=not eval_run_rf3)
+        eval_rf3_steps = rf3_cols[4].number_input("RF3 diffusion steps", min_value=1, max_value=1000, value=50, step=1, key="refolding_eval_rf3_steps", disabled=not eval_run_rf3)
+        eval_rf3_samples = rf3_cols[5].number_input("RF3 samples", min_value=1, max_value=20, value=5, step=1, key="refolding_eval_rf3_samples", disabled=not eval_run_rf3)
+        eval_rf3_seed = rf3_cols[6].number_input("RF3 seed", min_value=0, max_value=999999, value=0, step=1, key="refolding_eval_rf3_seed", disabled=not eval_run_rf3)
+        st.caption("RF3 folds the complex from sequences plus optional target-chain templates and per-chain target MSAs.")
+
+    with st.expander("OpenFold-3 Settings", expanded=eval_run_openfold3):
+        openfold_cols = st.columns(6)
+        eval_openfold3_checkpoint = openfold_cols[0].text_input(
+            "OpenFold-3 checkpoint",
+            value=str(refolding_workflow.OPENFOLD3_CHECKPOINT),
+            key="refolding_eval_openfold3_checkpoint",
+            disabled=not eval_run_openfold3,
+            help="Default shared path: /mnt/db/reference_files/openfold3/of3-p2-155k.pt.",
+        )
+        eval_openfold3_msa = openfold_cols[1].checkbox(
+            "Use target MSAs",
+            value=True,
+            key="refolding_eval_openfold3_msa",
+            disabled=not eval_run_openfold3,
+            help="Default on. Binder chains remain MSA-free; declared target chains use prepared A3M files when available.",
+        )
+        eval_openfold3_samples = openfold_cols[2].number_input(
+            "Diffusion samples",
+            min_value=1,
+            max_value=20,
+            value=5,
+            step=1,
+            key="refolding_eval_openfold3_samples",
+            disabled=not eval_run_openfold3,
+        )
+        eval_openfold3_seeds = openfold_cols[3].number_input(
+            "Model seeds",
+            min_value=1,
+            max_value=20,
+            value=1,
+            step=1,
+            key="refolding_eval_openfold3_seeds",
+            disabled=not eval_run_openfold3,
+        )
+        eval_openfold3_recycles = openfold_cols[4].number_input(
+            "Recycles",
+            min_value=1,
+            max_value=48,
+            value=3,
+            step=1,
+            key="refolding_eval_openfold3_recycles",
+            disabled=not eval_run_openfold3,
+            help="OpenFold-3 default architecture.shared.num_recycles is 3.",
+        )
+        eval_openfold3_msa_server = openfold_cols[5].checkbox(
+            "Use MSA server",
+            value=False,
+            key="refolding_eval_openfold3_msa_server",
+            disabled=not eval_run_openfold3,
+            help="Default off for local/high-throughput runs. Prefer the app's shared target-MSA repository.",
+        )
+        st.caption("OpenFold-3 runs from chain sequences. Target MSAs are attached as precomputed main MSAs; binder chains are supplied without MSAs.")
 
     with st.expander("Protenix Settings", expanded=eval_run_protenix):
         protenix_cols = st.columns(4)
@@ -1724,6 +1999,36 @@ with engines_tab:
         eval_protenix_cycle = protenix_cols[1].number_input("Pairformer cycles", min_value=1, max_value=48, value=3, step=1, key="refolding_eval_protenix_cycle", disabled=not eval_run_protenix)
         eval_protenix_steps = protenix_cols[2].number_input("Diffusion steps", min_value=1, max_value=1000, value=50, step=1, key="refolding_eval_protenix_steps", disabled=not eval_run_protenix)
         eval_protenix_samples = protenix_cols[3].number_input("Samples", min_value=1, max_value=20, value=5, step=1, key="refolding_eval_protenix_samples", disabled=not eval_run_protenix)
+        st.caption("Legacy PXDesign-backed Protenix v0.5 adapter. New standalone Protenix models are exposed separately below.")
+
+    with st.expander("Protenix v1 Settings", expanded=eval_run_protenix_v1):
+        protenix_v1_cols = st.columns(6)
+        eval_protenix_v1_model = protenix_v1_cols[0].selectbox(
+            "Model",
+            [
+                refolding_workflow.PROTENIX_V1_MODEL,
+                refolding_workflow.PROTENIX_V1_20250630_MODEL,
+            ],
+            index=0,
+            disabled=not eval_run_protenix_v1,
+            key="refolding_eval_protenix_v1_model",
+        )
+        eval_protenix_v1_msa = protenix_v1_cols[1].checkbox("Use target MSAs", value=True, key="refolding_eval_protenix_v1_msa", disabled=not eval_run_protenix_v1)
+        eval_protenix_v1_template = protenix_v1_cols[2].checkbox("Use templates", value=False, key="refolding_eval_protenix_v1_template", disabled=not eval_run_protenix_v1)
+        eval_protenix_v1_cycle = protenix_v1_cols[3].number_input("Pairformer cycles", min_value=1, max_value=48, value=10, step=1, key="refolding_eval_protenix_v1_cycle", disabled=not eval_run_protenix_v1)
+        eval_protenix_v1_steps = protenix_v1_cols[4].number_input("Diffusion steps", min_value=1, max_value=1000, value=200, step=1, key="refolding_eval_protenix_v1_steps", disabled=not eval_run_protenix_v1)
+        eval_protenix_v1_samples = protenix_v1_cols[5].number_input("Samples", min_value=1, max_value=20, value=5, step=1, key="refolding_eval_protenix_v1_samples", disabled=not eval_run_protenix_v1)
+        st.caption("Standalone Protenix CLI. Checkpoints and cache are mounted at /mnt/db/reference_files/protenix.")
+
+    with st.expander("Protenix v2 Settings", expanded=eval_run_protenix_v2):
+        protenix_v2_cols = st.columns(6)
+        eval_protenix_v2_model = protenix_v2_cols[0].text_input("Model", value=refolding_workflow.PROTENIX_V2_MODEL, disabled=not eval_run_protenix_v2, key="refolding_eval_protenix_v2_model")
+        eval_protenix_v2_msa = protenix_v2_cols[1].checkbox("Use target MSAs", value=True, key="refolding_eval_protenix_v2_msa", disabled=not eval_run_protenix_v2)
+        eval_protenix_v2_template = protenix_v2_cols[2].checkbox("Use templates", value=False, key="refolding_eval_protenix_v2_template", disabled=not eval_run_protenix_v2)
+        eval_protenix_v2_cycle = protenix_v2_cols[3].number_input("Pairformer cycles", min_value=1, max_value=48, value=10, step=1, key="refolding_eval_protenix_v2_cycle", disabled=not eval_run_protenix_v2)
+        eval_protenix_v2_steps = protenix_v2_cols[4].number_input("Diffusion steps", min_value=1, max_value=1000, value=200, step=1, key="refolding_eval_protenix_v2_steps", disabled=not eval_run_protenix_v2)
+        eval_protenix_v2_samples = protenix_v2_cols[5].number_input("Samples", min_value=1, max_value=20, value=5, step=1, key="refolding_eval_protenix_v2_samples", disabled=not eval_run_protenix_v2)
+        st.caption("Standalone Protenix v2 CLI adapter using the shared /mnt/db/reference_files/protenix cache.")
 
     with st.expander("BoltzGen Fold Settings", expanded=eval_run_boltzgen):
         boltzgen_cols = st.columns(3)
@@ -1784,7 +2089,10 @@ with run_tab:
             ("Boltz-2", eval_run_boltz2),
             ("ESMFold2", eval_run_esmfold2),
             ("RF3", eval_run_rf3),
+            ("OpenFold-3", eval_run_openfold3),
             ("Protenix", eval_run_protenix),
+            ("Protenix v1", eval_run_protenix_v1),
+            ("Protenix v2", eval_run_protenix_v2),
             ("BoltzGen Fold", eval_run_boltzgen),
         ]
         if enabled
@@ -1808,12 +2116,27 @@ with run_tab:
         estimate_engine_keys.append("esmfold2")
     if eval_run_rf3:
         estimate_engine_keys.append("rf3")
+    if eval_run_openfold3:
+        estimate_engine_keys.append("openfold3")
     if eval_run_protenix:
         estimate_engine_keys.append("protenix")
+    if eval_run_protenix_v1:
+        estimate_engine_keys.append("protenix_v1")
+    if eval_run_protenix_v2:
+        estimate_engine_keys.append("protenix_v2")
     if eval_run_boltzgen:
         estimate_engine_keys.append("boltzgen_fold")
     if eval_common or eval_rosetta_input or eval_rosetta or eval_pymol:
         estimate_engine_keys.append("postprocessing")
+    selected_candidate_set = set(selected_candidate_ids)
+    selected_lengths = [
+        _candidate_total_length(candidate)
+        for candidate in candidates
+        if str(candidate.get("candidate_id") or "") in selected_candidate_set
+    ]
+    selected_lengths = [length for length in selected_lengths if length is not None]
+    estimate_total_residues = sum(selected_lengths) if selected_lengths else None
+    requested_total_length = max(selected_lengths) if selected_lengths else None
     estimate_engine_params: dict[str, dict[str, int]] = {}
     if "esmfold2" in estimate_engine_keys:
         estimate_engine_params["esmfold2"] = {
@@ -1824,13 +2147,14 @@ with run_tab:
         estimate = estimate_engines(
             engines=estimate_engine_keys,
             candidate_count=run_count,
+            total_residues=int(estimate_total_residues) if estimate_total_residues else None,
             engine_params=estimate_engine_params,
         )
         with st.expander("Runtime estimate", expanded=True):
             runtime_cols = st.columns(4)
             runtime_cols[0].metric("Estimated total", estimate["total_time"])
             runtime_cols[1].metric("Candidates", f"{run_count:,}")
-            runtime_cols[2].metric("Residues", "n/a")
+            runtime_cols[2].metric("Residues", f"{int(estimate_total_residues):,}" if estimate_total_residues else "n/a")
             runtime_cols[3].metric("Engines/steps", len(estimate_engine_keys))
             estimate_df = _estimate_rows_dataframe(estimate)
             if not estimate_df.empty:
@@ -1840,6 +2164,7 @@ with run_tab:
                     hide_index=True,
                     column_config={
                         "seconds_per_candidate": st.column_config.NumberColumn("sec / candidate", format="%.1f"),
+                        "seconds_per_residue": st.column_config.NumberColumn("sec / residue", format="%.3f"),
                     },
                 )
             st.caption(
@@ -1849,14 +2174,6 @@ with run_tab:
     elif estimate_engine_keys:
         st.caption("Runtime estimate needs at least one selected candidate. Select candidates in the Dataset tab.")
     capacity_engine_keys = [engine for engine in estimate_engine_keys if engine != "postprocessing"]
-    selected_candidate_set = set(selected_candidate_ids)
-    selected_lengths = [
-        _candidate_total_length(candidate)
-        for candidate in candidates
-        if str(candidate.get("candidate_id") or "") in selected_candidate_set
-    ]
-    selected_lengths = [length for length in selected_lengths if length is not None]
-    requested_total_length = max(selected_lengths) if selected_lengths else None
     capacity_preset = "full_workflow" if (eval_common or eval_rosetta_input or eval_rosetta or eval_pymol) else "practical"
     if capacity_engine_keys and requested_total_length:
         with st.expander("Capacity warning", expanded=True):
@@ -1906,9 +2223,12 @@ with run_tab:
                 run_boltz2_initial_guess=bool(eval_run_boltz2),
                 run_esmfold2=bool(eval_run_esmfold2),
                 run_rf3=bool(eval_run_rf3),
+                run_openfold3=bool(eval_run_openfold3),
                 run_protenix=bool(eval_run_protenix),
+                run_protenix_v1=bool(eval_run_protenix_v1),
+                run_protenix_v2=bool(eval_run_protenix_v2),
                 run_boltzgen_fold=bool(eval_run_boltzgen),
-                colabfold_msa_source=str(eval_msa_source),
+                colabfold_msa_source=str(eval_msa_source if eval_colab_msa else "repo_run_csv"),
                 msa_repository_dir=Path(str(eval_msa_repository)),
                 require_real_target_msa=bool(eval_require_real_target_msa),
                 alphafast_db_dir=Path(str(eval_alphafast_db)),
@@ -1916,10 +2236,12 @@ with run_tab:
                 colabfold_cache_dir=Path(str(eval_colab_cache)),
                 alphafast_batch_size=int(eval_alphafast_batch_size),
                 alphafast_num_recycles=int(eval_af3_recycles),
+                alphafast_use_target_templates=bool(eval_af3_templates),
+                alphafast_query_only_msa=not bool(eval_af3_msa),
                 alphafast_gpu_device=eval_gpu,
                 af2_num_recycles=int(eval_af2_recycles),
                 af2_multimer=bool(eval_af2_multimer),
-                af2_use_initial_guess=bool(eval_af2_legacy_initial_guess),
+                af2_use_initial_guess=bool(eval_run_af2),
                 af2_use_binder_template=bool(eval_af2_legacy_initial_guess and eval_af2_binder_template),
                 af2_use_interface_template=bool(
                     eval_af2_legacy_initial_guess
@@ -1931,6 +2253,7 @@ with run_tab:
                 colabfold_gpu_device=eval_gpu,
                 gpu_device=eval_gpu,
                 colabfold_use_target_templates=bool(eval_colab_templates),
+                colabfold_use_target_msa=bool(eval_colab_msa),
                 colabfold_max_template_hits=int(eval_colab_max_template_hits),
                 boltz2_use_target_template=bool(eval_boltz_target_template),
                 boltz2_use_target_msa=bool(eval_boltz_target_msa),
@@ -1945,14 +2268,33 @@ with run_tab:
                 seed=int(eval_esm_seed),
                 rf3_checkpoint_path=Path(str(eval_rf3_checkpoint)),
                 rf3_use_target_msa=bool(eval_rf3_msa),
+                rf3_use_target_template=bool(eval_rf3_template),
                 rf3_recycles=int(eval_rf3_recycles),
                 rf3_num_steps=int(eval_rf3_steps),
                 rf3_diffusion_batch_size=int(eval_rf3_samples),
                 rf3_seed=int(eval_rf3_seed),
+                openfold3_checkpoint_path=Path(str(eval_openfold3_checkpoint)),
+                openfold3_use_target_msa=bool(eval_openfold3_msa),
+                openfold3_num_diffusion_samples=int(eval_openfold3_samples),
+                openfold3_num_model_seeds=int(eval_openfold3_seeds),
+                openfold3_num_recycles=int(eval_openfold3_recycles),
+                openfold3_use_msa_server=bool(eval_openfold3_msa_server),
                 protenix_use_msa=bool(eval_protenix_msa),
                 protenix_cycle=int(eval_protenix_cycle),
                 protenix_diffusion_steps=int(eval_protenix_steps),
                 protenix_samples=int(eval_protenix_samples),
+                protenix_v1_model_name=str(eval_protenix_v1_model),
+                protenix_v1_use_msa=bool(eval_protenix_v1_msa),
+                protenix_v1_use_template=bool(eval_protenix_v1_template),
+                protenix_v1_cycle=int(eval_protenix_v1_cycle),
+                protenix_v1_diffusion_steps=int(eval_protenix_v1_steps),
+                protenix_v1_samples=int(eval_protenix_v1_samples),
+                protenix_v2_model_name=str(eval_protenix_v2_model),
+                protenix_v2_use_msa=bool(eval_protenix_v2_msa),
+                protenix_v2_use_template=bool(eval_protenix_v2_template),
+                protenix_v2_cycle=int(eval_protenix_v2_cycle),
+                protenix_v2_diffusion_steps=int(eval_protenix_v2_steps),
+                protenix_v2_samples=int(eval_protenix_v2_samples),
                 boltzgen_recycling_steps=int(eval_boltzgen_recycles),
                 boltzgen_sampling_steps=int(eval_boltzgen_sampling),
                 boltzgen_diffusion_samples=int(eval_boltzgen_samples),
@@ -1965,13 +2307,19 @@ with run_tab:
 
 with results_tab:
     st.subheader("Results")
+    refresh_results_button("refolding_validation_refresh_results")
     rows = _refolding_result_rows()
     if rows:
         df = pd.DataFrame(rows)
         display_cols = [
             "result",
+            "job_code",
+            "run_id",
             "description",
             "status",
+            "source_job_code",
+            "source_run_id",
+            "source_task_group",
             "design_set",
             "source_job",
             "candidates",
@@ -1988,8 +2336,6 @@ with results_tab:
             "current_phase",
             "current_engine",
             "created_at",
-            "job_code",
-            "run_id",
         ]
         display_df = df[[col for col in display_cols if col in df.columns]].copy()
         table_key = "refolding_results"
@@ -2855,6 +3201,12 @@ with legacy_tab:
         esm_seed = st.number_input("Seed", min_value=0, max_value=999999, value=0, step=1, key="esmfold2_validation_seed")
     with esm_cols[4]:
         esm_contact_cutoff = st.number_input("Contact cutoff", min_value=2.0, max_value=20.0, value=8.0, step=0.5, key="esmfold2_validation_contact_cutoff")
+    esm_use_target_msa = st.checkbox(
+        "Use ESMFold2 target MSAs",
+        value=True,
+        key="esmfold2_validation_use_target_msa",
+        help="Pass cached per-target-chain A3M files into ESMFold2 ProteinInput.msa when they match the target sequence.",
+    )
     esm_device = st.segmented_control(
         "ESMFold2 device",
         ["auto", "cuda", "cpu"],
@@ -2876,6 +3228,7 @@ with legacy_tab:
                     device=str(esm_device or "auto"),
                     contact_cutoff=float(esm_contact_cutoff),
                     use_initial_guess=str(esm_mode or "sequence") == "initial_guess",
+                    use_target_msa=bool(esm_use_target_msa),
                 )
             result = read_json(run_dir / "result.json")
             st.success("ESMFold2 validation finished.") if result.get("success") is True else st.error("ESMFold2 validation failed. Open the job logs for details.")

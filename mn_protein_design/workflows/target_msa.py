@@ -105,6 +105,71 @@ def _first_a3m_query_sequence(path: Path) -> str:
     return _normalize_msa_query_sequence("".join(sequence_lines))
 
 
+def _read_a3m_records(path: Path) -> list[tuple[str, str]]:
+    records: list[tuple[str, str]] = []
+    header: str | None = None
+    sequence_lines: list[str] = []
+    for raw_line in path.read_text(errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            if header is not None:
+                records.append((header, "".join(sequence_lines)))
+            header = line
+            sequence_lines = []
+        else:
+            sequence_lines.append(line)
+    if header is not None:
+        records.append((header, "".join(sequence_lines)))
+    return records
+
+
+def _a3m_query_match_mask(query_sequence: str, residue_count: int) -> list[bool] | None:
+    keep: list[bool] = []
+    consumed = 0
+    for char in query_sequence:
+        is_match_column = char.isalpha() and char.isupper()
+        if is_match_column and consumed >= residue_count:
+            keep.append(False)
+            continue
+        keep.append(True)
+        if is_match_column:
+            consumed += 1
+    if consumed < residue_count:
+        return None
+    return keep
+
+
+def _write_prefix_cropped_a3m(source_path: Path, destination_path: Path, sequence: str) -> bool:
+    records = _read_a3m_records(source_path)
+    if not records:
+        return False
+    query = _normalize_msa_query_sequence(records[0][1].replace("-", ""))
+    expected = _normalize_msa_query_sequence(sequence)
+    if not query.startswith(expected) or len(query) == len(expected):
+        return False
+    keep_mask = _a3m_query_match_mask(records[0][1], len(expected))
+    if keep_mask is None:
+        return False
+    lines: list[str] = []
+    for header, aligned_sequence in records:
+        cropped = "".join(char for index, char in enumerate(aligned_sequence) if index < len(keep_mask) and keep_mask[index])
+        if not cropped:
+            continue
+        lines.append(header)
+        lines.append(cropped)
+    if len(lines) < 2:
+        return False
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    destination_path.write_text("\n".join(lines) + "\n")
+    valid, _reason = validate_a3m_file(destination_path)
+    if not valid or _first_a3m_query_sequence(destination_path) != expected:
+        destination_path.unlink(missing_ok=True)
+        return False
+    return True
+
+
 def validate_a3m_file(path: Path) -> tuple[bool, str]:
     if not path.exists():
         return False, "file does not exist"
@@ -163,6 +228,7 @@ def find_cached_msa_for_sequence(
         return None, f"repository missing; hash path: {reason}"
 
     expected_query = _normalize_msa_query_sequence(cleaned_sequence)
+    prefix_sources: list[Path] = []
     for candidate in sorted(Path(msa_repository_dir).glob("**/*.a3m")):
         if candidate == host_path:
             continue
@@ -170,10 +236,16 @@ def find_cached_msa_for_sequence(
         if not valid and not _repair_a3m_file(candidate):
             continue
         try:
-            if _first_a3m_query_sequence(candidate) == expected_query:
+            candidate_query = _first_a3m_query_sequence(candidate)
+            if candidate_query == expected_query:
                 return candidate, "sequence_scan"
+            if candidate_query.startswith(expected_query):
+                prefix_sources.append(candidate)
         except Exception:
             continue
+    for candidate in sorted(prefix_sources, key=lambda path: (len(_first_a3m_query_sequence(path)), str(path))):
+        if _write_prefix_cropped_a3m(candidate, host_path, expected_query):
+            return host_path, f"sequence_prefix_crop:{candidate.name}"
     return None, reason or "no sequence-matched A3M in repository"
 
 

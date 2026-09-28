@@ -48,8 +48,19 @@ Detection containers used by the PPI / Hotspot Detection page:
 
 ```bash
 docker compose build scannet
+docker compose build pesto
 docker compose build surf2spot
 docker compose build masif-seed
+```
+
+PeSTo keeps its model parameters in the shared reference folder rather than in
+the image. Install the bundled i_v4_1 checkpoint once before running PeSTo:
+
+```bash
+sudo install -d /mnt/db/reference_files/pesto/i_v4_1
+sudo install -m 0644 \
+  tools_to_implement/PeSTo/model/save/i_v4_1_2021-09-07_11-21/model_ckpt.pt \
+  /mnt/db/reference_files/pesto/i_v4_1/model_ckpt.pt
 ```
 
 Sequence-design uses existing images:

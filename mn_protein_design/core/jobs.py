@@ -4,12 +4,14 @@ import json
 import os
 import signal
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from mn_protein_design.core.gpu import gpu_queue_resource
 from mn_protein_design.runtime import runs_root
 
 
@@ -67,6 +69,137 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def _warning_metric_active(value: object) -> bool:
+    if value in {None, "", False, 0, 0.0}:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "none", "no", "ok"}
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _metric_label(key: str) -> str:
+    return key.replace("_", " ")
+
+
+def _param_bool(params: dict, key: str, default: bool = False) -> bool:
+    value = params.get(key)
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _refolding_requests_target_msa(params: dict) -> bool:
+    """Return whether any enabled prediction engine is configured to consume target MSAs."""
+    return any(
+        (
+            _param_bool(params, "run_alphafast_af3") and not _param_bool(params, "alphafast_query_only_msa"),
+            _param_bool(params, "run_colabfold") and _param_bool(params, "colabfold_use_target_msa", True),
+            _param_bool(params, "run_boltz2_initial_guess") and _param_bool(params, "boltz2_use_target_msa", True),
+            _param_bool(params, "run_rf3") and _param_bool(params, "rf3_use_target_msa", True),
+            _param_bool(params, "run_openfold3") and _param_bool(params, "openfold3_use_target_msa", True),
+            _param_bool(params, "run_esmfold2") and _param_bool(params, "esmfold2_use_target_msa", False),
+            _param_bool(params, "run_protenix") and _param_bool(params, "protenix_use_msa", True),
+            _param_bool(params, "run_protenix_v1") and _param_bool(params, "protenix_v1_use_msa", True),
+            _param_bool(params, "run_protenix_v2") and _param_bool(params, "protenix_v2_use_msa", True),
+        )
+    )
+
+
+def _strip_expected_template_only_msa_warning(text: str, params: dict) -> str:
+    if _refolding_requests_target_msa(params):
+        return text
+    expected_fragments = (
+        "alphafast af3 is configured for query-only msa mode",
+        "real target-msa requirement is disabled",
+        "chain msa target msa blocking nonreal count",
+        "chain msa target msa missing count",
+        "chain msa target msa available count",
+        "chain msa target msa real count",
+        "chain msa target msa query only count",
+        "chain msa target msa short nonreal count",
+    )
+    prefix = "Degraded run:"
+    suffix = text.strip()
+    had_prefix = suffix.lower().startswith(prefix.lower())
+    if had_prefix:
+        suffix = suffix[len(prefix) :].strip()
+    suffix = suffix.rstrip(".")
+    kept = [
+        part.strip()
+        for part in suffix.split(";")
+        if part.strip() and not any(fragment in part.strip().lower() for fragment in expected_fragments)
+    ]
+    if not kept:
+        return ""
+    return f"{prefix} {'; '.join(kept)}." if had_prefix else "; ".join(kept)
+
+
+def derive_job_warning(metadata: dict | None, input_payload: dict | None, result: dict | None) -> str:
+    """Return a user-facing warning for completed/running jobs with degraded behavior."""
+    metadata = metadata or {}
+    input_payload = input_payload or {}
+    result = result or {}
+    params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+    target_msa_requested = _refolding_requests_target_msa(params)
+    explicit = str(metadata.get("warning") or result.get("warning") or "").strip()
+    if explicit:
+        return _strip_expected_template_only_msa_warning(explicit, params)
+    warnings = result.get("warnings")
+    if isinstance(warnings, list):
+        text_warnings = [str(item).strip() for item in warnings if str(item).strip()]
+        if text_warnings:
+            return _strip_expected_template_only_msa_warning("; ".join(text_warnings[:3]), params)
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    messages: list[str] = []
+    if metrics.get("require_real_target_msa_disabled_after_msa_failure"):
+        messages.append("Real target-MSA requirement was disabled after MSA generation failed")
+    if metrics.get("alphafast_msa_pipeline_fallback"):
+        messages.append("AlphaFast/MMseqs MSA fallback was used")
+    if target_msa_requested and params.get("alphafast_query_only_msa"):
+        messages.append("AlphaFast AF3 is configured for query-only MSA mode")
+    if target_msa_requested and params.get("require_real_target_msa") is False:
+        messages.append("Real target-MSA requirement is disabled")
+    warning_terms = (
+        "fallback",
+        "query_only",
+        "nonreal",
+        "missing_after",
+        "skipped",
+        "degraded",
+    )
+    ignored_terms = (
+        "skipped_count",
+        "selected_candidate_count",
+    )
+    for key, value in metrics.items():
+        key_text = str(key)
+        key_lower = key_text.lower()
+        if any(term in key_lower for term in ignored_terms):
+            continue
+        if not target_msa_requested and "msa" in key_lower:
+            continue
+        if any(term in key_lower for term in warning_terms) and _warning_metric_active(value):
+            messages.append(f"{_metric_label(key_text)}: {value}")
+        elif key_lower.endswith("_error") and _warning_metric_active(value):
+            messages.append(f"{_metric_label(key_text)}: {value}")
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for message in messages:
+        if message not in seen:
+            seen.add(message)
+            deduped.append(message)
+    if not deduped:
+        return ""
+    suffix = "; ".join(deduped[:4])
+    if len(deduped) > 4:
+        suffix += f"; +{len(deduped) - 4} more"
+    return f"Degraded run: {suffix}."
+
+
 def _queue_resource_for(tool: str, params: dict | None) -> str | None:
     params = params or {}
     explicit = str(params.get("queue_resource") or "").strip().lower()
@@ -112,9 +245,17 @@ def _active_resource_owner(resource: str, requester_run_dir: Path) -> Path | Non
     root = runs_root()
     if not root.exists():
         return None
+    try:
+        requester_resolved = requester_run_dir.resolve()
+    except Exception:
+        requester_resolved = requester_run_dir
     for metadata_path in root.glob("*/*/metadata.json"):
         run_dir = metadata_path.parent
-        if run_dir == requester_run_dir:
+        try:
+            same_run = run_dir.resolve() == requester_resolved
+        except Exception:
+            same_run = run_dir == requester_run_dir
+        if same_run:
             continue
         metadata = read_json(metadata_path)
         status = str(metadata.get("status") or "")
@@ -160,16 +301,21 @@ def _acquire_resource_lock(run_dir: Path, resource: str, poll_seconds: float = 5
         try:
             lock_dir.parent.mkdir(parents=True, exist_ok=True)
             lock_dir.mkdir()
-            write_json(
-                lock_dir / "owner.json",
-                {
-                    "resource": resource,
-                    "run_dir": str(run_dir),
-                    "task_group": metadata.get("task_group"),
-                    "run_id": metadata.get("run_id"),
-                    "acquired_at": utc_now(),
-                },
-            )
+            try:
+                write_json(
+                    lock_dir / "owner.json",
+                    {
+                        "resource": resource,
+                        "run_dir": str(run_dir),
+                        "task_group": metadata.get("task_group"),
+                        "run_id": metadata.get("run_id"),
+                        "acquired_at": utc_now(),
+                    },
+                )
+            except FileNotFoundError:
+                # Another worker can reap a stale lock directory in the small
+                # window between mkdir() and owner.json creation. Retry cleanly.
+                continue
             metadata = read_json(run_dir / "metadata.json")
             metadata["queue_lock_acquired"] = resource
             metadata["queue_started_at"] = utc_now()
@@ -280,6 +426,17 @@ def update_status(run_dir: Path, status: str, **extra: object) -> None:
 
 def finish_job(run_dir: Path, success: bool, result: dict) -> None:
     input_payload = read_json(run_dir / "input.json")
+    metadata = read_json(run_dir / "metadata.json")
+    if success:
+        for key in (
+            "warning",
+            "warning_level",
+            "worker_error",
+            "worker_exception_type",
+            "cancel_reason",
+            "pause_reason",
+        ):
+            metadata.pop(key, None)
     normalized = {
         "success": success,
         "job_type": input_payload.get("job_type"),
@@ -291,6 +448,12 @@ def finish_job(run_dir: Path, success: bool, result: dict) -> None:
     }
     for key, value in result.items():
         normalized.setdefault(key, value)
+    warning = derive_job_warning(metadata, input_payload, normalized)
+    if warning:
+        metadata["warning"] = warning
+        metadata["warning_level"] = metadata.get("warning_level") or "degraded"
+        metadata["updated_at"] = utc_now()
+        write_json(run_dir / "metadata.json", metadata)
     write_json(run_dir / "result.json", normalized)
     update_status(run_dir, "completed" if success else "failed")
     _release_resource_lock(run_dir)
@@ -319,9 +482,59 @@ def _signal_worker_process(run_dir: Path, sig: int = signal.SIGTERM) -> bool:
         return False
 
 
+def _stop_run_docker_containers(run_dir: Path) -> list[str]:
+    """Stop running Docker containers whose inspect metadata references run_dir."""
+    run_text = str(run_dir.expanduser().resolve())
+    try:
+        ps = subprocess.run(
+            ["docker", "ps", "-q"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return []
+    container_ids = [line.strip() for line in ps.stdout.splitlines() if line.strip()]
+    if not container_ids:
+        return []
+
+    matching: list[str] = []
+    for container_id in container_ids:
+        try:
+            inspected = subprocess.run(
+                ["docker", "inspect", container_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception:
+            continue
+        if inspected.returncode == 0 and run_text in inspected.stdout:
+            matching.append(container_id)
+
+    stopped: list[str] = []
+    for container_id in matching:
+        try:
+            result = subprocess.run(
+                ["docker", "stop", container_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except Exception:
+            continue
+        if result.returncode == 0:
+            stopped.append(container_id)
+    return stopped
+
+
 def stop_job(run_dir: Path, reason: str = "Stopped by user") -> None:
     """Stop a queued/running job and mark it cancelled without deleting artifacts."""
     _signal_worker_process(run_dir, signal.SIGTERM)
+    stopped_containers = _stop_run_docker_containers(run_dir)
     _release_resource_lock(run_dir)
     metadata = read_json(run_dir / "metadata.json")
     stopped_at = utc_now()
@@ -331,6 +544,8 @@ def stop_job(run_dir: Path, reason: str = "Stopped by user") -> None:
     metadata["updated_at"] = stopped_at
     metadata["progress_label"] = reason
     metadata["cancel_reason"] = reason
+    if stopped_containers:
+        metadata["stopped_container_ids"] = stopped_containers
     write_json(run_dir / "metadata.json", metadata)
     result = read_json(run_dir / "result.json")
     result.update(
@@ -346,6 +561,7 @@ def stop_job(run_dir: Path, reason: str = "Stopped by user") -> None:
 def pause_job(run_dir: Path, reason: str = "") -> None:
     """Park a resumable job without treating it as a failed result."""
     _signal_worker_process(run_dir, signal.SIGTERM)
+    stopped_containers = _stop_run_docker_containers(run_dir)
     _release_resource_lock(run_dir)
     metadata = read_json(run_dir / "metadata.json")
     metadata.pop("completed_at", None)
@@ -355,6 +571,8 @@ def pause_job(run_dir: Path, reason: str = "") -> None:
     if reason:
         metadata["pause_reason"] = reason
         metadata["progress_label"] = reason
+    if stopped_containers:
+        metadata["stopped_container_ids"] = stopped_containers
     write_json(run_dir / "metadata.json", metadata)
     result = read_json(run_dir / "result.json")
     if result:
@@ -388,10 +606,91 @@ def prepare_job_for_resume(run_dir: Path) -> None:
         write_json(run_dir / "result.json", result)
 
 
-def resume_job(run_dir: Path) -> None:
+def set_job_resume_gpu(run_dir: Path, gpu_device: object | None) -> None:
+    """Retarget a paused/stopped worker job before resuming it."""
+    if gpu_device is None:
+        return
+    gpu_text = str(gpu_device).strip()
+    if not gpu_text:
+        return
+    queue_resource = gpu_queue_resource(gpu_text)
+
+    metadata = read_json(run_dir / "metadata.json")
+    metadata.pop("queue_lock_acquired", None)
+    metadata.pop("queue_shared_with_run_dir", None)
+    if queue_resource:
+        metadata["queue_resource"] = queue_resource
+    else:
+        metadata.pop("queue_resource", None)
+    metadata["updated_at"] = utc_now()
+    write_json(run_dir / "metadata.json", metadata)
+
+    input_path = run_dir / "input.json"
+    input_payload = read_json(input_path)
+    params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+    params["gpu_device"] = gpu_text
+    params["alphafast_gpu_device"] = gpu_text
+    if queue_resource:
+        params["queue_resource"] = queue_resource
+    else:
+        params.pop("queue_resource", None)
+    input_payload["params"] = params
+    write_json(input_path, input_payload)
+
+    worker_request_path = run_dir / "worker_request.json"
+    if worker_request_path.exists():
+        worker_request = read_json(worker_request_path)
+        kwargs = worker_request.get("kwargs") if isinstance(worker_request.get("kwargs"), dict) else {}
+        kwargs["gpu_device"] = gpu_text
+        kwargs["alphafast_gpu_device"] = gpu_text
+        kwargs["colabfold_gpu_device"] = gpu_text
+        validation_kwargs = kwargs.get("validation_kwargs") if isinstance(kwargs.get("validation_kwargs"), dict) else None
+        if validation_kwargs is not None:
+            validation_kwargs["gpu_device"] = gpu_text
+            validation_kwargs["alphafast_gpu_device"] = gpu_text
+            validation_kwargs["colabfold_gpu_device"] = gpu_text
+        # worker kwargs are passed directly to workflow functions; queue_resource
+        # belongs in metadata/input params and would be an unexpected kwarg.
+        kwargs.pop("queue_resource", None)
+        worker_request["kwargs"] = kwargs
+        write_json(worker_request_path, worker_request)
+
+
+def mark_job_for_artifact_resume(run_dir: Path) -> None:
+    """Make a worker request prefer completed artifacts after pause/stop/failure."""
+    input_path = run_dir / "input.json"
+    input_payload = read_json(input_path)
+    params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+    params["resume"] = True
+    input_payload["params"] = params
+    if input_payload:
+        write_json(input_path, input_payload)
+
+    worker_request_path = run_dir / "worker_request.json"
+    if not worker_request_path.exists():
+        return
+    worker_request = read_json(worker_request_path)
+    kind = str(worker_request.get("kind") or "")
+    kwargs = worker_request.get("kwargs") if isinstance(worker_request.get("kwargs"), dict) else {}
+    if kind in {"de_novo_binder_scoring_dataset", "candidate_refolding_evaluation"}:
+        kwargs["resume"] = True
+    elif kind == "sequence_design_pipeline":
+        kwargs["resume"] = True
+        validation_kwargs = kwargs.get("validation_kwargs") if isinstance(kwargs.get("validation_kwargs"), dict) else {}
+        if validation_kwargs:
+            validation_kwargs["resume"] = True
+            kwargs["validation_kwargs"] = validation_kwargs
+    kwargs.pop("queue_resource", None)
+    worker_request["kwargs"] = kwargs
+    write_json(worker_request_path, worker_request)
+
+
+def resume_job(run_dir: Path, *, gpu_device: object | None = None) -> None:
     """Queue a paused/stopped local-worker job again."""
     if not (run_dir / "worker_request.json").exists():
         raise FileNotFoundError(f"Job is not resumable because worker_request.json is missing: {run_dir}")
+    set_job_resume_gpu(run_dir, gpu_device)
+    mark_job_for_artifact_resume(run_dir)
     prepare_job_for_resume(run_dir)
     from mn_protein_design.core.local_worker import spawn_worker_for_run
 
@@ -414,6 +713,7 @@ def collect_jobs(task_group: str | None = None, *, include_hidden: bool = False)
             result = read_json(run_dir / "result.json")
             input_payload = read_json(run_dir / "input.json")
             input_params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+            warning = derive_job_warning(metadata, input_payload, result)
             queue_resource = (
                 _queue_resource_for(str(metadata.get("tool") or input_payload.get("tool", "")), input_params)
                 or metadata.get("queue_resource", "")
@@ -438,6 +738,8 @@ def collect_jobs(task_group: str | None = None, *, include_hidden: bool = False)
                     "queue_resource": queue_resource,
                     "current_phase": metadata.get("current_phase", ""),
                     "current_engine": metadata.get("current_engine", ""),
+                    "warning": warning,
+                    "warning_level": metadata.get("warning_level", "degraded" if warning else ""),
                     "campaign_name": metadata.get("campaign_name") or input_params.get("campaign_name", ""),
                     "campaign_id": metadata.get("campaign_id", ""),
                     "campaign_step": metadata.get("campaign_step", ""),

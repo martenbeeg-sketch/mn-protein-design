@@ -531,7 +531,87 @@ def _chain_roles(candidate: dict[str, Any]) -> tuple[str, str]:
 def _chain_role_groups(candidate: dict[str, Any]) -> tuple[list[str], list[str]]:
     binder_chains = [str(chain) for chain in candidate.get("binder_chains") or [] if str(chain)]
     target_chains = [str(chain) for chain in candidate.get("target_chains") or [] if str(chain)]
+    raw = candidate.get("raw_metadata") if isinstance(candidate.get("raw_metadata"), dict) else {}
+    role_payload = candidate.get("chain_roles")
+    if not isinstance(role_payload, dict):
+        role_payload = raw.get("chain_roles")
+    role_payload = role_payload if isinstance(role_payload, dict) else {}
+    roles = role_payload.get("roles")
+    roles = roles if isinstance(roles, dict) else {}
+    if not binder_chains:
+        binder_chains = [
+            str(chain) for chain in role_payload.get("binder_chains") or [] if str(chain)
+        ] or [str(chain) for chain, role in roles.items() if role == "binder"]
+    if not target_chains:
+        target_chains = [
+            str(chain) for chain in role_payload.get("target_chains") or [] if str(chain)
+        ] or [str(chain) for chain, role in roles.items() if role == "target"]
+    entity_target_chains = [
+        str(chain)
+        for chain in (
+            candidate.get("biological_target_chains")
+            or candidate.get("target_entity_chains")
+            or raw.get("biological_target_chains")
+            or raw.get("target_entity_chains")
+            or []
+        )
+        if str(chain)
+    ]
+    if entity_target_chains and not target_chains and not bool(raw.get("target_refolding")):
+        target_chains = entity_target_chains
+    if target_chains:
+        target_set = set(target_chains)
+        binder_chains = [chain for chain in binder_chains if chain not in target_set]
     return (binder_chains or ["A"], target_chains or ["B"])
+
+
+def _collapse_target_chains_for_ipsae(
+    structure: Path,
+    *,
+    binder_chain: str,
+    target_chains: list[str],
+) -> Path:
+    """Create a PDB scoring copy where target fragments form one chain group."""
+    target_group = [
+        chain for chain in dict.fromkeys(target_chains) if chain and chain != binder_chain
+    ]
+    if not structure.exists() or structure.suffix.lower() != ".pdb" or len(target_group) <= 1:
+        return structure
+
+    merged_chain = target_group[0]
+    merged = structure.with_name(
+        f"{structure.stem}_targetgroup_{merged_chain}{structure.suffix}"
+    )
+    lines: list[str] = []
+    residue_numbers: dict[tuple[str, str, str, str], int] = {}
+    next_residue = 1
+    changed = False
+    for line in structure.read_text(errors="ignore").splitlines(keepends=True):
+        record = line[:6].strip()
+        source_chain = line[21].strip() if len(line) > 21 else ""
+        if record in {"ATOM", "HETATM"} and source_chain in target_group:
+            residue_key = (
+                source_chain,
+                line[22:26].strip(),
+                line[26:27],
+                line[17:20],
+            )
+            if residue_key not in residue_numbers:
+                residue_numbers[residue_key] = next_residue
+                next_residue += 1
+            line = (
+                f"{line[:21]}{merged_chain[:1]}"
+                f"{residue_numbers[residue_key]:4d}{line[26:]}"
+            )
+            changed = True
+        elif record in {"TER", "ANISOU"} and source_chain in target_group:
+            line = f"{line[:21]}{merged_chain[:1]}{line[22:]}"
+            changed = True
+        lines.append(line)
+    if changed:
+        merged.write_text("".join(lines), encoding="utf-8")
+        return merged
+    return structure
 
 
 def _distance(left: tuple[float, float, float], right: tuple[float, float, float]) -> float:
@@ -606,7 +686,8 @@ def _run_ipsae(source_run_dir: Path, run_dir: Path, candidates: list[dict[str, A
     for candidate in candidates:
         safe_id = _safe_id(candidate)
         metrics = dict(candidate.get("metrics") or {})
-        binder_chain, target_chain = _chain_roles(candidate)
+        binder_chains, target_chains = _chain_role_groups(candidate)
+        binder_chain, target_chain = binder_chains[0], target_chains[0]
         structure_path = _resolve_path(source_run_dir, candidate.get("complex_pdb"))
         pae_path = _find_pae_path(source_run_dir, candidate, structure_path)
         staged_dir = input_dir / safe_id
@@ -626,6 +707,11 @@ def _run_ipsae(source_run_dir: Path, run_dir: Path, candidates: list[dict[str, A
         staged_pae = staged_dir / pae_path.name
         shutil.copy2(structure_path, staged_structure)
         shutil.copy2(pae_path, staged_pae)
+        staged_structure = _collapse_target_chains_for_ipsae(
+            staged_structure,
+            binder_chain=binder_chain,
+            target_chains=target_chains,
+        )
         engine, pae_format = _ipsae_engine(candidate, staged_pae)
         full_runner = Path(IPSAE_FULL_RUNNER)
         if full_runner.exists() and staged_pae.suffix.lower() == ".json" and staged_structure.suffix.lower() == ".pdb":
@@ -709,6 +795,12 @@ def _run_ipsae(source_run_dir: Path, run_dir: Path, candidates: list[dict[str, A
         pae_path = _find_pae_path(source_run_dir, candidate, structure_path)
         if structure_path:
             staged_structure = input_dir / safe_id / structure_path.name
+            binder_chains, target_chains = _chain_role_groups(candidate)
+            staged_structure = _collapse_target_chains_for_ipsae(
+                staged_structure,
+                binder_chain=binder_chains[0],
+                target_chains=target_chains,
+            )
         row_metrics = _parse_ipsae_row(row_path) if row_path.exists() else {}
         summary_metrics: dict[str, Any] = {}
         if staged_structure and staged_structure.exists():
@@ -827,7 +919,36 @@ def _passes_thresholds(row: dict[str, Any], thresholds: dict[str, float]) -> tup
     return not failures, failures
 
 
-def build_analysis_table(candidates: list[dict[str, Any]], thresholds: dict[str, float] | None = None) -> pd.DataFrame:
+def _analysis_attempt_key(candidate: dict[str, Any]) -> str:
+    raw = candidate.get("raw_metadata") if isinstance(candidate.get("raw_metadata"), dict) else {}
+    source_candidate = raw.get("source_candidate") if isinstance(raw.get("source_candidate"), dict) else None
+    if source_candidate:
+        return _analysis_attempt_key(source_candidate)
+    for key in ("source_candidate_id", "sequence_refinement_parent_id"):
+        value = raw.get(key)
+        if value:
+            return str(value)
+    parents = [str(parent) for parent in candidate.get("parents") or [] if str(parent)]
+    if parents:
+        return parents[0]
+    return str(candidate.get("candidate_id") or "")
+
+
+def _ranking_sort_columns(metric: str) -> tuple[list[str], list[bool]]:
+    metric = str(metric or "analysis_score")
+    if metric in {"binder_rmsd", "monomer_rmsd", "ipae", "ipde"}:
+        return ["passes_filters", metric, "analysis_score"], [False, True, False]
+    if metric == "analysis_score":
+        return ["passes_filters", "analysis_score"], [False, False]
+    return ["passes_filters", metric, "analysis_score"], [False, False, False]
+
+
+def build_analysis_table(
+    candidates: list[dict[str, Any]],
+    thresholds: dict[str, float] | None = None,
+    *,
+    ranking_metric: str = "analysis_score",
+) -> pd.DataFrame:
     thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
     rows: list[dict[str, Any]] = []
     for source_index, candidate in enumerate(candidates):
@@ -841,6 +962,7 @@ def build_analysis_table(candidates: list[dict[str, Any]], thresholds: dict[str,
             "binder_sequence": candidate.get("binder_sequence"),
             "parent_count": len(candidate.get("parents") or []),
             "metric_count": len(flat_metrics),
+            "attempt_key": _analysis_attempt_key(candidate),
         }
         for metric in METRIC_ALIASES:
             if metric == "ipde":
@@ -868,7 +990,10 @@ def build_analysis_table(candidates: list[dict[str, Any]], thresholds: dict[str,
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    return df.sort_values(["passes_filters", "analysis_score"], ascending=[False, False]).reset_index(drop=True)
+    sort_cols, ascending = _ranking_sort_columns(ranking_metric)
+    sort_cols = [col for col in sort_cols if col in df.columns]
+    ascending = ascending[: len(sort_cols)]
+    return df.sort_values(sort_cols or ["passes_filters", "analysis_score"], ascending=ascending or [False, False]).reset_index(drop=True)
 
 
 def _summary_payload(df: pd.DataFrame, thresholds: dict[str, float]) -> dict[str, Any]:
@@ -898,6 +1023,8 @@ def run_analysis_contract(
     candidates_jsonl: Path,
     tool: str = "ranking",
     keep_top_n: int = 100,
+    keep_per_attempt: int | None = None,
+    ranking_metric: str = "analysis_score",
     thresholds: dict[str, float] | None = None,
 ) -> Path:
     source_run_dir = Path(source_run_dir)
@@ -916,7 +1043,13 @@ def run_analysis_contract(
         job_type="analysis",
         tool=tool,
         inputs={"source_run_dir": str(source_run_dir), "candidates_jsonl": str(candidates_jsonl)},
-        params={"keep_top_n": keep_top_n, "thresholds": {**DEFAULT_THRESHOLDS, **(thresholds or {})}, "backend": "internal"},
+        params={
+            "keep_top_n": keep_top_n,
+            "keep_per_attempt": keep_per_attempt,
+            "ranking_metric": ranking_metric,
+            "thresholds": {**DEFAULT_THRESHOLDS, **(thresholds or {})},
+            "backend": "internal",
+        },
     )
     inherited_metadata = {
         "campaign_name": source_metadata.get("campaign_name") or "",
@@ -940,7 +1073,7 @@ def run_analysis_contract(
     analysis_dir.mkdir(parents=True, exist_ok=True)
     source_candidates = _run_ipsae(source_run_dir, job.run_dir, source_candidates)
     source_candidates = _add_hotspot_metrics(source_run_dir, source_candidates)
-    df = build_analysis_table(source_candidates, thresholds)
+    df = build_analysis_table(source_candidates, thresholds, ranking_metric=ranking_metric)
     df.insert(0, "analysis_rank", range(1, len(df) + 1))
     ranked_csv = analysis_dir / "ranked_candidates.csv"
     pass_fail_csv = analysis_dir / "pass_fail_counts.csv"
@@ -951,11 +1084,17 @@ def run_analysis_contract(
     summary = _summary_payload(df, thresholds)
     write_json(summary_json, summary)
 
+    ranked_df = df
+    if not ranked_df.empty and keep_per_attempt is not None:
+        ranked_df = ranked_df.groupby("attempt_key", group_keys=False).head(max(1, int(keep_per_attempt)))
+    if not ranked_df.empty:
+        ranked_df = ranked_df.head(max(1, int(keep_top_n)))
+
     ranked = source_candidates if df.empty else [
         source_candidates[int(source_index)]
-        for source_index in df["source_index"].head(max(1, int(keep_top_n))).tolist()
+        for source_index in ranked_df["source_index"].tolist()
     ]
-    ranked_rows = df.head(max(1, int(keep_top_n))).to_dict(orient="records") if not df.empty else []
+    ranked_rows = ranked_df.to_dict(orient="records") if not ranked_df.empty else []
     candidates: list[dict[str, Any]] = []
     for rank, source in enumerate(ranked, start=1):
         row = ranked_rows[rank - 1] if rank - 1 < len(ranked_rows) else {}
@@ -964,6 +1103,9 @@ def run_analysis_contract(
             {
                 "analysis_rank": rank,
                 "analysis_score": row.get("analysis_score"),
+                "analysis_ranking_metric": ranking_metric,
+                "analysis_attempt_key": row.get("attempt_key"),
+                "analysis_keep_per_attempt": keep_per_attempt,
                 "passes_filters": row.get("passes_filters"),
                 "filter_failures": row.get("filter_failures"),
                 "analysis_backend": "internal",

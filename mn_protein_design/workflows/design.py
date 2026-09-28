@@ -5,6 +5,7 @@ import csv
 import gzip
 import hashlib
 import json
+import random
 import re
 import shlex
 import shutil
@@ -25,6 +26,7 @@ from mn_protein_design.core.hotspot_metrics import calculate_hotspot_metrics, pa
 from mn_protein_design.core.jobs import collect_jobs, create_job, finish_job, read_json, update_status, write_json
 from mn_protein_design.core.manifests import load_manifest
 from mn_protein_design.core.structures import filter_pdb_text, pdb_summary
+from mn_protein_design.runtime import reference_root
 from mn_protein_design.workflows.target_msa import (
     ensure_boltz_msas_for_target as _shared_ensure_boltz_msas_for_target,
     ensure_pxdesign_msa_dirs_for_target,
@@ -32,6 +34,10 @@ from mn_protein_design.workflows.target_msa import (
 
 
 DESIGN_GROUP = "design"
+RFDIFFUSION_SCAFFOLD_LIBRARY_CONTAINER_DIR = "/models/ppi_scaffolds"
+RFDIFFUSION_BUNDLED_SCAFFOLD_TAR = (
+    Path(__file__).resolve().parents[2] / "tools_to_implement" / "RFdiffusion" / "examples" / "ppi_scaffolds_subset.tar.gz"
+)
 AA3_TO_1 = {
     "ALA": "A",
     "ARG": "R",
@@ -56,15 +62,74 @@ AA3_TO_1 = {
 }
 
 
-def prepared_design_targets() -> list[dict]:
-    from mn_protein_design.workflows.detection import completed_target_jobs
+def rfdiffusion_scaffold_library_status(scaffold_dir: Path | None = None) -> dict:
+    scaffold_dir = scaffold_dir or reference_root() / "rfdiffusion_models" / "ppi_scaffolds"
+    ss_files = sorted(scaffold_dir.glob("*_ss.pt")) if scaffold_dir.exists() else []
+    adj_files = sorted(scaffold_dir.glob("*_adj.pt")) if scaffold_dir.exists() else []
+    return {
+        "path": str(scaffold_dir),
+        "exists": scaffold_dir.exists(),
+        "ss_count": len(ss_files),
+        "adj_count": len(adj_files),
+        "ready": bool(ss_files and adj_files),
+        "bundled_tar": str(RFDIFFUSION_BUNDLED_SCAFFOLD_TAR),
+        "bundled_tar_exists": RFDIFFUSION_BUNDLED_SCAFFOLD_TAR.exists(),
+    }
 
-    return completed_target_jobs()
+
+def prepare_rfdiffusion_scaffold_library(scaffold_dir: Path | None = None) -> dict:
+    import tarfile
+
+    scaffold_dir = scaffold_dir or reference_root() / "rfdiffusion_models" / "ppi_scaffolds"
+    status = rfdiffusion_scaffold_library_status(scaffold_dir)
+    if status["ready"]:
+        return status
+    if not RFDIFFUSION_BUNDLED_SCAFFOLD_TAR.exists():
+        raise FileNotFoundError(
+            f"Bundled RFdiffusion scaffold archive not found: {RFDIFFUSION_BUNDLED_SCAFFOLD_TAR}"
+        )
+    scaffold_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(RFDIFFUSION_BUNDLED_SCAFFOLD_TAR, "r:gz") as archive:
+        parent = scaffold_dir.parent.resolve()
+        for member in archive.getmembers():
+            target = (scaffold_dir.parent / member.name).resolve()
+            if parent != target and parent not in target.parents:
+                raise ValueError(f"Unsafe path in RFdiffusion scaffold archive: {member.name}")
+        archive.extractall(scaffold_dir.parent)
+    return rfdiffusion_scaffold_library_status(scaffold_dir)
+
+
+def rfdiffusion_scaffold_ids(scaffold_dir: Path | None = None) -> list[str]:
+    scaffold_dir = scaffold_dir or reference_root() / "rfdiffusion_models" / "ppi_scaffolds"
+    if not scaffold_dir.exists():
+        return []
+    return sorted(path.name[: -len("_ss.pt")] for path in scaffold_dir.glob("*_ss.pt"))
+
+
+def random_rfdiffusion_scaffold_id(scaffold_dir: Path | None = None) -> str:
+    scaffold_ids = rfdiffusion_scaffold_ids(scaffold_dir)
+    if not scaffold_ids:
+        raise RuntimeError("RFdiffusion scaffold-guided mode has no scaffold *_ss.pt files to choose from.")
+    return random.choice(scaffold_ids)
+
+
+def _has_rfdiffusion_scaffold_list_override(run_parameters: str) -> bool:
+    return bool(re.search(r"(?:^|\s)\+{0,2}scaffoldguided\.scaffold_list=", run_parameters))
+
+
+def prepared_design_targets() -> list[dict]:
+    """Return every target structure that can be staged for binder design."""
+    from mn_protein_design.workflows.detection import ppi_target_jobs
+
+    return ppi_target_jobs()
 
 
 def target_label(row: dict) -> str:
     chains = ",".join(row.get("chains") or [])
-    return f"{row['target_name']} ({row['job_code']}, chains {chains or 'unknown'})"
+    source = str(row.get("source_category") or row.get("prepared_kind") or "target")
+    provenance = str(row.get("source_label") or row.get("tool") or "").strip()
+    provenance_text = f", source {provenance}" if provenance else ""
+    return f"{row['target_name']} [{source}] ({row['job_code']}, chains {chains or 'unknown'}{provenance_text})"
 
 
 def design_jobs_for_target(target_pdb: Path) -> list[dict]:
@@ -164,6 +229,34 @@ def validate_rfdiffusion_optional_params(contigmap_length: str = "", inpaint_seq
                 raise ValueError("contigmap.inpaint_seq should look like A10-20/A22/B30-40.")
 
 
+def build_rfdiffusion_scaffoldguided_parameters(
+    enabled: bool,
+    scaffold_dir: str = RFDIFFUSION_SCAFFOLD_LIBRARY_CONTAINER_DIR,
+    target_pdb: bool = True,
+    target_path: str = "",
+    target_ss: str = "",
+    target_adj: str = "",
+) -> str:
+    if not enabled:
+        return ""
+    scaffold_dir = str(scaffold_dir or RFDIFFUSION_SCAFFOLD_LIBRARY_CONTAINER_DIR).strip().rstrip("/")
+    if not scaffold_dir:
+        raise ValueError("RFdiffusion scaffold-guided mode requires a scaffold directory.")
+    parts = [
+        "++scaffoldguided.scaffoldguided=True",
+        f"++scaffoldguided.scaffold_dir={scaffold_dir}/",
+    ]
+    if target_pdb:
+        parts.append("++scaffoldguided.target_pdb=True")
+    if target_path.strip():
+        parts.append(f"++scaffoldguided.target_path={target_path.strip()}")
+    if target_ss.strip():
+        parts.append(f"++scaffoldguided.target_ss={target_ss.strip()}")
+    if target_adj.strip():
+        parts.append(f"++scaffoldguided.target_adj={target_adj.strip()}")
+    return " ".join(parts)
+
+
 def build_rfdiffusion_run_parameters(
     timesteps: int,
     partial_diffusion: bool = False,
@@ -173,6 +266,12 @@ def build_rfdiffusion_run_parameters(
     deterministic: bool = False,
     noise_scale_ca: str = "",
     noise_scale_frame: str = "",
+    scaffoldguided: bool = False,
+    scaffold_dir: str = RFDIFFUSION_SCAFFOLD_LIBRARY_CONTAINER_DIR,
+    scaffold_target_pdb: bool = True,
+    scaffold_target_path: str = "",
+    scaffold_target_ss: str = "",
+    scaffold_target_adj: str = "",
     extra_run_parameters: str = "",
 ) -> str:
     validate_rfdiffusion_optional_params(contigmap_length, inpaint_seq)
@@ -192,6 +291,16 @@ def build_rfdiffusion_run_parameters(
         parts.append(f"denoiser.noise_scale_ca={noise_scale_ca.strip()}")
     if noise_scale_frame.strip():
         parts.append(f"denoiser.noise_scale_frame={noise_scale_frame.strip()}")
+    scaffoldguided_parameters = build_rfdiffusion_scaffoldguided_parameters(
+        scaffoldguided,
+        scaffold_dir=scaffold_dir,
+        target_pdb=scaffold_target_pdb,
+        target_path=scaffold_target_path,
+        target_ss=scaffold_target_ss,
+        target_adj=scaffold_target_adj,
+    )
+    if scaffoldguided_parameters:
+        parts.append(scaffoldguided_parameters)
     if extra_run_parameters.strip():
         parts.append(extra_run_parameters.strip())
     return " ".join(parts)
@@ -226,6 +335,7 @@ def _bindcraft_advanced_settings(
     max_trajectories: int,
     num_seqs_override: int | None = None,
     max_mpnn_sequences_override: int | None = None,
+    enable_mpnn: bool = True,
 ) -> dict:
     settings = _read_json_file(_ovo_bindcraft_resource("settings_advanced", settings_file))
     settings.update(
@@ -237,6 +347,7 @@ def _bindcraft_advanced_settings(
             "remove_unrelaxed_trajectory": False,
             "remove_unrelaxed_complex": False,
             "remove_binder_monomer": False,
+            "enable_mpnn": bool(enable_mpnn),
             "af_params_dir": "alphafold_models_path",
         }
     )
@@ -269,6 +380,7 @@ def _copy_bindcraft_settings(run_dir: Path, params: dict) -> None:
             params["max_trajectories"],
             params.get("num_seqs_override"),
             params.get("max_mpnn_sequences_override"),
+            bool(params.get("enable_mpnn", True)),
         ),
     )
     filters_path = _ovo_bindcraft_resource("settings_filters", params["filter_settings"])
@@ -310,7 +422,10 @@ def _normalize_bindcraft_candidates(run_dir: Path, params: dict, target_artifact
     output_dir = run_dir / "artifacts" / "raw" / "bindcraft" / "output"
     stats = _read_bindcraft_stats(output_dir)
     pdb_by_design: dict[str, Path] = {}
-    for pattern in ["Accepted/*.pdb"]:
+    patterns = ["Accepted/*.pdb"]
+    if not bool(params.get("enable_mpnn", True)):
+        patterns.extend(["Trajectory/Relaxed/*.pdb", "Trajectory/*.pdb"])
+    for pattern in patterns:
         for pdb_path in sorted(output_dir.glob(pattern)):
             pdb_by_design.setdefault(pdb_path.stem, pdb_path)
     candidates: list[dict] = []
@@ -319,6 +434,9 @@ def _normalize_bindcraft_candidates(run_dir: Path, params: dict, target_artifact
         metrics = _bindcraft_stats_for_design(stats, design_name)
         trajectory_name = re.sub(r"_mpnn\d+(?:_model\d+)?$", "", design_name)
         trajectory_path = output_dir / "Trajectory" / f"{trajectory_name}.pdb"
+        output_kind = pdb_path.parent.name
+        is_generator_trajectory = output_kind in {"Trajectory", "Relaxed"}
+        result_kind = "generator_trajectory" if is_generator_trajectory else "native_pipeline"
         binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
             target_artifact,
             pdb_path,
@@ -338,7 +456,9 @@ def _normalize_bindcraft_candidates(run_dir: Path, params: dict, target_artifact
             {
                 "candidate_id": f"bindcraft_{index:05d}",
                 "source_tool": "bindcraft",
-                "stage": STAGE_COMPLEX_REFOLDING,
+                "stage": STAGE_GENERATION_BACKBONE_SEQUENCE
+                if is_generator_trajectory
+                else STAGE_COMPLEX_REFOLDING,
                 "target_pdb": target_path,
                 "complex_pdb": complex_path,
                 "binder_pdb": None,
@@ -350,16 +470,16 @@ def _normalize_bindcraft_candidates(run_dir: Path, params: dict, target_artifact
                 "contig": None,
                 "metrics": {
                     **metrics,
-                    "complex_refolding_backend": "bindcraft",
-                    "result_kind": "native_pipeline",
+                    "complex_refolding_backend": "bindcraft" if not is_generator_trajectory else "",
+                    "result_kind": result_kind,
                     "target_chain_inference": chain_inference,
                 },
                 "raw_metadata": {
-                    "result_kind": "native_pipeline",
+                    "result_kind": result_kind,
                     "bindcraft_design": design_name,
                     "input_target_chains": params.get("target_chains", []),
                     "target_chain_inference": chain_inference,
-                    "bindcraft_output_kind": pdb_path.parent.name,
+                    "bindcraft_output_kind": output_kind,
                     "design_reference_pdb": _rel_path(run_dir, trajectory_path)
                     if trajectory_path.exists()
                     else None,
@@ -1424,7 +1544,11 @@ def _normalize_pxdesign_generation_candidates(
     write_output: bool = True,
 ) -> list[dict]:
     raw_dir = run_dir / "artifacts" / "raw" / "pxdesign" / "output"
-    structure_paths = sorted(path for path in raw_dir.glob("**/*.cif") if path.is_file())
+    structure_paths = sorted(
+        path
+        for path in raw_dir.glob("**/*.cif")
+        if path.is_file() and not (path.parent == raw_dir and path.name.lower() in {"target.cif", "target_binder.cif"})
+    )
     candidates: list[dict] = []
     for index, structure_path in enumerate(structure_paths, start=1):
         binder_chains, target_chains, chain_inference = _infer_generated_chain_roles(
@@ -1606,7 +1730,10 @@ def _normalize_proteina_complexa_candidates(run_dir: Path, params: dict, target_
         )
     raw_candidates: list[dict] = []
     inference_root = run_dir / "artifacts" / "raw" / "proteina_complexa" / "inference"
+    raw_limit = int(params.get("num_designs") or 0) if bool(params.get("generator_only", False)) else 0
     for structure_path in sorted(inference_root.glob("**/job_*/*.pdb")):
+        if raw_limit and len(raw_candidates) >= raw_limit:
+            break
         if structure_path.name.endswith("_binder.pdb") or structure_path.name.endswith("_updated.pdb"):
             continue
         index = len(raw_candidates) + 1
@@ -1642,6 +1769,8 @@ def _normalize_proteina_complexa_candidates(run_dir: Path, params: dict, target_
                 },
             }
         )
+    if bool(params.get("generator_only", False)):
+        return write_candidates(run_dir, "proteina_complexa", raw_candidates)
     merged = _merge_candidate_pools(
         tool="proteina_complexa",
         native_candidates=candidates,
@@ -2313,6 +2442,11 @@ def _rfdiffusion_pipeline_payload(
     num_designs: int,
     final_run_parameters: str,
     rfdiffusion_guidance_preset: str,
+    scaffoldguided: bool,
+    scaffold_dir: str,
+    scaffold_target_pdb: bool,
+    scaffold_target_ss: str,
+    scaffold_target_adj: str,
     backbone_filters: str,
     apply_backbone_hotspot_prefilter: bool,
     backbone_min_hotspot_contact_fraction: float,
@@ -2345,6 +2479,11 @@ def _rfdiffusion_pipeline_payload(
         "rfdiffusion_contig": contig,
         "rfdiffusion_guidance_preset": rfdiffusion_guidance_preset,
         "rfdiffusion_run_parameters": final_run_parameters,
+        "scaffoldguided": scaffoldguided,
+        "scaffold_dir": scaffold_dir,
+        "scaffold_target_pdb": scaffold_target_pdb,
+        "scaffold_target_ss": scaffold_target_ss.strip(),
+        "scaffold_target_adj": scaffold_target_adj.strip(),
         "hotspot": hotspots,
         "backbone_filters": backbone_filters.strip() or "none",
         "backbone_hotspot_prefilter": {
@@ -2393,6 +2532,12 @@ def run_rfdiffusion_classic(
     deterministic: bool = False,
     noise_scale_ca: str = "",
     noise_scale_frame: str = "",
+    scaffoldguided: bool = False,
+    scaffold_dir: str = RFDIFFUSION_SCAFFOLD_LIBRARY_CONTAINER_DIR,
+    scaffold_target_pdb: bool = True,
+    scaffold_target_path: str = "",
+    scaffold_target_ss: str = "",
+    scaffold_target_adj: str = "",
     save_trajectory: bool = False,
     editable_run_parameters: str = "",
     edited_target_pdb_text: str | None = None,
@@ -2401,7 +2546,7 @@ def run_rfdiffusion_classic(
     mpnn_omit_aa: str = "CX",
     mpnn_bias_aa: str = "",
     mpnn_run_parameters: str = "",
-    sequence_design_method: str = "ligandmpnn",
+    sequence_design_method: str = "protein_mpnn",
     mpnn_fastrelax_cycles: int = 0,
     refolding_test: str = "af2_model_1_multimer_tt_3rec",
     execution_backend: str = "docker",
@@ -2412,9 +2557,19 @@ def run_rfdiffusion_classic(
     complex_multimer: bool = True,
     complex_num_recycles: int = 3,
     analysis_keep_top_n: int = 100,
+    analysis_keep_per_attempt: int | None = None,
+    analysis_rank_metric: str = "analysis_score",
     analysis_thresholds: dict[str, float] | None = None,
     gpu_device: object = "0",
 ) -> Path:
+    sequence_design_method = {
+        "ligandmpnn": "protein_mpnn",
+        "proteinmpnn": "protein_mpnn",
+        "protein_mpnn": "protein_mpnn",
+        "ligand_mpnn": "ligand_mpnn",
+        "soluble_mpnn": "soluble_mpnn",
+        "solublempnn": "soluble_mpnn",
+    }.get(str(sequence_design_method), "protein_mpnn")
     hotspots = normalize_hotspots(hotspots) if hotspots else ""
     validate_rfdiffusion_inputs(contig, hotspots, binder_length, num_designs, timesteps)
     validate_rfdiffusion_optional_params(contigmap_length, inpaint_seq)
@@ -2428,8 +2583,58 @@ def run_rfdiffusion_classic(
         deterministic=deterministic,
         noise_scale_ca=noise_scale_ca,
         noise_scale_frame=noise_scale_frame,
+        scaffoldguided=scaffoldguided,
+        scaffold_dir=scaffold_dir,
+        scaffold_target_pdb=scaffold_target_pdb,
+        scaffold_target_path=scaffold_target_path,
+        scaffold_target_ss=scaffold_target_ss,
+        scaffold_target_adj=scaffold_target_adj,
         extra_run_parameters=extra_run_parameters,
     )
+    scaffold_selection: dict[str, object] = {}
+    if scaffoldguided:
+        scaffold_status = prepare_rfdiffusion_scaffold_library()
+        if not scaffold_status.get("ready"):
+            raise RuntimeError(
+                "RFdiffusion scaffold-guided mode was requested, but the scaffold library is not ready "
+                f"at {scaffold_status.get('path')}."
+            )
+        if "scaffoldguided.scaffoldguided" not in final_run_parameters:
+            final_run_parameters = " ".join(
+                [
+                    final_run_parameters,
+                    build_rfdiffusion_scaffoldguided_parameters(
+                        True,
+                        scaffold_dir=scaffold_dir,
+                        target_pdb=scaffold_target_pdb,
+                        target_path=scaffold_target_path,
+                        target_ss=scaffold_target_ss,
+                        target_adj=scaffold_target_adj,
+                    ),
+                ]
+            ).strip()
+        if scaffold_target_pdb and not re.search(r"(?:^|\s)\+{0,2}scaffoldguided\.target_path=", final_run_parameters):
+            final_run_parameters = " ".join(
+                [final_run_parameters, "++scaffoldguided.target_path=/work/artifacts/input/target.pdb"]
+            ).strip()
+        if _has_rfdiffusion_scaffold_list_override(final_run_parameters):
+            scaffold_selection = {
+                "mode": "manual_or_editable_scaffold_list",
+                "scaffold_dir": scaffold_dir.strip() or RFDIFFUSION_SCAFFOLD_LIBRARY_CONTAINER_DIR,
+            }
+        else:
+            selected_scaffold_id = random_rfdiffusion_scaffold_id(Path(scaffold_status["path"]))
+            final_run_parameters = " ".join(
+                [final_run_parameters, f"++scaffoldguided.scaffold_list=[{selected_scaffold_id}]"]
+            ).strip()
+            scaffold_selection = {
+                "mode": "random_single_scaffold",
+                "scaffold_id": selected_scaffold_id,
+                "scaffold_dir": scaffold_dir.strip() or RFDIFFUSION_SCAFFOLD_LIBRARY_CONTAINER_DIR,
+                "host_scaffold_dir": scaffold_status.get("path"),
+                "ss_file": f"{selected_scaffold_id}_ss.pt",
+                "adj_file": f"{selected_scaffold_id}_adj.pt",
+            }
     params = {
         "target_chains": target_chains,
         "campaign_name": campaign_name.strip(),
@@ -2452,6 +2657,15 @@ def run_rfdiffusion_classic(
         "deterministic": deterministic,
         "noise_scale_ca": noise_scale_ca.strip(),
         "noise_scale_frame": noise_scale_frame.strip(),
+        "scaffoldguided": scaffoldguided,
+        "scaffold_dir": scaffold_dir.strip(),
+        "scaffold_target_pdb": scaffold_target_pdb,
+        "scaffold_target_path": scaffold_target_path.strip(),
+        "scaffold_target_ss": scaffold_target_ss.strip(),
+        "scaffold_target_adj": scaffold_target_adj.strip(),
+        "scaffold_selection": scaffold_selection,
+        "scaffold_selection_mode": scaffold_selection.get("mode", ""),
+        "scaffold_id": scaffold_selection.get("scaffold_id", ""),
         "save_trajectory": save_trajectory,
         "rfdiffusion_run_parameters": final_run_parameters,
         "mpnn_num_sequences": mpnn_num_sequences,
@@ -2470,6 +2684,8 @@ def run_rfdiffusion_classic(
         "complex_multimer": complex_multimer,
         "complex_num_recycles": complex_num_recycles,
         "analysis_keep_top_n": analysis_keep_top_n,
+        "analysis_keep_per_attempt": analysis_keep_per_attempt,
+        "analysis_rank_metric": analysis_rank_metric,
         "analysis_thresholds": analysis_thresholds or {},
         "gpu_device": normalize_gpu_device(gpu_device),
         "pipeline_mode": "mn_protein_design_rfdiffusion",
@@ -2499,6 +2715,11 @@ def run_rfdiffusion_classic(
         num_designs=num_designs,
         final_run_parameters=final_run_parameters,
         rfdiffusion_guidance_preset=rfdiffusion_guidance_preset,
+        scaffoldguided=scaffoldguided,
+        scaffold_dir=scaffold_dir,
+        scaffold_target_pdb=scaffold_target_pdb,
+        scaffold_target_ss=scaffold_target_ss,
+        scaffold_target_adj=scaffold_target_adj,
         backbone_filters=backbone_filters,
         apply_backbone_hotspot_prefilter=apply_backbone_hotspot_prefilter,
         backbone_min_hotspot_contact_fraction=backbone_min_hotspot_contact_fraction,
@@ -2513,6 +2734,10 @@ def run_rfdiffusion_classic(
         refolding_test=refolding_test,
     )
     write_json(pipeline_dir / "mn_rfdiffusion_pipeline_params.json", pipeline_payload)
+    if scaffold_selection:
+        pipeline_payload["scaffold_selection"] = scaffold_selection
+        write_json(pipeline_dir / "mn_rfdiffusion_pipeline_params.json", pipeline_payload)
+        write_json(pipeline_dir / "rfdiffusion_scaffold_selection.json", scaffold_selection)
     (pipeline_dir / "rfdiffusion_run_parameters.txt").write_text(final_run_parameters + "\n")
     (pipeline_dir / "rfdiffusion_contig.txt").write_text(contig + "\n")
     (pipeline_dir / "hotspots.txt").write_text(hotspots + "\n")
@@ -2520,6 +2745,7 @@ def run_rfdiffusion_classic(
     hotspot_arg = f' "ppi.hotspot_res=[{hotspots}]"' if hotspots else ""
     traj_arg = "true" if save_trajectory else "false"
     shell_run_parameters = _hydra_overrides_for_bash(final_run_parameters)
+    rfdiffusion_models_dir = reference_root() / "rfdiffusion_models"
     script = (
         "set -euxo pipefail; "
         "rm -rf /work/artifacts/raw/rfdiffusion/output; "
@@ -2580,6 +2806,8 @@ def run_rfdiffusion_classic(
                     str(save_trajectory).lower(),
                     "--rfdiffusion_run_parameters",
                     shlex.quote(final_run_parameters),
+                    "--rfdiffusion_models_dir",
+                    shlex.quote(str(rfdiffusion_models_dir)),
                 ]
             ),
         ]
@@ -2593,7 +2821,7 @@ def run_rfdiffusion_classic(
             "-v",
             f"{job.run_dir}:/work",
             "-v",
-            "/mnt/db/reference_files/rfdiffusion_models:/models:ro",
+            f"{rfdiffusion_models_dir}:/models:ro",
             "-w",
             "/work",
             manifest["image"],
@@ -2649,6 +2877,8 @@ def run_rfdiffusion_classic(
                 "tool": "ranking",
                 "params": {
                     "keep_top_n": int(analysis_keep_top_n),
+                    "keep_per_attempt": analysis_keep_per_attempt,
+                    "ranking_metric": analysis_rank_metric,
                     "thresholds": thresholds,
                 },
             },
@@ -3123,14 +3353,38 @@ def run_boltzgen(
         for chain_id, residues in residues_by_chain.items()
     }
     binding_by_chain: dict[str, list[str]] = {}
+    boltzgen_hotspot_map: dict[str, str] = {}
+    unmapped_hotspots: list[str] = []
     for token in hotspots.split(",") if hotspots else []:
         if not token:
             continue
         chain_id = token[0]
-        residue_number = int(token[1:])
+        try:
+            residue_number = int(token[1:])
+        except ValueError:
+            unmapped_hotspots.append(token)
+            continue
         chain_local_index = residue_index_by_chain.get(chain_id, {}).get(residue_number)
         if chain_local_index is not None:
-            binding_by_chain.setdefault(chain_id, []).append(str(chain_local_index))
+            mapped = str(chain_local_index)
+            binding_by_chain.setdefault(chain_id, []).append(mapped)
+            boltzgen_hotspot_map[token] = f"{chain_id}{mapped}"
+        else:
+            unmapped_hotspots.append(token)
+    params["boltzgen_hotspot_map"] = boltzgen_hotspot_map
+    params["boltzgen_binding_by_chain"] = binding_by_chain
+    params["unmapped_hotspots"] = unmapped_hotspots
+    write_json(job.run_dir / "input.json", {"inputs": {"target_pdb": str(target_pdb), "target_chains": target_chains}, "params": params})
+    write_json(
+        raw_dir / "input" / "hotspot_mapping.json",
+        {
+            "requested_hotspots": [token for token in hotspots.split(",") if token],
+            "mapped_hotspots": boltzgen_hotspot_map,
+            "binding_by_chain": binding_by_chain,
+            "unmapped_hotspots": unmapped_hotspots,
+            "mapping_contract": "PDB residue number -> BoltzGen chain-local residue index",
+        },
+    )
     spec = [
         "entities:",
         "  - protein:",
@@ -4017,6 +4271,7 @@ def run_proteina_complexa(
     seed: int = 5,
     batch_size: int = 1,
     gpu_device: object = "0",
+    generator_only: bool = False,
 ) -> Path:
     if not target_chains:
         raise ValueError("At least one target chain is required.")
@@ -4050,6 +4305,7 @@ def run_proteina_complexa(
         "batch_size": batch_size,
         "gpu_device": normalize_gpu_device(gpu_device),
         "contract": "search_binder_local_pipeline",
+        "generator_only": bool(generator_only),
     }
     job = create_job(DESIGN_GROUP, "design_campaign", "proteina_complexa", {"target_pdb": str(target_pdb), "target_chains": target_chains}, params)
     if campaign_name.strip():

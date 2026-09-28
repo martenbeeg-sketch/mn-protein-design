@@ -5,21 +5,23 @@ from pathlib import Path
 
 from mn_protein_design.core.gpu import docker_gpu_args
 from mn_protein_design.core.jobs import update_status, write_json
+from mn_protein_design.runtime import reference_root
 
 
 def build_docker_command(
     manifest: dict,
     run_dir: Path,
     args: list[str],
-    reference_root: Path = Path("/mnt/db/reference_files"),
+    reference_root_path: Path | None = None,
     gpu_device: object = "all",
 ) -> list[str]:
     command = ["docker", "run", "--rm"]
     if manifest.get("gpu"):
         command.extend(docker_gpu_args(gpu_device))
     command.extend(["-v", f"{run_dir}:/work"])
-    if reference_root.exists():
-        command.extend(["-v", f"{reference_root}:/ref:ro"])
+    reference_path = reference_root_path or reference_root()
+    if reference_path.exists():
+        command.extend(["-v", f"{reference_path}:/ref:ro"])
     command.append(str(manifest["image"]))
     command.extend(args)
     return command

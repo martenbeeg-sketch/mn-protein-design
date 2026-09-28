@@ -8,7 +8,7 @@ from pathlib import Path
 
 import typer
 
-from mn_protein_design.runtime import DEFAULT_APP_HOME, DEFAULT_TMPDIR, ensure_runtime_home
+from mn_protein_design.runtime import DEFAULT_APP_HOME, DEFAULT_TMPDIR, ensure_runtime_home, reference_root
 
 
 app = typer.Typer(
@@ -27,10 +27,16 @@ def cli() -> None:
 def init_home(
     app_home: str = typer.Option(str(DEFAULT_APP_HOME), "--app-home", help="Runtime directory for jobs and app state."),
     tmpdir: str = typer.Option(str(DEFAULT_TMPDIR), "--tmpdir", help="Writable temporary directory for Streamlit startup."),
+    reference_dir: str | None = typer.Option(None, "--reference-dir", help="Shared model/reference directory."),
 ) -> None:
     """Initialize the file-backed runtime directory."""
     home_path = ensure_runtime_home(app_home, tmpdir)
+    if reference_dir:
+        os.environ["MN_PROTEIN_DESIGN_REFERENCE_DIR"] = str(Path(reference_dir).expanduser().resolve())
+    reference_path = reference_root()
+    reference_path.mkdir(parents=True, exist_ok=True)
     typer.echo(f"Initialized mn-protein-design runtime directory: {home_path}")
+    typer.echo(f"Reference directory: {reference_path}")
 
 
 def _has_streamlit_port(args: list[str]) -> bool:
@@ -54,6 +60,7 @@ def run_app(
     ctx: typer.Context,
     app_home: str = typer.Option(str(DEFAULT_APP_HOME), "--app-home", help="Runtime directory for jobs and app state."),
     tmpdir: str = typer.Option(str(DEFAULT_TMPDIR), "--tmpdir", help="Writable temporary directory for Streamlit startup."),
+    reference_dir: str | None = typer.Option(None, "--reference-dir", help="Shared model/reference directory."),
     port: int = typer.Option(8501, "--port", help="First port to try when choosing a free Streamlit port."),
     port_max: int = typer.Option(8599, "--port-max", help="Highest port to try when choosing a free Streamlit port."),
 ) -> None:
@@ -62,7 +69,10 @@ def run_app(
     os.environ.setdefault("TMPDIR", str(Path(tmpdir).expanduser().resolve()))
     os.environ.setdefault("MN_PROTEIN_DESIGN_APP_HOME", str(home_path))
     os.environ.setdefault("MN_PROTEIN_DESIGN_RUN_DIR", str(home_path / "workdir" / "runs"))
+    if reference_dir:
+        os.environ["MN_PROTEIN_DESIGN_REFERENCE_DIR"] = str(Path(reference_dir).expanduser().resolve())
     Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+    reference_root().mkdir(parents=True, exist_ok=True)
 
     streamlit_script_path = Path(__file__).resolve().parent / "run_app.py"
     sys.argv = ["streamlit", "run", str(streamlit_script_path)]

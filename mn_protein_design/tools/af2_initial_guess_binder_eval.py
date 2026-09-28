@@ -55,11 +55,22 @@ def get_pdb_total_length(pdb_path: str) -> int:
     return len(unique_residues)
 
 
-def get_binder_sequence(pdb_path: str, chain_id: str) -> str:
-    sidecar = os.path.splitext(pdb_path)[0] + ".binder_sequence.txt"
-    if os.path.exists(sidecar):
-        with open(sidecar, "r", encoding="utf-8") as handle:
-            return "".join(handle.read().split()).upper()
+def get_design_sequence(pdb_path: str, chain_id: str, *, target_only: bool = False) -> str:
+    sidecar_names = (
+        [".target_sequence.txt", ".binder_sequence.txt"]
+        if target_only
+        else [".binder_sequence.txt"]
+    )
+    for suffix in sidecar_names:
+        sidecar = os.path.splitext(pdb_path)[0] + suffix
+        if os.path.exists(sidecar):
+            with open(sidecar, "r", encoding="utf-8") as handle:
+                return "".join(handle.read().split()).upper()
+
+    chain_ids = [part.strip() for part in str(chain_id or "").split(",") if part.strip()]
+    if not chain_ids:
+        chain_ids = [str(chain_id or "A")]
+    chain_set = set(chain_ids)
 
     residue_map = {
         "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
@@ -71,9 +82,9 @@ def get_binder_sequence(pdb_path: str, chain_id: str) -> str:
     seen: set[tuple[str, str]] = set()
     with open(pdb_path, "r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            if not line.startswith(("ATOM", "HETATM")) or line[21].strip() != chain_id:
+            if not line.startswith(("ATOM", "HETATM")) or line[21].strip() not in chain_set:
                 continue
-            residue_key = (line[22:26].strip(), line[26].strip())
+            residue_key = (line[21].strip(), line[22:26].strip(), line[26].strip())
             if residue_key in seen:
                 continue
             seen.add(residue_key)
@@ -102,6 +113,52 @@ def get_binder_source_chains(pdb_path: str, fallback: str = "A") -> list[str]:
     with open(sidecar, "r", encoding="utf-8") as handle:
         chains = [part.strip() for part in handle.read().split(",") if part.strip()]
     return chains or [fallback]
+
+
+def get_target_source_chains(pdb_path: str, fallback: str = "A") -> list[str]:
+    sidecar = os.path.splitext(pdb_path)[0] + ".target_source_chains.txt"
+    if not os.path.exists(sidecar):
+        return [part.strip() for part in fallback.split(",") if part.strip()] or ["A"]
+    with open(sidecar, "r", encoding="utf-8") as handle:
+        chains = [part.strip() for part in handle.read().split(",") if part.strip()]
+    return chains or [part.strip() for part in fallback.split(",") if part.strip()] or ["A"]
+
+
+def _chain_lengths_from_pdb(pdb_path: str, chains: list[str]) -> list[tuple[str, int]]:
+    chain_set = set(chains)
+    residues: dict[str, set[tuple[str, str]]] = {chain: set() for chain in chains}
+    with open(pdb_path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not line.startswith("ATOM"):
+                continue
+            chain = line[21].strip()
+            if chain not in chain_set:
+                continue
+            residues.setdefault(chain, set()).add((line[22:26].strip(), line[26].strip()))
+    return [(chain, len(residues.get(chain, set()))) for chain in chains]
+
+
+def _target_output_maps(model):
+    chain_lengths = getattr(model, "_target_chain_lengths_for_output", None) or [("B", model._target_len)]
+    target_residue_indices = [int(value) for value in model.aux["residue_index"][: model._target_len]]
+    chain_by_residue: dict[int, str] = {}
+    resno_by_residue: dict[int, int] = {}
+    offset = 0
+    for chain, length in chain_lengths:
+        for local_index, residue_index in enumerate(target_residue_indices[offset : offset + int(length)], start=1):
+            chain_by_residue[residue_index] = chain
+            resno_by_residue[residue_index] = local_index
+        offset += int(length)
+    return chain_by_residue, resno_by_residue
+
+
+def _format_target_residue_labels(model, target_residue_indices) -> str:
+    chain_by_residue, resno_by_residue = _target_output_maps(model)
+    labels = []
+    for residue_index in target_residue_indices:
+        key = int(residue_index)
+        labels.append(f"{chain_by_residue.get(key, 'B')}{resno_by_residue.get(key, key)}")
+    return ",".join(labels)
 
 
 def _ca_coordinates(pdb_path: str, chains: list[str] | None = None) -> np.ndarray:
@@ -214,7 +271,7 @@ def _save_monomer_pae_json(model, out_path: str, metrics: dict):
         json.dump(payload, handle)
 
 
-def save_binder_design_pdb(model, filename: str):
+def save_binder_design_pdb(model, filename: str, *, binder_output_chain: str = "A"):
     aux = model._tmp["best"]["aux"] if "aux" in model._tmp.get("best", {}) else model.aux
     aux = aux["all"]
     payload = {key: aux[key] for key in ["aatype", "residue_index", "atom_positions", "atom_mask"]}
@@ -227,14 +284,18 @@ def save_binder_design_pdb(model, filename: str):
     def to_pdb_str(x, model_number=None):
         pdb_str = protein.to_pdb(protein.Protein(**x))
         binder_mapping = dict(zip(x["residue_index"][: model._binder_len], range(1, model._binder_len + 1)))
+        target_chain_by_residue, target_resno_by_residue = _target_output_maps(model)
         lines = []
+        binder_chain = str(binder_output_chain or "A")[:1]
         for line in pdb_str.splitlines()[1:-2]:
             if line.startswith(("ATOM", "HETATM")):
                 resno = int(line[22:26].strip())
                 if resno in binder_mapping:
-                    lines.append(line[:21] + "A" + str(binder_mapping[resno]).rjust(4) + line[26:])
+                    lines.append(line[:21] + binder_chain + str(binder_mapping[resno]).rjust(4) + line[26:])
                 else:
-                    lines.append(line[:21] + "B" + line[22:])
+                    chain = target_chain_by_residue.get(resno, "B")[:1]
+                    mapped_resno = target_resno_by_residue.get(resno, resno)
+                    lines.append(line[:21] + chain + str(mapped_resno).rjust(4) + line[26:])
         body = "\n".join(lines)
         if model_number is not None:
             return f"MODEL{model_number:8}\n{body}\nENDMDL\n"
@@ -269,6 +330,12 @@ def main():
         default=False,
         help="Fold one staged chain with fixbb/template inputs; used for monomer capacity tests.",
     )
+    parser.add_argument(
+        "--target-fragment-template-only",
+        action="store_true",
+        default=False,
+        help="Fold a target-only fragmented template while preserving staged fragment chains.",
+    )
     parser.add_argument("--multimer", action="store_true", default=False)
     parser.add_argument(
         "--binder-multimer",
@@ -284,7 +351,9 @@ def main():
     if options.use_interface_template:
         assert options.use_binder_template
 
-    if options.single_chain_template_only:
+    target_only_template_mode = options.single_chain_template_only or options.target_fragment_template_only
+
+    if target_only_template_mode:
         options.target_template_only = False
 
     model_names = [
@@ -296,7 +365,7 @@ def main():
         f"model_{index}_multimer_v3" if binder_uses_multimer else f"model_{index}_ptm"
         for index in range(1, options.model_count + 1)
     ]
-    if options.single_chain_template_only:
+    if target_only_template_mode:
         model = mk_af_model(
             protocol="fixbb",
             data_dir=options.params,
@@ -332,20 +401,27 @@ def main():
             basename = os.path.basename(path).removesuffix(".pdb")
             print(f"Predicting PDB {index:,}/{len(paths):,}: {basename}")
             start_time = time.time()
+            designed_chain_list = get_binder_source_chains(path, options.designed_chains)
+            designed_chains = ",".join(designed_chain_list)
+            designed_output_chain = (designed_chain_list or ["A"])[0]
             target_chain = get_target_chains(
                 path,
-                "B" if options.designed_chains == "A" else "A",
+                "B" if designed_chains == "A" else "A",
             )
-            if options.designed_chains not in {"A", "B"}:
-                raise NotImplementedError("Expected binder chain to be A or B")
+            target_chain_list = [chain.strip() for chain in target_chain.split(",") if chain.strip()]
+            target_chain_lengths = _chain_lengths_from_pdb(path, target_chain_list)
 
-            binder_sequence = get_binder_sequence(path, options.designed_chains)
-            if options.single_chain_template_only:
+            binder_sequence = get_design_sequence(
+                path,
+                designed_chains,
+                target_only=target_only_template_mode,
+            )
+            if target_only_template_mode:
                 if not binder_sequence or "X" in binder_sequence:
-                    raise ValueError(f"Could not extract a complete sequence from chain {options.designed_chains} in {path}")
+                    raise ValueError(f"Could not extract a complete sequence from chain {designed_chains} in {path}")
                 model.prep_inputs(
                     pdb_filename=path,
-                    chain=options.designed_chains,
+                    chain=designed_chains,
                     rm_template=False,
                     rm_template_seq=False,
                     rm_template_sc=False,
@@ -353,7 +429,7 @@ def main():
                 )
             elif options.target_template_only:
                 if not binder_sequence or "X" in binder_sequence:
-                    raise ValueError(f"Could not extract a complete binder sequence from chain {options.designed_chains} in {path}")
+                    raise ValueError(f"Could not extract a complete binder sequence from chain {designed_chains} in {path}")
                 model.prep_inputs(
                     path,
                     binder_chain=None,
@@ -362,19 +438,21 @@ def main():
                     rm_target=False,
                     hotspot=options.hotspot if options.hotspot else None,
                 )
+                model._target_chain_lengths_for_output = target_chain_lengths
             else:
                 model.prep_inputs(
                     path,
-                    binder_chain=options.designed_chains,
+                    binder_chain=designed_chains,
                     target_chain=target_chain,
                     rm_target=False,
                     rm_binder=not options.use_binder_template,
                     rm_template_ic=not options.use_interface_template,
                     hotspot=options.hotspot if options.hotspot else None,
                 )
+                model._target_chain_lengths_for_output = target_chain_lengths
             if options.cyclic:
                 add_cyclic_offset(model, offset_type=2)
-            if options.single_chain_template_only:
+            if target_only_template_mode:
                 model.set_seq(seq=binder_sequence)
             elif options.target_template_only:
                 model.set_seq(seq=binder_sequence)
@@ -387,7 +465,7 @@ def main():
             model.set_opt(num_recycles=options.num_recycles)
             for model_index in range(options.model_count):
                 model.predict(models=[model_index], num_recycles=options.num_recycles, verbose=False)
-                if options.single_chain_template_only:
+                if target_only_template_mode:
                     log = model.aux["log"]
                     row = {
                         "binder_plddt": float(log.get("plddt")) * 100.0 if log.get("plddt") is not None else None,
@@ -416,17 +494,15 @@ def main():
                     target_interface_res = model.aux["residue_index"][: model._target_len][
                         ca_dist.min(axis=0) <= 8
                     ]
-                    row["interface_target_residues"] = ",".join(
-                        f"B{pos}" for pos in target_interface_res
-                    )
+                    row["interface_target_residues"] = _format_target_residue_labels(model, target_interface_res)
                 model_number = model_index + 1
                 model_pdb = f"{out_base}_model{model_number}.pdb"
                 model_pae = f"{out_base}_model{model_number}_pae.json"
-                if options.single_chain_template_only:
+                if target_only_template_mode:
                     model.save_pdb(model_pdb)
                     _save_monomer_pae_json(model, model_pae, row)
                 else:
-                    save_binder_design_pdb(model, model_pdb)
+                    save_binder_design_pdb(model, model_pdb, binder_output_chain=designed_output_chain)
                     _save_pae_json(model, model_pae, row)
                 model_rows.append(row)
                 model_outputs.append((model_pdb, model_pae))
@@ -444,10 +520,18 @@ def main():
                     "multimer_v3" if binder_uses_multimer else "ptm"
                 ),
                 "complex_prediction_protocol": (
-                    "single_chain_template_fold" if options.single_chain_template_only else "target_binder_complex"
+                    "target_fragment_template_fold"
+                    if options.target_fragment_template_only
+                    else "single_chain_template_fold"
+                    if options.single_chain_template_only
+                    else "target_binder_complex"
                 ),
                 "binder_fold_prediction_protocol": (
-                    "not_applicable_single_chain" if options.single_chain_template_only else "binder_alone"
+                    "not_applicable_target_fragment"
+                    if options.target_fragment_template_only
+                    else "not_applicable_single_chain"
+                    if options.single_chain_template_only
+                    else "binder_alone"
                 ),
             }
             for model_number, row in enumerate(model_rows, start=1):
@@ -468,12 +552,16 @@ def main():
                 shutil.copy2(model_outputs[best_index][1], f"{out_base}_pae.json")
             metrics["representative_model"] = best_index + 1
             reference_pdb = os.path.join(options.input_dir, "references", f"{basename}.pdb")
-            reference_chains = get_binder_source_chains(path)
+            reference_chains = (
+                get_target_source_chains(path, designed_chains)
+                if target_only_template_mode
+                else get_binder_source_chains(path, designed_chains)
+            )
             metrics["interface_target_residues"] = model_rows[best_index][
                 "interface_target_residues"
             ]
 
-            if options.single_chain_template_only:
+            if target_only_template_mode:
                 metrics["monomer_refolding_rmsd"] = (
                     _aligned_ca_rmsd(reference_pdb, model_outputs[best_index][0], reference_chains)
                     if os.path.exists(reference_pdb)
@@ -505,7 +593,7 @@ def main():
                         if os.path.exists(reference_pdb)
                         else None
                     )
-            if not options.single_chain_template_only:
+            if not target_only_template_mode:
                 for metric_name in ("binder_only_plddt", "binder_only_pae", "binder_rmsd"):
                     values = [
                         metrics.get(f"model_{model_number}_{metric_name}")

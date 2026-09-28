@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 
-mn-protein-design-workdir/
+mn-protein-design-workdir
 mn_protein_design.egg-info/
 
 smoke_tests/

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "mn-protein-design"
 version = "0.0.1"
 description = "Small Streamlit workbench for Docker-orchestrated protein design workflows"
-readme = "APP_BUILD_PLAN.md"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "biopython",

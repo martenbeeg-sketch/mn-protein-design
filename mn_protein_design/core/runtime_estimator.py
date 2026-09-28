@@ -17,8 +17,11 @@ ENGINE_LABELS = {
     "af2_initial_guess": "AF2 initial guess",
     "boltz2_initial_guess": "Boltz-2",
     "esmfold2": "ESMFold2",
+    "openfold3": "OpenFold-3",
     "rf3": "RF3",
     "protenix": "Protenix",
+    "protenix_v1": "Protenix v1",
+    "protenix_v2": "Protenix v2",
     "boltzgen_fold": "BoltzGen target-template fold",
     "postprocessing": "Metric postprocessing",
     "design_campaign": "Design campaign",
@@ -37,6 +40,7 @@ ENGINE_LABELS = {
     "scannet": "ScanNet",
     "surf2spot": "Surf2Spot",
     "masif_seed": "MaSIF-seed",
+    "pesto": "PeSTo",
 }
 
 FALLBACK_SECONDS_PER_CANDIDATE = {
@@ -48,7 +52,10 @@ FALLBACK_SECONDS_PER_CANDIDATE = {
     "alphafast_msa": 15.0,
     "postprocessing": 8.0,
     "rf3": 30.0,
+    "openfold3": 75.0,
     "protenix": 45.0,
+    "protenix_v1": 75.0,
+    "protenix_v2": 90.0,
     "boltzgen_fold": 25.0,
     "rfdiffusion_classic": 180.0,
     "bindcraft": 1800.0,
@@ -65,6 +72,7 @@ FALLBACK_SECONDS_PER_CANDIDATE = {
     "scannet": 300.0,
     "surf2spot": 180.0,
     "masif_seed": 600.0,
+    "pesto": 90.0,
     "design_campaign": 600.0,
 }
 
@@ -78,7 +86,10 @@ TOOL_TO_ENGINE = {
     "af2_initial_guess": "af2_initial_guess",
     "boltz2_initial_guess": "boltz2_initial_guess",
     "rf3": "rf3",
+    "openfold3": "openfold3",
     "protenix": "protenix",
+    "protenix_v1": "protenix_v1",
+    "protenix_v2": "protenix_v2",
     "boltzgen_fold": "boltzgen_fold",
     "design_campaign": "design_campaign",
     "multi_engine_design_campaign": "design_campaign",
@@ -86,6 +97,7 @@ TOOL_TO_ENGINE = {
     "scannet": "scannet",
     "surf2spot": "surf2spot",
     "masif_seed": "masif_seed",
+    "pesto": "pesto",
 }
 
 
@@ -169,11 +181,13 @@ def collect_runtime_observations(root: Path | None = None) -> list[RuntimeObserv
         candidate_count = _candidate_count(result)
         if duration is None or not candidate_count:
             continue
+        total_residues = _int_or_none(metrics.get("total_residues") or metrics.get("total_length"))
         observations.append(
             RuntimeObservation(
                 engine=engine,
                 seconds=duration,
                 candidate_count=candidate_count,
+                total_residues=total_residues,
                 run_id=run_id,
                 source="job_metadata",
             )
@@ -224,6 +238,7 @@ def estimate_engines(
                 "basis": basis,
                 "history_runs": len(engine_obs),
                 "seconds_per_candidate": estimated_seconds / candidate_count if candidate_count else None,
+                "seconds_per_residue": estimated_seconds / total_residues if total_residues else None,
             }
         )
     return {
@@ -248,6 +263,28 @@ def estimate_job_runtime_with_observations(
     params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
     tool = str(row.get("tool") or input_payload.get("tool") or "")
     job_type = str(row.get("job_type") or input_payload.get("job_type") or "")
+    if job_type == "refolding_evaluation" or tool in {"refolding_evaluation_engines", "target_refolding_evaluation_engines"}:
+        engines = _refolding_engine_keys(params)
+        candidate_count = (
+            _int_or_none(params.get("candidate_count"))
+            or _int_or_none(params.get("selected_candidate_count"))
+            or _int_or_none(params.get("max_candidates"))
+            or 1
+        )
+        total_residues = _int_or_none(params.get("total_residues"))
+        engine_params = _refolding_engine_params(params, engines)
+        estimate = estimate_engines(
+            engines=engines or [tool or job_type],
+            candidate_count=max(1, candidate_count),
+            total_residues=total_residues,
+            engine_params=engine_params,
+            observations=observations,
+        )
+        return {
+            "estimated_seconds": estimate.get("total_seconds"),
+            "estimated_time": estimate.get("total_time", "n/a"),
+            "basis": "refolding engine fallbacks/history",
+        }
     if tool == "design_campaign" or job_type == "multi_engine_design_campaign":
         engines = [str(engine) for engine in params.get("engines") or []]
         template_enabled = bool((params.get("template_redesign") or {}).get("enabled")) if isinstance(params.get("template_redesign"), dict) else False
@@ -290,6 +327,65 @@ def estimate_job_runtime_with_observations(
         "estimated_time": row_estimate.get("estimated_time", "n/a"),
         "basis": row_estimate.get("basis", "fallback"),
     }
+
+
+def _refolding_engine_keys(params: dict[str, Any]) -> list[str]:
+    engines: list[str] = []
+    if bool(params.get("run_alphafast_af3")):
+        engines.append("alphafast_af3")
+    if bool(params.get("run_colabfold")):
+        engines.append("colabfold")
+    if bool(params.get("run_af2_initial_guess")):
+        engines.append("af2_initial_guess")
+    if bool(params.get("run_boltz2_initial_guess")):
+        engines.append("boltz2_initial_guess")
+    if bool(params.get("run_esmfold2")):
+        engines.append("esmfold2")
+    if bool(params.get("run_rf3")):
+        engines.append("rf3")
+    if bool(params.get("run_openfold3")):
+        engines.append("openfold3")
+    if bool(params.get("run_protenix")):
+        engines.append("protenix")
+    if bool(params.get("run_protenix_v1")):
+        engines.append("protenix_v1")
+    if bool(params.get("run_protenix_v2")):
+        engines.append("protenix_v2")
+    if bool(params.get("run_boltzgen_fold")):
+        engines.append("boltzgen_fold")
+    msa_needed = (
+        bool(params.get("run_alphafast_af3"))
+        or bool(params.get("run_colabfold"))
+        or (bool(params.get("run_boltz2_initial_guess")) and bool(params.get("boltz2_use_target_msa", True)))
+        or (bool(params.get("run_esmfold2")) and bool(params.get("esmfold2_use_target_msa")))
+        or (bool(params.get("run_rf3")) and bool(params.get("rf3_use_target_msa")))
+        or (bool(params.get("run_openfold3")) and bool(params.get("openfold3_use_target_msa")))
+        or (bool(params.get("run_protenix")) and bool(params.get("protenix_use_msa", True)))
+        or (bool(params.get("run_protenix_v1")) and bool(params.get("protenix_v1_use_msa", True)))
+        or (bool(params.get("run_protenix_v2")) and bool(params.get("protenix_v2_use_msa", True)))
+    )
+    msa_source = str(params.get("shared_msa_source") or params.get("colabfold_msa_source") or "")
+    query_only = bool(params.get("alphafast_query_only_msa"))
+    if msa_needed and not query_only and ("alphafast_mmseqs_gpu" in msa_source or not msa_source):
+        engines.insert(0, "alphafast_msa")
+    if (
+        bool(params.get("run_common_interface_metrics"))
+        or bool(params.get("run_predicted_rosetta_metrics"))
+        or bool(params.get("run_pymol_metrics"))
+        or bool(params.get("run_pyrosetta_input_metrics"))
+    ):
+        engines.append("postprocessing")
+    return engines
+
+
+def _refolding_engine_params(params: dict[str, Any], engines: list[str]) -> dict[str, dict[str, Any]]:
+    engine_params: dict[str, dict[str, Any]] = {}
+    if "esmfold2" in engines:
+        engine_params["esmfold2"] = {
+            "num_loops": params.get("num_loops"),
+            "num_sampling_steps": params.get("num_sampling_steps"),
+        }
+    return engine_params
 
 
 def _engine_runtime_multiplier(engine: str, params: dict[str, Any]) -> float:

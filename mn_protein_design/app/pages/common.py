@@ -17,6 +17,7 @@ from mn_protein_design.core.jobs import (
     find_downstream_jobs,
     pause_job,
     read_json,
+    derive_job_warning,
     resume_job,
     stop_job,
 )
@@ -93,6 +94,11 @@ def selected_dataframe_rows(event: object, key: str | None = None) -> list[int]:
             rows = (state.get("selection") or {}).get("rows") or []
             return [int(row) for row in rows]
     return []
+
+
+def refresh_results_button(key: str, label: str = "Refresh table") -> None:
+    if st.button(label, key=key):
+        st.rerun()
 
 
 def show_delete_jobs_dialog(
@@ -211,6 +217,174 @@ def show_delete_jobs_dialog(
         render_confirmation()
 
 
+def _run_code_from_dir(run_dir_text: object) -> str:
+    if not str(run_dir_text or "").strip():
+        return ""
+    run_dir = Path(str(run_dir_text or ""))
+    if not run_dir.exists() or not (run_dir / "metadata.json").exists():
+        return ""
+    metadata = read_json(run_dir / "metadata.json")
+    return display_job_code(metadata.get("job_code"), run_dir.name)
+
+
+def _job_count_text(params: dict, inputs: dict) -> str:
+    selected = inputs.get("selected_candidate_ids") or params.get("selected_candidate_ids")
+    if isinstance(selected, list) and selected:
+        return f"{len(selected):,} selected"
+    for key in ("candidate_count", "staged_count", "selected_candidate_count", "record_count"):
+        try:
+            value = int(params.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            label = "candidate" if value == 1 else "candidates"
+            return f"{value:,} {label}"
+    return ""
+
+
+def _enabled_engine_text(params: dict) -> str:
+    names: list[str] = []
+    configured = params.get("models")
+    if isinstance(configured, list):
+        names.extend(str(item).upper() if str(item).lower() == "af3" else str(item) for item in configured)
+    toggles = [
+        ("run_alphafast_af3", "AF3"),
+        ("run_colabfold", "ColabFold"),
+        ("run_af2_initial_guess", "AF2-IG"),
+        ("run_boltz2_initial_guess", "Boltz-2"),
+        ("run_boltzgen_fold", "BoltzGen Fold"),
+        ("run_esmfold2", "ESMFold2"),
+        ("run_rf3", "RF3"),
+        ("run_protenix", "Protenix"),
+        ("run_openfold3", "OpenFold3"),
+    ]
+    for key, label in toggles:
+        if params.get(key) and label not in names:
+            names.append(label)
+    return ", ".join(names[:5]) + ("..." if len(names) > 5 else "")
+
+
+def _compact_error(result: dict) -> str:
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    for key in (
+        "worker_error",
+        "error",
+        "benchmark_postprocessing_error",
+        "common_interface_metrics_error",
+        "predicted_rosetta_metrics_error",
+    ):
+        value = result.get(key) or metrics.get(key)
+        if value:
+            text = " ".join(str(value).split())
+            return text[:120] + ("..." if len(text) > 120 else "")
+    return ""
+
+
+def _job_warning(row: dict, params: dict, result: dict, is_target_refolding: bool) -> str:
+    derived = derive_job_warning(
+        row,
+        {"params": params},
+        result,
+    )
+    if derived:
+        return derived
+    if is_target_refolding and params.get("alphafast_query_only_msa"):
+        return "MSA fallback/query-only mode is enabled for this target-refolding run."
+    return ""
+
+
+def _job_annotations(row: dict, input_payload: dict, result: dict) -> dict[str, str]:
+    params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+    inputs = input_payload.get("inputs") if isinstance(input_payload.get("inputs"), dict) else {}
+    task_group = str(row.get("task_group") or "")
+    job_type = str(row.get("job_type") or input_payload.get("job_type") or "")
+    tool = str(row.get("tool") or input_payload.get("tool") or "")
+    status = str(row.get("status") or "")
+    model_type = str(params.get("model_type") or "").strip()
+    count_text = _job_count_text(params, inputs)
+    engine_text = _enabled_engine_text(params)
+    source_run_dir = inputs.get("source_run_dir") or params.get("source_run_dir")
+    source_code = _run_code_from_dir(source_run_dir)
+    source_input = read_json(Path(str(source_run_dir)) / "input.json") if source_run_dir else {}
+    source_job_type = str(source_input.get("job_type") or "")
+    is_target_refolding = bool(
+        params.get("target_refolding")
+        or inputs.get("target_refolding")
+        or job_type == "target_refolding_candidate_set"
+        or tool in {"target_refolding_input_builder", "target_refolding_evaluation_engines"}
+        or source_job_type == "target_refolding_candidate_set"
+    )
+
+    if job_type == "target_refolding_candidate_set" or tool == "target_refolding_input_builder":
+        title = "Target refolding input set"
+    else:
+        title = str(row.get("campaign_name") or params.get("campaign_name") or "").strip()
+    if not title:
+        if job_type == "sequence_design":
+            title = f"{model_type or tool or 'MPNN'} redesign"
+        elif job_type == "sequence_design_validation":
+            title = "Sequence redesign validation"
+        elif job_type == "refolding_evaluation" and is_target_refolding:
+            title = "Target refolding evaluation"
+        elif job_type == "refolding_evaluation":
+            title = "Candidate refolding evaluation"
+        elif job_type == "candidate_import":
+            title = "Candidate import"
+        elif job_type == "result_selection_export":
+            title = "Ranked result export"
+        elif "refolding" in job_type:
+            title = f"{tool or job_type} refolding"
+        elif task_group:
+            title = f"{task_group} {job_type or tool}".strip()
+        else:
+            title = job_type or tool or "Job"
+
+    description_parts: list[str] = []
+    if is_target_refolding:
+        description_parts.append("target-chain refolding")
+    warning = _job_warning(row, params, result, is_target_refolding)
+    if warning:
+        description_parts.append("MSA fallback warning")
+    if source_code:
+        description_parts.append(f"from {source_code}")
+    if count_text:
+        description_parts.append(count_text)
+    if model_type and model_type not in title:
+        description_parts.append(model_type)
+    if engine_text and job_type != "sequence_design":
+        description_parts.append(engine_text)
+    if params.get("run_common_interface_metrics"):
+        description_parts.append("ipSAE/common interface metrics")
+    if params.get("run_predicted_rosetta_metrics"):
+        description_parts.append("Rosetta metrics")
+    if params.get("run_pymol_metrics"):
+        description_parts.append("PyMOL metrics")
+    description = "; ".join(description_parts) or f"{tool or job_type} run"
+
+    comment = ""
+    error = _compact_error(result)
+    title_blob = " ".join([title, description, str(row.get("campaign_name") or "")]).lower()
+    if status == "failed":
+        comment = f"Cleanup candidate if superseded; failed{': ' + error if error else ''}"
+    elif warning:
+        comment = warning
+    elif status in STOPPED_STATUSES | PAUSED_STATUSES:
+        comment = "Stopped or paused; resume if needed, otherwise cleanup candidate."
+    elif status == "unknown" or (not result and status not in ACTIVE_STATUSES):
+        comment = "No result file found; likely interrupted or exploratory. Inspect before deleting."
+    elif "test" in title_blob or "tmp" in title_blob or "debug" in title_blob:
+        comment = "Looks like a test/debug run; cleanup candidate if no downstream jobs depend on it."
+    elif status in ACTIVE_STATUSES:
+        comment = "Active job; do not delete while running or queued."
+
+    return {
+        "job_title": title,
+        "job_description": description,
+        "job_comment": comment,
+        "job_is_target_refolding": "1" if is_target_refolding else "",
+    }
+
+
 def render_job_table(task_group: str | list[str] | None = None, rows_override: list[dict] | None = None) -> None:
     table_key = (
         "all"
@@ -220,6 +394,7 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
         else task_group
     )
     table_key = "".join(ch if ch.isalnum() else "_" for ch in table_key)
+    refresh_results_button(f"{table_key}_refresh_jobs_table")
 
     if rows_override is not None:
         rows = rows_override
@@ -239,8 +414,15 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
     df = pd.DataFrame(rows)
     runtime_observations = collect_runtime_observations()
     estimate_rows = []
+    tool_details = []
+    annotation_rows = []
     for row in rows:
-        input_payload = read_json(Path(str(row.get("run_dir") or "")) / "input.json")
+        run_dir = Path(str(row.get("run_dir") or ""))
+        input_payload = read_json(run_dir / "input.json")
+        result_payload = read_json(run_dir / "result.json")
+        params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+        tool_details.append(str(params.get("model_type") or "").strip())
+        annotation_rows.append(_job_annotations(row, input_payload, result_payload))
         estimate_rows.append(
             estimate_job_runtime_with_observations(
                 row,
@@ -250,6 +432,19 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
         )
     df["estimated_time"] = [row.get("estimated_time", "n/a") for row in estimate_rows]
     df["estimate_basis"] = [row.get("basis", "") for row in estimate_rows]
+    df["tool_detail"] = tool_details
+    df["title"] = [row.get("job_title", "") for row in annotation_rows]
+    df["description"] = [row.get("job_description", "") for row in annotation_rows]
+    df["comments"] = [row.get("job_comment", "") for row in annotation_rows]
+    target_refolding_mask = pd.Series(
+        [bool(row.get("job_is_target_refolding")) for row in annotation_rows],
+        index=df.index,
+    )
+    if "current_phase" in df.columns:
+        df.loc[
+            target_refolding_mask & (df["current_phase"] == "Predicting complexes"),
+            "current_phase",
+        ] = "Predicting target folds"
     df["job_code_link"] = df.apply(
         lambda row: (
             f"/results?task_group={row['task_group']}"
@@ -261,10 +456,14 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
     display_df = df[
         [
             "job_code_link",
+            "title",
+            "description",
+            "comments",
             "campaign_name",
             "task_group",
             "job_type",
             "tool",
+            "tool_detail",
             "status",
             "queue_resource",
             "current_phase",
@@ -308,7 +507,7 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
     resumable_action_rows = selected_full_rows[
         selected_full_rows["status"].isin(PAUSED_STATUSES | STOPPED_STATUSES | {"failed"})
     ]
-    action_cols = st.columns(3)
+    action_cols = st.columns([1, 1, 1, 1])
     if action_cols[0].button(
         "Pause selected",
         disabled=active_action_rows.empty,
@@ -327,7 +526,26 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
         for row in pd.concat([active_action_rows, paused_action_rows]).drop_duplicates("run_id").to_dict(orient="records"):
             stop_job(Path(str(row["run_dir"])), "Stopped by user")
         st.rerun()
-    if action_cols[2].button(
+    resume_gpu_override: str | None = None
+    resume_gpu_options = ["Keep stored GPU", *available_gpu_devices()]
+    current_resume_gpu = ""
+    if len(resumable_action_rows) == 1:
+        current_resume_gpu = _job_gpu_device(resumable_action_rows.iloc[0].to_dict())
+    selected_resume_gpu = action_cols[2].selectbox(
+        "Resume GPU",
+        resume_gpu_options,
+        index=0,
+        key=f"{table_key}_resume_gpu_override",
+        disabled=resumable_action_rows.empty,
+        help=(
+            "Override the saved GPU before resuming selected local-worker jobs. "
+            f"Choose 'Keep stored GPU' to leave each job unchanged"
+            + (f" (currently {current_resume_gpu})." if current_resume_gpu else ".")
+        ),
+    )
+    if selected_resume_gpu != "Keep stored GPU":
+        resume_gpu_override = selected_resume_gpu
+    if action_cols[3].button(
         "Resume selected",
         disabled=resumable_action_rows.empty,
         key=f"{table_key}_resume_selected_jobs",
@@ -336,7 +554,7 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
         errors = []
         for row in resumable_action_rows.to_dict(orient="records"):
             try:
-                resume_job(Path(str(row["run_dir"])))
+                resume_job(Path(str(row["run_dir"])), gpu_device=resume_gpu_override)
             except Exception as exc:
                 errors.append(f"{row.get('job_code')}: {exc}")
         if errors:

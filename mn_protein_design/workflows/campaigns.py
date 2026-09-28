@@ -110,6 +110,7 @@ def _run_module_step(source: dict[str, Any], step: dict[str, Any]) -> Path:
             tool=tool,
             require_monomer_success=bool(params.get("require_monomer_success", True)),
             template_mode=str(params.get("template_mode") or "target_template"),
+            use_target_msa=bool(params.get("use_target_msa", True)),
             num_recycles=int(params.get("num_recycles") or 3),
             multimer=bool(params.get("multimer", True)),
             max_candidates=int(params.get("max_candidates") or 20),
@@ -125,6 +126,12 @@ def _run_module_step(source: dict[str, Any], step: dict[str, Any]) -> Path:
             candidates_jsonl=Path(str(source["candidates_jsonl"])),
             tool=tool,
             keep_top_n=int(params.get("keep_top_n") or 100),
+            keep_per_attempt=(
+                int(params["keep_per_attempt"])
+                if params.get("keep_per_attempt") not in {None, ""}
+                else None
+            ),
+            ranking_metric=str(params.get("ranking_metric") or "analysis_score"),
             thresholds=dict(params.get("thresholds") or {}),
         )
     raise NotImplementedError(f"{module}/{tool} is registered, but no runner is wired yet.")
@@ -291,6 +298,7 @@ def run_next_step(campaign_run_dir: Path) -> Path | None:
                 tool=tool,
                 require_monomer_success=bool(params.get("require_monomer_success", True)),
                 template_mode=str(params.get("template_mode") or "target_template"),
+                use_target_msa=bool(params.get("use_target_msa", True)),
                 num_recycles=int(params.get("num_recycles") or 3),
                 multimer=bool(params.get("multimer", True)),
             )
@@ -300,6 +308,12 @@ def run_next_step(campaign_run_dir: Path) -> Path | None:
                 candidates_jsonl=Path(str(source["candidates_jsonl"])),
                 tool=tool,
                 keep_top_n=int(params.get("keep_top_n") or 100),
+                keep_per_attempt=(
+                    int(params["keep_per_attempt"])
+                    if params.get("keep_per_attempt") not in {None, ""}
+                    else None
+                ),
+                ranking_metric=str(params.get("ranking_metric") or "analysis_score"),
                 thresholds=dict(params.get("thresholds") or {}),
             )
         else:

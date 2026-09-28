@@ -30,6 +30,7 @@ def main() -> None:
         {
             "Jobs": [
                 _page(package_root, "app/pages/jobs.py", "Jobs", "jobs", default=True),
+                _page(package_root, "app/pages/settings.py", "Settings", "settings"),
             ],
             "Tasks": [
                 _page(package_root, "app/pages/target_preparation.py", "Target Preparation", "target-preparation"),
@@ -46,6 +47,7 @@ def main() -> None:
             ],
             "": [
                 _page(package_root, "app/pages/results.py", "Result Details", "results", hidden=True),
+                _page(package_root, "app/pages/design_capacity_results.py", "Design Capacity Batch Results", "design-capacity-results", hidden=True),
             ],
         },
         position="sidebar",

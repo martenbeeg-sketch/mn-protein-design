@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import os
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from mn_protein_design.app.pages.common import (
     esmfold2_preset_label,
     esmfold2_preset_selector,
     gpu_run_panel,
+    refresh_results_button,
     result_link,
     selected_dataframe_rows,
     show_delete_jobs_dialog,
@@ -19,7 +22,8 @@ from mn_protein_design.app.pages.common import (
 )
 from mn_protein_design.core.jobs import ACTIVE_STATUSES, collect_jobs, finish_job, read_json
 from mn_protein_design.core.local_worker import spawn_worker_for_run
-from mn_protein_design.core.runtime_estimator import estimate_engines
+from mn_protein_design.core.runtime_estimator import estimate_engines, format_duration
+from mn_protein_design.runtime import runs_root
 from mn_protein_design.workflows.benchmark import (
     ALPHAFAST_DB_DIR,
     ALPHAFAST_WEIGHTS_DIR,
@@ -39,7 +43,14 @@ from mn_protein_design.workflows.benchmark import (
 )
 from mn_protein_design.workflows.capacity_benchmark import capacity_warnings
 from mn_protein_design.workflows.esm_binder import ESMFOLD2_MODEL_DIR
-from mn_protein_design.workflows.refolding import BOLTZ_MODELS_DIR, RF3_CHECKPOINT
+from mn_protein_design.workflows.refolding import (
+    BOLTZ_MODELS_DIR,
+    OPENFOLD3_CHECKPOINT,
+    PROTENIX_V1_20250630_MODEL,
+    PROTENIX_V1_MODEL,
+    PROTENIX_V2_MODEL,
+    RF3_CHECKPOINT,
+)
 
 
 KNOWN_BENCHMARK_ROOT = Path("/mnt/db/reference_files/de_novo_binder_scoring_overath_2025")
@@ -52,9 +63,34 @@ BENCHMARK_MATRIX_ENGINE_ORDER = [
     "BoltzGen Fold",
     "ColabFold",
     "ESMFold2",
-    "Protenix",
+    "OpenFold-3",
+    "Protenix v0.5",
+    "Protenix v1",
+    "Protenix v2",
     "RF3",
 ]
+BENCHMARK_ENGINE_METRIC_FILES = {
+    "AF3": "alphafast_af3_metrics.csv",
+    "AF2-IG": "af2_initial_guess_metrics.csv",
+    "Boltz-2": "boltz2_initial_guess_metrics.csv",
+    "BoltzGen Fold": "boltzgen_fold_metrics.csv",
+    "ColabFold": "colabfold_metrics.csv",
+    "ESMFold2": "esmfold2_metrics.csv",
+    "OpenFold-3": "openfold3_metrics.csv",
+    "Protenix v0.5": "protenix_metrics.csv",
+    "Protenix v1": "protenix_v1_metrics.csv",
+    "Protenix v2": "protenix_v2_metrics.csv",
+    "RF3": "rf3_metrics.csv",
+    "Input": "input_rosetta_metrics.csv",
+}
+BENCHMARK_ENGINE_ALIASES = {
+    "Protenix": "Protenix v0.5",
+}
+
+
+def _canonical_benchmark_engine_label(engine: object) -> str:
+    text = str(engine or "").strip()
+    return BENCHMARK_ENGINE_ALIASES.get(text, text)
 
 
 def _safe_sort_token(value: object) -> str:
@@ -119,6 +155,7 @@ def _estimate_rows_dataframe(estimate: dict) -> pd.DataFrame:
                 "engine": row.get("label"),
                 "estimated_time": row.get("estimated_time"),
                 "seconds_per_candidate": row.get("seconds_per_candidate"),
+                "seconds_per_residue": row.get("seconds_per_residue"),
                 "basis": row.get("basis"),
                 "history_runs": row.get("history_runs"),
             }
@@ -162,6 +199,11 @@ def _enabled_engines(params: dict) -> str:
                 collection_engines.extend(str(engine) for engine in (selection.get("engines") or []))
         if collection_engines:
             return ", ".join(dict.fromkeys(collection_engines))
+    engines = _benchmark_engine_labels_from_params(params)
+    return ", ".join(engines) or "metrics only"
+
+
+def _benchmark_engine_labels_from_params(params: dict) -> list[str]:
     engines: list[str] = []
     if params.get("run_alphafast_af3"):
         engines.append("AF3")
@@ -175,13 +217,154 @@ def _enabled_engines(params: dict) -> str:
         engines.append("ESMFold2")
     if params.get("run_rf3"):
         engines.append("RF3")
+    if params.get("run_openfold3"):
+        engines.append("OpenFold-3")
     if params.get("run_protenix"):
-        engines.append("Protenix")
+        engines.append("Protenix v0.5")
+    if params.get("run_protenix_v1"):
+        engines.append("Protenix v1")
+    if params.get("run_protenix_v2"):
+        engines.append("Protenix v2")
     if params.get("run_boltzgen_fold"):
-        engines.append("BoltzGen fold")
+        engines.append("BoltzGen Fold")
     if not engines and params.get("modes"):
         engines.append("ESMFold2")
-    return ", ".join(engines) or "metrics only"
+    return engines
+
+
+def _bool_param(params: dict, worker_kwargs: dict, key: str, default: bool = False) -> bool:
+    value = params.get(key, worker_kwargs.get(key, default))
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _list_param(params: dict, worker_kwargs: dict, key: str) -> list[str]:
+    value = params.get(key, worker_kwargs.get(key, []))
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = ast.literal_eval(text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+        return [part.strip() for part in text.split(",") if part.strip()]
+    return []
+
+
+def _benchmark_evidence_label(*, msa: bool = False, template: bool = False) -> str:
+    if msa and template:
+        return "MSA+template"
+    if msa:
+        return "MSA"
+    if template:
+        return "template"
+    return "none"
+
+
+def _benchmark_evidence_summary(params: dict, worker_kwargs: dict) -> tuple[str, str]:
+    """Summarize whether selected benchmark engines used target MSA and/or template evidence."""
+    if isinstance(params.get("selections"), list):
+        engines: list[str] = []
+        for selection in params.get("selections") or []:
+            if isinstance(selection, dict):
+                engines.extend(str(engine) for engine in selection.get("engines") or [])
+        return "mixed", "; ".join(dict.fromkeys(engines))
+
+    uses_msa = False
+    uses_template = False
+    engine_modes: list[tuple[str, str]] = []
+
+    def add(engine: str, *, msa: bool = False, template: bool = False) -> None:
+        nonlocal uses_msa, uses_template
+        uses_msa = uses_msa or bool(msa)
+        uses_template = uses_template or bool(template)
+        engine_modes.append((engine, _benchmark_evidence_label(msa=msa, template=template)))
+
+    if _bool_param(params, worker_kwargs, "run_alphafast_af3"):
+        add(
+            "AF3",
+            msa=not _bool_param(params, worker_kwargs, "alphafast_query_only_msa", False),
+            template=_bool_param(params, worker_kwargs, "alphafast_use_target_templates", True),
+        )
+    if _bool_param(params, worker_kwargs, "run_colabfold"):
+        add(
+            "ColabFold",
+            msa=_bool_param(params, worker_kwargs, "colabfold_use_target_msa", True),
+            template=_bool_param(params, worker_kwargs, "colabfold_use_target_templates", True),
+        )
+    if _bool_param(params, worker_kwargs, "run_af2_initial_guess"):
+        add("AF2-IG", template=True)
+    if _bool_param(params, worker_kwargs, "run_boltz2_initial_guess"):
+        add(
+            "Boltz-2",
+            msa=_bool_param(params, worker_kwargs, "boltz2_use_target_msa", True),
+            template=_bool_param(params, worker_kwargs, "boltz2_use_target_template", True),
+        )
+    if _bool_param(params, worker_kwargs, "run_esmfold2") or params.get("modes"):
+        add(
+            "ESMFold2",
+            msa=_bool_param(params, worker_kwargs, "esmfold2_use_target_msa", False),
+            template="initial_guess" in set(
+                _list_param(params, worker_kwargs, "esmfold2_modes") or _list_param(params, worker_kwargs, "modes")
+            ),
+        )
+    if _bool_param(params, worker_kwargs, "run_rf3"):
+        add(
+            "RF3",
+            msa=_bool_param(params, worker_kwargs, "rf3_use_target_msa", True),
+            template=_bool_param(params, worker_kwargs, "rf3_use_target_template", True),
+        )
+    if _bool_param(params, worker_kwargs, "run_openfold3"):
+        add("OpenFold-3", msa=_bool_param(params, worker_kwargs, "openfold3_use_target_msa", True))
+    if _bool_param(params, worker_kwargs, "run_protenix"):
+        add("Protenix v0.5", msa=_bool_param(params, worker_kwargs, "protenix_use_msa", True))
+    if _bool_param(params, worker_kwargs, "run_protenix_v1"):
+        add(
+            "Protenix v1",
+            msa=_bool_param(params, worker_kwargs, "protenix_v1_use_msa", True),
+            template=_bool_param(params, worker_kwargs, "protenix_v1_use_template", False),
+        )
+    if _bool_param(params, worker_kwargs, "run_protenix_v2"):
+        add(
+            "Protenix v2",
+            msa=_bool_param(params, worker_kwargs, "protenix_v2_use_msa", True),
+            template=_bool_param(params, worker_kwargs, "protenix_v2_use_template", False),
+        )
+    if _bool_param(params, worker_kwargs, "run_boltzgen_fold"):
+        add("BoltzGen Fold", template=True)
+
+    return _benchmark_evidence_label(msa=uses_msa, template=uses_template), "; ".join(
+        f"{engine}: {mode}" for engine, mode in engine_modes
+    )
+
+
+def _benchmark_engines_available_for_run(run_dir: Path, input_payload: dict, metrics_path: Path) -> list[str]:
+    detected = [_canonical_benchmark_engine_label(engine) for engine in benchmark_engines_in_metrics(metrics_path)]
+    job_type = str(input_payload.get("job_type") or "")
+    if job_type == "benchmark_collection":
+        return detected
+
+    params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+    selected = {_canonical_benchmark_engine_label(engine) for engine in _benchmark_engine_labels_from_params(params)}
+    if not selected:
+        return detected
+
+    benchmark_dir = run_dir / "artifacts" / "benchmark"
+    available: list[str] = []
+    for engine in detected:
+        if engine not in selected and engine != "Input":
+            continue
+        metric_name = BENCHMARK_ENGINE_METRIC_FILES.get(engine)
+        if metric_name and not (benchmark_dir / metric_name).exists():
+            continue
+        available.append(engine)
+    return available
 
 
 def _short_bool(value: object) -> str:
@@ -235,21 +418,48 @@ def _benchmark_engine_settings(input_payload: dict, worker_kwargs: dict, engine:
         add(parts, "templates", _short_bool(get_value("colabfold_use_target_templates", default=False)))
         add(parts, "template_hits", get_value("colabfold_max_template_hits", default=""))
     elif engine == "AF3":
+        add(parts, "templates", _short_bool(get_value("alphafast_use_target_templates", default=True)))
+        add(parts, "target_msa", _short_bool(not bool(get_value("alphafast_query_only_msa", default=False))))
         add(parts, "recycles", get_value("alphafast_num_recycles", default=""))
         add(parts, "batch", get_value("alphafast_batch_size", default=""))
         add(parts, "gpu", get_value("alphafast_gpu_device", "gpu_device", default=""))
     elif engine == "RF3":
+        add(parts, "templates", _short_bool(get_value("rf3_use_target_template", default=True)))
         add(parts, "target_msa", _short_bool(get_value("rf3_use_target_msa", default=True)))
         add(parts, "recycles", get_value("rf3_recycles", default=""))
         add(parts, "steps", get_value("rf3_num_steps", default=""))
         add(parts, "batch", get_value("rf3_diffusion_batch_size", default=""))
         checkpoint = str(get_value("rf3_checkpoint_path", default=""))
         add(parts, "checkpoint", Path(checkpoint).name if checkpoint else "")
-    elif engine == "Protenix":
+    elif engine == "OpenFold-3":
+        add(parts, "target_msa", _short_bool(get_value("openfold3_use_target_msa", default=True)))
+        add(parts, "samples", get_value("openfold3_num_diffusion_samples", default=""))
+        add(parts, "seeds", get_value("openfold3_num_model_seeds", default=""))
+        add(parts, "recycles", get_value("openfold3_num_recycles", default=""))
+        add(parts, "msa_server", _short_bool(get_value("openfold3_use_msa_server", default=False)))
+        checkpoint = str(get_value("openfold3_checkpoint_path", default=""))
+        add(parts, "checkpoint", Path(checkpoint).name if checkpoint else "")
+    elif engine in {"Protenix", "Protenix v0.5"}:
         add(parts, "msa", _short_bool(get_value("protenix_use_msa", default=True)))
         add(parts, "cycles", get_value("protenix_cycle", default=""))
         add(parts, "steps", get_value("protenix_diffusion_steps", default=""))
         add(parts, "samples", get_value("protenix_samples", default=""))
+    elif engine == "Protenix v1":
+        add(parts, "model", get_value("protenix_v1_model_name", default=""))
+        add(parts, "default_params", _short_bool(get_value("protenix_v1_use_default_params", default=True)))
+        add(parts, "msa", _short_bool(get_value("protenix_v1_use_msa", default=True)))
+        add(parts, "template", _short_bool(get_value("protenix_v1_use_template", default=False)))
+        add(parts, "cycles", get_value("protenix_v1_cycle", default=""))
+        add(parts, "steps", get_value("protenix_v1_diffusion_steps", default=""))
+        add(parts, "samples", get_value("protenix_v1_samples", default=""))
+    elif engine == "Protenix v2":
+        add(parts, "model", get_value("protenix_v2_model_name", default=""))
+        add(parts, "default_params", _short_bool(get_value("protenix_v2_use_default_params", default=True)))
+        add(parts, "msa", _short_bool(get_value("protenix_v2_use_msa", default=True)))
+        add(parts, "template", _short_bool(get_value("protenix_v2_use_template", default=False)))
+        add(parts, "cycles", get_value("protenix_v2_cycle", default=""))
+        add(parts, "steps", get_value("protenix_v2_diffusion_steps", default=""))
+        add(parts, "samples", get_value("protenix_v2_samples", default=""))
     return "; ".join(parts)
 
 
@@ -328,6 +538,7 @@ def _benchmark_job_table(rows: list[dict]) -> pd.DataFrame:
         esm_preset = esmfold2_preset_label(esm_loops, esm_steps)
         metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
         outputs = result.get("outputs") if isinstance(result.get("outputs"), dict) else {}
+        evidence_mode, evidence_detail = _benchmark_evidence_summary(params, worker_kwargs)
         top_ap = (
             feature_summary.get("top_feature_average_precision")
             or metrics.get("merged_benchmark_top_feature_average_precision")
@@ -356,10 +567,13 @@ def _benchmark_job_table(rows: list[dict]) -> pd.DataFrame:
             {
                 "delete": False,
                 "result": result_link("benchmark", str(row.get("run_id")), "Open result"),
+                "job_code_link": f"{result_link('benchmark', str(row.get('run_id')))}&job_code={row.get('job_code')}",
                 "kind": "collection" if job_type == "benchmark_collection" else "benchmark",
                 "description": " | ".join(description_parts),
                 "dataset": _job_dataset_label(input_payload),
                 "engines": _enabled_engines(params),
+                "evidence_mode": evidence_mode,
+                "evidence_detail": evidence_detail,
                 "esmfold2_preset": esm_preset,
                 "esmfold2_loops": esm_loops,
                 "esmfold2_steps": esm_steps,
@@ -418,7 +632,7 @@ def _available_benchmark_sources(rows: list[dict]) -> tuple[list[dict], list[dic
                 }
             )
             continue
-        engines_available = benchmark_engines_in_metrics(metrics_path)
+        engines_available = _benchmark_engines_available_for_run(run_dir, input_payload, metrics_path)
         if not engines_available:
             unavailable_rows.append(
                 {
@@ -526,10 +740,588 @@ def _benchmark_matrix_cells(source_rows: list[dict]) -> pd.DataFrame:
     return cells
 
 
+def _input_target_counts_for_benchmark(run_dir: Path, input_payload: dict) -> pd.DataFrame:
+    records = _input_records_for_benchmark(run_dir, input_payload)
+    if records.empty:
+        return pd.DataFrame(columns=["target_id", "records"])
+    grouped = records.groupby("target_id", dropna=False).size().reset_index(name="records")
+    grouped["target_id"] = grouped["target_id"].astype(str)
+    return grouped
+
+
+def _input_records_for_benchmark(run_dir: Path, input_payload: dict) -> pd.DataFrame:
+    inputs = input_payload.get("inputs") if isinstance(input_payload.get("inputs"), dict) else {}
+    candidate_paths = [
+        run_dir / "artifacts" / "raw" / "de_novo_binder_scoring" / "dataset" / "input.csv",
+        run_dir / "artifacts" / "queued_inputs" / "input.csv",
+    ]
+    input_csv = str(inputs.get("input_csv") or "").strip()
+    if input_csv:
+        candidate_paths.append(Path(input_csv).expanduser())
+    worker_payload = read_json(run_dir / "worker_request.json")
+    worker_kwargs = worker_payload.get("kwargs") if isinstance(worker_payload.get("kwargs"), dict) else {}
+    worker_csv = str(worker_kwargs.get("input_csv") or "").strip()
+    if worker_csv:
+        candidate_paths.append(Path(worker_csv).expanduser())
+    for path in candidate_paths:
+        if path.exists():
+            try:
+                df = pd.read_csv(path)
+            except Exception:
+                continue
+            if df.empty or "binder_id" not in df.columns:
+                continue
+            if "target_id" not in df.columns:
+                df["target_id"] = "all targets"
+            df["binder_id"] = df["binder_id"].astype(str)
+            df["target_id"] = df["target_id"].astype(str)
+            df["total_residues"] = df.apply(_input_row_total_residues, axis=1)
+            return df[["binder_id", "target_id", "total_residues"]].copy()
+    return pd.DataFrame(columns=["binder_id", "target_id", "total_residues"])
+
+
+def _numeric_or_zero(value: object) -> int:
+    try:
+        if value is None or pd.isna(value):
+            return 0
+        return max(0, int(float(str(value))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _input_row_total_residues(row: pd.Series) -> int:
+    binder_chain = str(row.get("binder_chain") or "A").strip() or "A"
+    total = _numeric_or_zero(row.get(f"{binder_chain}_length") or row.get("A_length"))
+    target_chains = _parse_text_list(row.get("target_chains"))
+    if target_chains:
+        for chain in target_chains:
+            if chain == binder_chain:
+                continue
+            length = (
+                _numeric_or_zero(row.get(f"{chain}_length"))
+                or _numeric_or_zero(row.get(f"target_subchain_{chain}_len"))
+                or _sequence_length_value(row.get(f"target_subchain_{chain}_seq"))
+            )
+            total += int(length)
+    else:
+        total += _numeric_or_zero(row.get("B_length"))
+    return int(total)
+
+
+def _sequence_length_value(value: object) -> int:
+    text = str(value or "").strip()
+    if not text or text.lower() == "nan":
+        return 0
+    return len(text)
+
+
+def _parse_text_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text or text.lower() == "nan":
+        return []
+    try:
+        import ast
+
+        parsed = ast.literal_eval(text)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, (list, tuple, set)):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return [part.strip().strip("'\"") for part in text.replace(";", ",").split(",") if part.strip().strip("'\"")]
+
+
+def _child_tool_for_matrix_engine(engine: str) -> str:
+    engine = _canonical_benchmark_engine_label(engine)
+    return {
+        "Protenix v0.5": "protenix",
+        "Protenix v1": "protenix_v1",
+        "Protenix v2": "protenix_v2",
+        "RF3": "rf3",
+        "OpenFold-3": "openfold3",
+        "BoltzGen Fold": "boltzgen_fold",
+    }.get(engine, "")
+
+
+def _latest_internal_child_run(parent_run_dir: Path, tool: str) -> Path | None:
+    if not tool:
+        return None
+    matches: list[Path] = []
+    root = runs_root()
+    if not root.exists():
+        return None
+    parent_text = str(parent_run_dir)
+    for metadata_path in root.glob("*/*/metadata.json"):
+        child_dir = metadata_path.parent
+        if child_dir == parent_run_dir:
+            continue
+        metadata = read_json(metadata_path)
+        if str(metadata.get("parent_run_dir") or metadata.get("internal_parent_run_dir") or "") != parent_text:
+            continue
+        if str(metadata.get("tool") or metadata.get("engine") or "") != tool:
+            continue
+        matches.append(child_dir)
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def _active_child_candidate_ids(child_run_dir: Path) -> set[str]:
+    metadata = read_json(child_run_dir / "metadata.json")
+    for key in ("current_candidate_ids", "current_step_candidate_ids", "active_candidate_ids"):
+        values = metadata.get(key)
+        if isinstance(values, list):
+            return {str(value) for value in values if str(value)}
+
+    command_payload = read_json(child_run_dir / "command.json")
+    steps = command_payload.get("steps") if isinstance(command_payload.get("steps"), list) else []
+    if not steps:
+        return set()
+    stdout_path = child_run_dir / "stdout.log"
+    if not stdout_path.exists():
+        return set()
+    try:
+        command_lines = [line.strip()[2:] for line in stdout_path.read_text(errors="ignore").splitlines() if line.startswith("$ ")]
+    except Exception:
+        return set()
+    if not command_lines:
+        return set()
+    active_command = command_lines[-1]
+    for step in steps:
+        command = step.get("command")
+        if isinstance(command, list) and " ".join(str(part) for part in command) == active_command:
+            return {str(value) for value in step.get("candidate_ids") or [] if str(value)}
+    return set()
+
+
+def _active_targets_for_child_engine(parent_run_dir: Path, engine: str, input_records: pd.DataFrame) -> set[str]:
+    child_run_dir = _latest_internal_child_run(parent_run_dir, _child_tool_for_matrix_engine(engine))
+    if child_run_dir is None or input_records.empty:
+        return set()
+    metadata = read_json(child_run_dir / "metadata.json")
+    target_values = metadata.get("current_target_ids")
+    if isinstance(target_values, list):
+        targets = {str(value) for value in target_values if str(value)}
+        if targets:
+            return targets
+    active_ids = _active_child_candidate_ids(child_run_dir)
+    if not active_ids:
+        return set()
+    binder_to_target = {
+        str(row["binder_id"]): str(row["target_id"])
+        for _, row in input_records.iterrows()
+    }
+    binder_to_target.update({str(key).lower(): value for key, value in list(binder_to_target.items())})
+    return {binder_to_target[candidate_id] for candidate_id in active_ids if candidate_id in binder_to_target}
+
+
+def _child_engine_step_index(parent_run_dir: Path, engine: str) -> tuple[int | None, list[dict]]:
+    child_run_dir = _latest_internal_child_run(parent_run_dir, _child_tool_for_matrix_engine(engine))
+    if child_run_dir is None:
+        return None, []
+    metadata = read_json(child_run_dir / "metadata.json")
+    step_index = metadata.get("current_step_index")
+    command_payload = read_json(child_run_dir / "command.json")
+    steps = command_payload.get("steps") if isinstance(command_payload.get("steps"), list) else []
+    if step_index:
+        return int(step_index), steps
+    stdout_path = child_run_dir / "stdout.log"
+    if not steps or not stdout_path.exists():
+        return None, steps
+    try:
+        command_lines = [line.strip()[2:] for line in stdout_path.read_text(errors="ignore").splitlines() if line.startswith("$ ")]
+    except Exception:
+        return None, steps
+    if not command_lines:
+        return None, steps
+    active_command = command_lines[-1]
+    for step_index, step in enumerate(steps, start=1):
+        command = step.get("command")
+        if isinstance(command, list) and " ".join(str(part) for part in command) == active_command:
+            return step_index, steps
+    return None, steps
+
+
+def _child_engine_state(parent_run_dir: Path, engine: str) -> tuple[Path | None, int | None, list[dict]]:
+    child_run_dir = _latest_internal_child_run(parent_run_dir, _child_tool_for_matrix_engine(engine))
+    if child_run_dir is None:
+        return None, None, []
+    step_index, steps = _child_engine_step_index(parent_run_dir, engine)
+    return child_run_dir, step_index, steps
+
+
+def _candidate_residue_map(input_records: pd.DataFrame) -> dict[str, int]:
+    if input_records.empty or "binder_id" not in input_records.columns:
+        return {}
+    values: dict[str, int] = {}
+    for _, row in input_records.iterrows():
+        binder_id = str(row.get("binder_id") or "")
+        residues = _numeric_or_zero(row.get("total_residues"))
+        if binder_id and residues:
+            values[binder_id] = residues
+            values[binder_id.lower()] = residues
+    return values
+
+
+def _step_candidate_ids(step: dict) -> set[str]:
+    values = {str(value) for value in step.get("candidate_ids") or [] if str(value)}
+    values.update({value.lower() for value in list(values)})
+    return values
+
+
+def _step_residue_total(step: dict, residue_by_candidate: dict[str, int]) -> int:
+    explicit = _numeric_or_zero(step.get("total_residues"))
+    if explicit:
+        return explicit
+    total = 0
+    for candidate_id in [str(value) for value in step.get("candidate_ids") or [] if str(value)]:
+        total += int(residue_by_candidate.get(candidate_id) or residue_by_candidate.get(candidate_id.lower()) or 0)
+    return total
+
+
+def _format_matrix_seconds(seconds: float | None) -> str:
+    if seconds is None:
+        return ""
+    return format_duration(float(seconds))
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _current_step_elapsed_seconds(metadata: dict, step_index: int | None, completed_indices: set[int]) -> float:
+    if step_index is None or step_index in completed_indices:
+        return 0.0
+    started_at = _parse_timestamp(metadata.get("updated_at"))
+    if started_at is None:
+        return 0.0
+    return max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
+
+
+def _engine_estimate_seconds(engine: str, candidate_count: int, total_residues: int) -> float | None:
+    if candidate_count <= 0:
+        return None
+    estimate = estimate_engines(
+        engines=[_child_tool_for_matrix_engine(engine) or engine],
+        candidate_count=int(candidate_count),
+        total_residues=int(total_residues) if total_residues else None,
+    )
+    rows = estimate.get("rows") or []
+    if not rows:
+        return None
+    value = rows[0].get("estimated_seconds")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _child_runtime_progress(
+    parent_run_dir: Path,
+    engine: str,
+    target_id: str,
+    input_records: pd.DataFrame,
+) -> dict[str, str]:
+    child_run_dir, step_index, steps = _child_engine_state(parent_run_dir, engine)
+    if child_run_dir is None or step_index is None or not steps or input_records.empty:
+        return {}
+
+    metadata = read_json(child_run_dir / "metadata.json")
+    residue_by_candidate = _candidate_residue_map(input_records)
+    target_candidate_ids = set(
+        input_records.loc[input_records["target_id"].astype(str).eq(str(target_id)), "binder_id"].astype(str)
+    )
+    target_ids = set(target_candidate_ids)
+    target_ids.update({value.lower() for value in list(target_ids)})
+    target_step_indices = [
+        index
+        for index, step in enumerate(steps, start=1)
+        if target_ids & _step_candidate_ids(step)
+    ]
+    if not target_step_indices:
+        return {}
+
+    timing_payload = read_json(child_run_dir / "artifacts" / "runtime_step_timings.json")
+    timing_rows = timing_payload.get("timings") if isinstance(timing_payload.get("timings"), list) else []
+    timings_by_index: dict[int, dict] = {}
+    for timing in timing_rows:
+        try:
+            timings_by_index[int(timing.get("step_index"))] = timing
+        except (TypeError, ValueError):
+            continue
+    completed_indices = set(timings_by_index)
+    current_elapsed = _current_step_elapsed_seconds(metadata, step_index, completed_indices)
+
+    def step_seconds(index: int) -> float:
+        timing = timings_by_index.get(index) or {}
+        try:
+            return float(timing.get("seconds") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    completed_seconds = sum(step_seconds(index) for index in completed_indices)
+    overall_elapsed = completed_seconds + current_elapsed
+    target_completed_seconds = sum(step_seconds(index) for index in target_step_indices if index in completed_indices)
+    target_elapsed = target_completed_seconds + (current_elapsed if step_index in target_step_indices else 0.0)
+
+    overall_residues = sum(_step_residue_total(step, residue_by_candidate) for step in steps)
+    target_residues = sum(_step_residue_total(steps[index - 1], residue_by_candidate) for index in target_step_indices)
+    completed_residues = sum(
+        _step_residue_total(steps[index - 1], residue_by_candidate)
+        for index in completed_indices
+        if 0 < index <= len(steps)
+    )
+    timed_seconds = sum(step_seconds(index) for index in completed_indices)
+    estimated_overall_by_batch = None
+    estimated_target_by_batch = None
+    if completed_indices and timed_seconds:
+        seconds_per_step = timed_seconds / float(max(1, len(completed_indices)))
+        estimated_overall_by_batch = seconds_per_step * float(len(steps))
+        estimated_target_by_batch = seconds_per_step * float(len(target_step_indices))
+    if completed_residues and timed_seconds:
+        seconds_per_residue = timed_seconds / float(completed_residues)
+        estimated_overall_by_residue = seconds_per_residue * float(overall_residues or 0)
+        estimated_target_by_residue = seconds_per_residue * float(target_residues or 0)
+        if estimated_overall_by_batch is not None:
+            estimated_overall = max(estimated_overall_by_residue, estimated_overall_by_batch)
+            estimated_target = max(estimated_target_by_residue, estimated_target_by_batch or 0.0)
+            estimate_basis = "current/conservative"
+        else:
+            estimated_overall = estimated_overall_by_residue
+            estimated_target = estimated_target_by_residue
+            estimate_basis = "current/residue"
+    elif completed_indices:
+        estimated_overall = estimated_overall_by_batch
+        estimated_target = estimated_target_by_batch
+        estimate_basis = "current/batch"
+    else:
+        estimated_overall = _engine_estimate_seconds(engine, len(input_records), overall_residues)
+        estimated_target = _engine_estimate_seconds(engine, len(target_candidate_ids), target_residues)
+        estimate_basis = "history/fallback"
+
+    target_done = sum(1 for index in target_step_indices if index < step_index)
+    target_current = target_done + (1 if step_index in target_step_indices else 0)
+    target_current = max(0, min(target_current, len(target_step_indices)))
+    overall_progress = f"{int(step_index)}/{len(steps)}"
+    target_progress = f"{target_current}/{len(target_step_indices)}"
+    remaining_overall = max(0.0, float(estimated_overall or 0.0) - overall_elapsed) if estimated_overall else None
+    remaining_target = max(0.0, float(estimated_target or 0.0) - target_elapsed) if estimated_target else None
+    return {
+        "batch_progress": target_progress,
+        "overall_batch_progress": overall_progress,
+        "target_batch_progress": target_progress,
+        "elapsed_overall": _format_matrix_seconds(overall_elapsed),
+        "elapsed_target": _format_matrix_seconds(target_elapsed),
+        "estimated_overall": _format_matrix_seconds(estimated_overall),
+        "estimated_target": _format_matrix_seconds(estimated_target),
+        "estimated_overall_by_batch": _format_matrix_seconds(estimated_overall_by_batch),
+        "estimated_target_by_batch": _format_matrix_seconds(estimated_target_by_batch),
+        "estimated_overall_by_residue": _format_matrix_seconds(locals().get("estimated_overall_by_residue")),
+        "estimated_target_by_residue": _format_matrix_seconds(locals().get("estimated_target_by_residue")),
+        "remaining_overall": _format_matrix_seconds(remaining_overall),
+        "remaining_target": _format_matrix_seconds(remaining_target),
+        "estimate_basis": estimate_basis,
+    }
+
+
+def _child_target_batch_progress(
+    parent_run_dir: Path,
+    engine: str,
+    target_id: str,
+    input_records: pd.DataFrame,
+) -> str:
+    if input_records.empty:
+        return ""
+    step_index, steps = _child_engine_step_index(parent_run_dir, engine)
+    if step_index is None or not steps:
+        return ""
+    target_ids = set(
+        input_records.loc[input_records["target_id"].astype(str).eq(str(target_id)), "binder_id"].astype(str)
+    )
+    target_ids.update({value.lower() for value in target_ids})
+    if not target_ids:
+        return ""
+    target_step_indices: list[int] = []
+    for index, step in enumerate(steps, start=1):
+        candidate_ids = {str(value) for value in step.get("candidate_ids") or [] if str(value)}
+        candidate_ids.update({value.lower() for value in list(candidate_ids)})
+        if target_ids & candidate_ids:
+            target_step_indices.append(index)
+    if not target_step_indices:
+        return ""
+    completed_for_target = sum(1 for index in target_step_indices if index < step_index)
+    if step_index in target_step_indices:
+        current_for_target = completed_for_target + 1
+    else:
+        current_for_target = completed_for_target
+    total_for_target = len(target_step_indices)
+    if current_for_target <= 0:
+        return f"0/{total_for_target}"
+    return f"{current_for_target}/{total_for_target}"
+
+
+def _live_benchmark_matrix_cells(rows: list[dict]) -> pd.DataFrame:
+    live_rows: list[dict[str, object]] = []
+    engine_rank = {engine: index for index, engine in enumerate(BENCHMARK_MATRIX_ENGINE_ORDER)}
+    engine_metric_files = {
+        "AF3": "alphafast_af3_metrics.csv",
+        "AF2-IG": "af2_initial_guess_metrics.csv",
+        "Boltz-2": "boltz2_initial_guess_metrics.csv",
+        "BoltzGen Fold": "boltzgen_fold_metrics.csv",
+        "ColabFold": "colabfold_metrics.csv",
+        "ESMFold2": "esmfold2_metrics.csv",
+        "OpenFold-3": "openfold3_metrics.csv",
+        "Protenix v0.5": "protenix_metrics.csv",
+        "Protenix v1": "protenix_v1_metrics.csv",
+        "Protenix v2": "protenix_v2_metrics.csv",
+        "RF3": "rf3_metrics.csv",
+    }
+    live_statuses = set(ACTIVE_STATUSES) | {"failed"}
+    for row in rows:
+        status = str(row.get("status") or "")
+        if status not in live_statuses:
+            continue
+        run_dir = Path(str(row.get("run_dir") or ""))
+        input_payload = read_json(run_dir / "input.json")
+        job_type = str(input_payload.get("job_type") or "")
+        if job_type in {"benchmark_collection", "benchmark_matrix_workspace", "refolding_evaluation"}:
+            continue
+        params = input_payload.get("params") if isinstance(input_payload.get("params"), dict) else {}
+        engines = _benchmark_engine_labels_from_params(params)
+        if not engines:
+            continue
+        input_records = _input_records_for_benchmark(run_dir, input_payload)
+        target_counts = (
+            input_records.groupby("target_id", dropna=False).size().reset_index(name="records")
+            if not input_records.empty
+            else pd.DataFrame(columns=["target_id", "records"])
+        )
+        if not target_counts.empty:
+            target_counts["target_id"] = target_counts["target_id"].astype(str)
+        if target_counts.empty:
+            continue
+        worker_payload = read_json(run_dir / "worker_request.json")
+        worker_kwargs = worker_payload.get("kwargs") if isinstance(worker_payload.get("kwargs"), dict) else {}
+        current_phase = str(row.get("current_phase") or "")
+        current_engine = str(row.get("current_engine") or "")
+        active_targets_by_engine: dict[str, set[str]] = {}
+
+        def matrix_status_for_engine(engine: str, target_id: str) -> str:
+            if status == "failed":
+                return "failed"
+            if status == "queued":
+                return "queued"
+            metric_name = engine_metric_files.get(engine)
+            metric_path = run_dir / "artifacts" / "benchmark" / metric_name if metric_name else None
+            if metric_path is not None and metric_path.exists():
+                return "completed"
+            if current_phase.startswith("Predicting"):
+                if current_engine == engine:
+                    active_targets = active_targets_by_engine.setdefault(
+                        engine,
+                        _active_targets_for_child_engine(run_dir, engine, input_records),
+                    )
+                    if active_targets:
+                        return "running" if target_id in active_targets else "queued"
+                    return "queued"
+                if current_engine in engines and engine in engines:
+                    return "completed" if engines.index(engine) < engines.index(current_engine) else "queued"
+                return "queued"
+            if current_phase.startswith("Calculating benchmark metrics"):
+                return "completed"
+            return "queued"
+
+        for _, target_row in target_counts.iterrows():
+            target_id = str(target_row.get("target_id") or "all targets")
+            for engine in engines:
+                cell_status = matrix_status_for_engine(engine, target_id)
+                runtime_progress: dict[str, str] = {}
+                if cell_status == "running":
+                    runtime_progress = _child_runtime_progress(
+                        run_dir,
+                        engine,
+                        target_id,
+                        input_records,
+                    )
+                batch_progress = runtime_progress.get("batch_progress", "")
+                live_rows.append(
+                    {
+                        "select": False,
+                        "engine": engine,
+                        "engine_rank": engine_rank.get(engine, len(engine_rank)),
+                        "target_id": target_id,
+                        "status": cell_status,
+                        "batch_progress": batch_progress,
+                        "overall_batch_progress": runtime_progress.get("overall_batch_progress", ""),
+                        "target_batch_progress": runtime_progress.get("target_batch_progress", ""),
+                        "elapsed_overall": runtime_progress.get("elapsed_overall", ""),
+                        "elapsed_target": runtime_progress.get("elapsed_target", ""),
+                        "estimated_overall": runtime_progress.get("estimated_overall", ""),
+                        "estimated_target": runtime_progress.get("estimated_target", ""),
+                        "estimated_overall_by_batch": runtime_progress.get("estimated_overall_by_batch", ""),
+                        "estimated_target_by_batch": runtime_progress.get("estimated_target_by_batch", ""),
+                        "estimated_overall_by_residue": runtime_progress.get("estimated_overall_by_residue", ""),
+                        "estimated_target_by_residue": runtime_progress.get("estimated_target_by_residue", ""),
+                        "remaining_overall": runtime_progress.get("remaining_overall", ""),
+                        "remaining_target": runtime_progress.get("remaining_target", ""),
+                        "estimate_basis": runtime_progress.get("estimate_basis", ""),
+                        "records": int(target_row.get("records") or 0),
+                        "run_id": str(row.get("run_id") or ""),
+                        "job_code": str(row.get("job_code") or ""),
+                        "kind": "live benchmark",
+                        "dataset": _job_dataset_label(input_payload),
+                        "settings": _benchmark_engine_settings(input_payload, worker_kwargs, engine),
+                        "description": " | ".join(
+                            part
+                            for part in [
+                                _job_dataset_label(input_payload),
+                                _enabled_engines(params),
+                                str(row.get("current_phase") or ""),
+                                str(row.get("current_engine") or ""),
+                                f"target batches {runtime_progress.get('target_batch_progress')}" if runtime_progress.get("target_batch_progress") else "",
+                                f"overall batches {runtime_progress.get('overall_batch_progress')}" if runtime_progress.get("overall_batch_progress") else "",
+                                f"elapsed target {runtime_progress.get('elapsed_target')}" if runtime_progress.get("elapsed_target") else "",
+                                f"ETA target {runtime_progress.get('remaining_target')}" if runtime_progress.get("remaining_target") else "",
+                            ]
+                            if part
+                        ),
+                        "created_at": str(row.get("created_at") or ""),
+                        "result": result_link("benchmark", str(row.get("run_id")), "Open"),
+                    }
+                )
+    if not live_rows:
+        return pd.DataFrame()
+    live = pd.DataFrame(live_rows)
+    live["created_sort"] = live["created_at"].astype(str)
+    live["kind_rank"] = 3
+    return live.sort_values(["engine_rank", "target_id", "created_sort"], ascending=[True, True, False]).copy()
+
+
 def _canonical_benchmark_cells(cells: pd.DataFrame) -> pd.DataFrame:
     if cells.empty:
         return cells.copy()
-    return cells.drop_duplicates(["engine", "target_id"], keep="first").copy()
+    ranked = cells.copy()
+    status_rank = {"completed": 0, "running": 1, "queued": 2, "failed": 3, "missing": 4}
+    ranked["_status_rank"] = ranked["status"].astype(str).map(status_rank).fillna(5).astype(int)
+    if "kind_rank" not in ranked.columns:
+        ranked["kind_rank"] = ranked["kind"].map({"benchmark": 0, "collection": 1, "live benchmark": 3}).fillna(2)
+    if "created_sort" not in ranked.columns:
+        ranked["created_sort"] = ranked["created_at"].astype(str)
+    ranked = ranked.sort_values(
+        ["engine_rank", "target_id", "_status_rank", "kind_rank", "created_sort"],
+        ascending=[True, True, True, True, False],
+    )
+    return ranked.drop_duplicates(["engine", "target_id"], keep="first").drop(columns=["_status_rank"]).copy()
 
 
 def _clean_checkbox_series(values: pd.Series) -> pd.Series:
@@ -585,6 +1377,20 @@ def _benchmark_matrix_with_missing(
                     "engine_rank": engine_rank.get(engine, len(engine_rank)),
                     "target_id": target_id,
                     "status": "missing",
+                    "batch_progress": "",
+                    "overall_batch_progress": "",
+                    "target_batch_progress": "",
+                    "elapsed_overall": "",
+                    "elapsed_target": "",
+                    "estimated_overall": "",
+                    "estimated_target": "",
+                    "estimated_overall_by_batch": "",
+                    "estimated_target_by_batch": "",
+                    "estimated_overall_by_residue": "",
+                    "estimated_target_by_residue": "",
+                    "remaining_overall": "",
+                    "remaining_target": "",
+                    "estimate_basis": "",
                     "records": 0,
                     "run_id": "",
                     "job_code": "",
@@ -715,7 +1521,10 @@ run_boltz2_ig = True
 run_colabfold = True
 run_alphafast_af3 = True
 run_rf3 = False
+run_openfold3 = False
 run_protenix = False
+run_protenix_v1 = False
+run_protenix_v2 = False
 run_boltzgen_fold = False
 generate_inputs = True
 repo_models: list[str] = ["af3", "boltz", "colabfold"]
@@ -725,7 +1534,7 @@ pyrosetta_nprocs = default_pyrosetta_nprocs
 run_common_interface_metrics = True
 run_predicted_rosetta_metrics = True
 run_pymol_metrics = True
-repo_mode = "pdb_only"
+repo_mode = "hybrid"
 repo_max_records = 0
 repo_esm_modes = ["initial_guess"]
 repo_sampling = 32
@@ -734,9 +1543,9 @@ repo_seed = 0
 af2_recycles = 3
 af2_multimer = True
 af2_legacy_initial_guess = False
-af2_binder_template = False
-af2_interface_template = False
-boltz2_target_template = True
+af2_binder_template = bool(st.session_state.get("benchmark_af2ig_binder_template", False))
+af2_interface_template = bool(st.session_state.get("benchmark_af2ig_interface_template", False))
+boltz2_target_template = bool(st.session_state.get("benchmark_boltz2_template", True))
 boltz2_use_target_msa = bool(st.session_state.get("benchmark_boltz2_use_target_msa", True))
 boltz2_recycling_steps = 10
 boltz2_sampling_steps = 200
@@ -744,14 +1553,33 @@ boltz2_diffusion_samples = 3
 boltz2_write_full_pae = True
 rf3_checkpoint_path = str(RF3_CHECKPOINT)
 rf3_use_target_msa = bool(st.session_state.get("benchmark_rf3_use_target_msa", True))
+rf3_use_target_template = bool(st.session_state.get("benchmark_rf3_use_target_template", True))
 rf3_recycles = 10
 rf3_num_steps = 50
 rf3_diffusion_batch_size = 5
 rf3_seed = 0
+openfold3_checkpoint_path = str(OPENFOLD3_CHECKPOINT)
+openfold3_use_target_msa = bool(st.session_state.get("benchmark_openfold3_use_target_msa", True))
+openfold3_num_diffusion_samples = 5
+openfold3_num_model_seeds = 1
+openfold3_num_recycles = 3
+openfold3_use_msa_server = False
 protenix_use_msa = bool(st.session_state.get("benchmark_protenix_use_msa", True))
 protenix_cycle = 3
 protenix_diffusion_steps = 50
 protenix_samples = 5
+protenix_v1_model_name = PROTENIX_V1_MODEL
+protenix_v1_use_msa = bool(st.session_state.get("benchmark_protenix_v1_use_msa", True))
+protenix_v1_use_template = bool(st.session_state.get("benchmark_protenix_v1_template", False))
+protenix_v1_cycle = 10
+protenix_v1_diffusion_steps = 200
+protenix_v1_samples = 5
+protenix_v2_model_name = PROTENIX_V2_MODEL
+protenix_v2_use_msa = bool(st.session_state.get("benchmark_protenix_v2_use_msa", True))
+protenix_v2_use_template = bool(st.session_state.get("benchmark_protenix_v2_template", False))
+protenix_v2_cycle = 10
+protenix_v2_diffusion_steps = 200
+protenix_v2_samples = 5
 boltzgen_recycling_steps = 3
 boltzgen_sampling_steps = 200
 boltzgen_diffusion_samples = 5
@@ -768,6 +1596,8 @@ alphafast_db_dir = str(ALPHAFAST_DB_DIR)
 alphafast_weights_dir = str(ALPHAFAST_WEIGHTS_DIR)
 alphafast_batch_size = 0
 alphafast_recycles = 10
+alphafast_use_target_templates = bool(st.session_state.get("benchmark_alphafast_use_target_templates", True))
+alphafast_use_target_msa = bool(st.session_state.get("benchmark_alphafast_use_target_msa", True))
 gpu_device = "0"
 simple_modes = ["sequence", "initial_guess"]
 simple_max_records = 0
@@ -839,6 +1669,9 @@ with tabs[0]:
 
                 target_signature = tuple(sorted(selected_targets))
                 previous_signature = st.session_state.get("known_benchmark_target_signature")
+                if st.session_state.pop("known_benchmark_clear_select_all", False):
+                    st.session_state["known_benchmark_select_all"] = False
+                    st.session_state["known_benchmark_select_all_previous"] = False
                 select_all = st.checkbox(
                     "Select all records for selected targets",
                     value=False,
@@ -897,6 +1730,37 @@ with tabs[0]:
                         kind="mergesort",
                         na_position="last",
                     ).drop(columns=["_record_sort_value"], errors="ignore")
+                first_per_target_max = max(1, int(subset.groupby("target_id").size().max()))
+                first_per_target_key = "known_benchmark_first_per_target_count"
+                if int(st.session_state.get(first_per_target_key, 1)) > first_per_target_max:
+                    st.session_state[first_per_target_key] = first_per_target_max
+                first_per_target_cols = st.columns([1, 1, 4])
+                first_per_target_count = first_per_target_cols[0].number_input(
+                    "First records per target",
+                    min_value=1,
+                    max_value=first_per_target_max,
+                    value=min(10, first_per_target_max),
+                    step=1,
+                    key=first_per_target_key,
+                    help="Select the first N records for each selected target using the current record table order.",
+                )
+                if first_per_target_cols[1].button(
+                    "Select first N per target",
+                    key="known_benchmark_select_first_per_target",
+                    help="Uses the current record table order and replaces the existing row selection.",
+                ):
+                    selected_ids = set(
+                        ordered_subset.groupby("target_id", group_keys=False)
+                        .head(int(first_per_target_count))["binder_id"]
+                        .astype(str)
+                    )
+                    st.session_state[selected_ids_key] = selected_ids
+                    st.session_state["known_benchmark_clear_select_all"] = True
+                    st.session_state["known_benchmark_select_all_previous"] = False
+                    st.session_state["known_benchmark_editor_version"] = (
+                        int(st.session_state.get("known_benchmark_editor_version", 0)) + 1
+                    )
+                    st.rerun()
                 editor_df = ordered_subset[display_cols].copy()
                 editor_df.insert(0, "selected", editor_df["binder_id"].isin(selected_ids))
                 previous_selected_ids = set(selected_ids)
@@ -1018,7 +1882,10 @@ with tabs[1]:
         "benchmark_run_esmfold2": dataset_source == "Metric table only",
         "benchmark_run_boltz2": engine_disabled,
         "benchmark_run_rf3": engine_disabled,
+        "benchmark_run_openfold3": engine_disabled,
         "benchmark_run_protenix": engine_disabled,
+        "benchmark_run_protenix_v1": engine_disabled,
+        "benchmark_run_protenix_v2": engine_disabled,
         "benchmark_run_boltzgen_fold": engine_disabled,
     }
     if "benchmark_engine_defaults_all_selected_v1" not in st.session_state:
@@ -1031,7 +1898,29 @@ with tabs[1]:
         if disabled:
             st.session_state[engine_key] = False
 
-    bulk_cols = st.columns([1, 1, 6])
+    template_msa_engine_keys = {
+        "benchmark_run_alphafast_af3",
+        "benchmark_run_colabfold",
+        "benchmark_run_esmfold2",
+        "benchmark_run_boltz2",
+        "benchmark_run_rf3",
+        "benchmark_run_protenix_v1",
+        "benchmark_run_protenix_v2",
+    }
+    template_only_engine_keys = set(template_msa_engine_keys)
+    template_only_engine_keys.add("benchmark_run_af2ig")
+    msa_engine_keys = {
+        "benchmark_run_alphafast_af3",
+        "benchmark_run_colabfold",
+        "benchmark_run_esmfold2",
+        "benchmark_run_boltz2",
+        "benchmark_run_rf3",
+        "benchmark_run_openfold3",
+        "benchmark_run_protenix",
+        "benchmark_run_protenix_v1",
+        "benchmark_run_protenix_v2",
+    }
+    bulk_cols = st.columns([1, 1, 1.5, 1.5, 1.35, 2.65])
     if bulk_cols[0].button("Select all engines", key="benchmark_select_all_engines"):
         for engine_key, disabled in benchmark_engine_state.items():
             if not disabled:
@@ -1042,8 +1931,101 @@ with tabs[1]:
             if not disabled:
                 st.session_state[engine_key] = False
         st.rerun()
+    if bulk_cols[2].button("Template + MSA engines", key="benchmark_select_template_msa_engines"):
+        for engine_key, disabled in benchmark_engine_state.items():
+            if not disabled:
+                st.session_state[engine_key] = engine_key in template_msa_engine_keys
+        st.session_state["benchmark_alphafast_use_target_templates"] = True
+        st.session_state["benchmark_alphafast_use_target_msa"] = True
+        st.session_state["benchmark_colabfold_use_target_templates"] = True
+        st.session_state["benchmark_colabfold_use_target_msa"] = True
+        st.session_state["benchmark_af2ig_binder_template"] = True
+        st.session_state["benchmark_af2ig_interface_template"] = True
+        st.session_state["benchmark_esmfold2_modes"] = ["initial_guess"]
+        st.session_state["benchmark_esmfold2_use_target_msa"] = True
+        st.session_state["benchmark_boltz2_template"] = True
+        st.session_state["benchmark_boltz2_use_target_msa"] = True
+        st.session_state["benchmark_rf3_use_target_template"] = True
+        st.session_state["benchmark_rf3_use_target_msa"] = True
+        st.session_state["benchmark_protenix_v1_template"] = True
+        st.session_state["benchmark_protenix_v1_use_msa"] = True
+        st.session_state["benchmark_protenix_v2_template"] = True
+        st.session_state["benchmark_protenix_v2_use_msa"] = True
+        st.session_state["benchmark_openfold3_use_target_msa"] = False
+        st.session_state["benchmark_protenix_use_msa"] = False
+        st.session_state["benchmark_require_real_target_msa"] = True
+        st.rerun()
+    if bulk_cols[3].button("Template-only engines", key="benchmark_select_template_only_engines"):
+        for engine_key, disabled in benchmark_engine_state.items():
+            if not disabled:
+                st.session_state[engine_key] = engine_key in template_only_engine_keys
+        st.session_state["benchmark_alphafast_use_target_templates"] = True
+        st.session_state["benchmark_alphafast_use_target_msa"] = False
+        st.session_state["benchmark_colabfold_use_target_templates"] = True
+        st.session_state["benchmark_colabfold_use_target_msa"] = False
+        st.session_state["benchmark_af2ig_binder_template"] = True
+        st.session_state["benchmark_af2ig_interface_template"] = True
+        st.session_state["benchmark_esmfold2_modes"] = ["initial_guess"]
+        st.session_state["benchmark_esmfold2_use_target_msa"] = False
+        st.session_state["benchmark_boltz2_template"] = True
+        st.session_state["benchmark_boltz2_use_target_msa"] = False
+        st.session_state["benchmark_rf3_use_target_template"] = True
+        st.session_state["benchmark_rf3_use_target_msa"] = False
+        st.session_state["benchmark_protenix_v1_template"] = True
+        st.session_state["benchmark_protenix_v1_use_msa"] = False
+        st.session_state["benchmark_protenix_v2_template"] = True
+        st.session_state["benchmark_protenix_v2_use_msa"] = False
+        st.session_state["benchmark_openfold3_use_target_msa"] = False
+        st.session_state["benchmark_protenix_use_msa"] = False
+        st.session_state["benchmark_require_real_target_msa"] = False
+        st.rerun()
+    if bulk_cols[4].button("MSA-only engines", key="benchmark_select_msa_only_engines"):
+        for engine_key, disabled in benchmark_engine_state.items():
+            if not disabled:
+                st.session_state[engine_key] = engine_key in msa_engine_keys
+        st.session_state["benchmark_alphafast_use_target_templates"] = False
+        st.session_state["benchmark_alphafast_use_target_msa"] = True
+        st.session_state["benchmark_colabfold_use_target_templates"] = False
+        st.session_state["benchmark_colabfold_use_target_msa"] = True
+        st.session_state["benchmark_boltz2_template"] = False
+        st.session_state["benchmark_boltz2_use_target_msa"] = True
+        st.session_state["benchmark_rf3_use_target_template"] = False
+        st.session_state["benchmark_rf3_use_target_msa"] = True
+        st.session_state["benchmark_protenix_v1_template"] = False
+        st.session_state["benchmark_protenix_v1_use_msa"] = True
+        st.session_state["benchmark_protenix_v2_template"] = False
+        st.session_state["benchmark_protenix_v2_use_msa"] = True
+        st.session_state["benchmark_esmfold2_modes"] = ["sequence"]
+        st.session_state["benchmark_esmfold2_use_target_msa"] = True
+        st.session_state["benchmark_openfold3_use_target_msa"] = True
+        st.session_state["benchmark_protenix_use_msa"] = True
+        st.session_state["benchmark_require_real_target_msa"] = True
+        st.rerun()
+    if bulk_cols[5].button("No MSA + no template", key="benchmark_disable_msa_template"):
+        st.session_state["benchmark_run_af2ig"] = False
+        st.session_state["benchmark_alphafast_use_target_templates"] = False
+        st.session_state["benchmark_alphafast_use_target_msa"] = False
+        st.session_state["benchmark_colabfold_use_target_templates"] = False
+        st.session_state["benchmark_colabfold_use_target_msa"] = False
+        st.session_state["benchmark_af2ig_legacy_initial_guess"] = False
+        st.session_state["benchmark_af2ig_binder_template"] = False
+        st.session_state["benchmark_af2ig_interface_template"] = False
+        st.session_state["benchmark_esmfold2_modes"] = ["sequence"]
+        st.session_state["benchmark_esmfold2_use_target_msa"] = False
+        st.session_state["benchmark_boltz2_template"] = False
+        st.session_state["benchmark_boltz2_use_target_msa"] = False
+        st.session_state["benchmark_rf3_use_target_template"] = False
+        st.session_state["benchmark_rf3_use_target_msa"] = False
+        st.session_state["benchmark_openfold3_use_target_msa"] = False
+        st.session_state["benchmark_protenix_use_msa"] = False
+        st.session_state["benchmark_protenix_v1_template"] = False
+        st.session_state["benchmark_protenix_v1_use_msa"] = False
+        st.session_state["benchmark_protenix_v2_template"] = False
+        st.session_state["benchmark_protenix_v2_use_msa"] = False
+        st.session_state["benchmark_require_real_target_msa"] = False
+        st.rerun()
 
-    engine_cols = st.columns(8)
+    engine_cols = st.columns(11)
     with engine_cols[0]:
         run_alphafast_af3 = st.checkbox("AlphaFast AF3", value=True, disabled=engine_disabled, key="benchmark_run_alphafast_af3")
     with engine_cols[1]:
@@ -1057,8 +2039,14 @@ with tabs[1]:
     with engine_cols[5]:
         run_rf3 = st.checkbox("RF3", value=True, disabled=engine_disabled, key="benchmark_run_rf3")
     with engine_cols[6]:
-        run_protenix = st.checkbox("Protenix", value=True, disabled=engine_disabled, key="benchmark_run_protenix")
+        run_openfold3 = st.checkbox("OpenFold-3", value=True, disabled=engine_disabled, key="benchmark_run_openfold3")
     with engine_cols[7]:
+        run_protenix = st.checkbox("Protenix v0.5", value=True, disabled=engine_disabled, key="benchmark_run_protenix")
+    with engine_cols[8]:
+        run_protenix_v1 = st.checkbox("Protenix v1", value=True, disabled=engine_disabled, key="benchmark_run_protenix_v1")
+    with engine_cols[9]:
+        run_protenix_v2 = st.checkbox("Protenix v2", value=True, disabled=engine_disabled, key="benchmark_run_protenix_v2")
+    with engine_cols[10]:
         run_boltzgen_fold = st.checkbox(
             "BoltzGen fold",
             value=True,
@@ -1068,7 +2056,29 @@ with tabs[1]:
         )
 
     if dataset_source not in {"Simple ESMFold2 CSV", "Metric table only"}:
-        repo_mode = st.segmented_control("Input mode", ["pdb_only", "hybrid", "seq_only_csv"], selection_mode="single", default="pdb_only")
+        has_repo_csv = bool(
+            known_csv_text
+            or repo_csv_text
+            or repo_input_csv_path.strip()
+            or repo_input_csv is not None
+            or repo_zip is not None
+            or repo_zip_path.strip()
+        )
+        has_repo_pdbs = bool(
+            known_pdb_dir
+            or repo_pdb_dir.strip()
+            or repo_zip is not None
+            or repo_zip_path.strip()
+        )
+        if has_repo_csv and has_repo_pdbs:
+            repo_mode = "hybrid"
+            st.caption("Input mode: CSV rows define the benchmark records; PDBs provide the structures.")
+        elif has_repo_csv:
+            repo_mode = "seq_only_csv"
+            st.caption("Input mode: sequence CSV only.")
+        else:
+            repo_mode = "pdb_only"
+            st.caption("Input mode: PDB folder only.")
         selected_record_count = int(runtime_size.get("candidate_count") or 0)
         if selected_record_count:
             st.caption(f"Prediction engines will process all {selected_record_count:,} checked records.")
@@ -1076,12 +2086,15 @@ with tabs[1]:
 
         with st.expander("MSA Reference Data", expanded=True):
             msa_consuming_engine_selected = bool(
-                run_alphafast_af3
-                or run_colabfold
+                (run_alphafast_af3 and alphafast_use_target_msa)
+                or (run_colabfold and bool(st.session_state.get("benchmark_colabfold_use_target_msa", True)))
                 or (run_boltz2_ig and boltz2_use_target_msa)
                 or (run_repo_esm and esmfold2_use_target_msa)
                 or (run_rf3 and rf3_use_target_msa)
+                or (run_openfold3 and openfold3_use_target_msa)
                 or (run_protenix and protenix_use_msa)
+                or (run_protenix_v1 and protenix_v1_use_msa)
+                or (run_protenix_v2 and protenix_v2_use_msa)
             )
             msa_cols = st.columns(4)
             colabfold_msa_source = msa_cols[0].segmented_control(
@@ -1139,12 +2152,32 @@ with tabs[1]:
             default_models.append("boltz")
         if run_colabfold:
             default_models.append("colabfold")
+        if run_protenix:
+            default_models.append("protenix")
+        if run_protenix_v1:
+            default_models.append("protenix_v1")
+        if run_protenix_v2:
+            default_models.append("protenix_v2")
         repo_models = default_models or ["af3", "boltz", "colabfold"]
 
         with st.expander("AlphaFast AF3 Settings", expanded=run_alphafast_af3):
-            af3_cols = st.columns(2)
+            af3_cols = st.columns(4)
             alphafast_weights_dir = af3_cols[0].text_input("AF3 weights dir", value=str(ALPHAFAST_WEIGHTS_DIR), disabled=not run_alphafast_af3)
             alphafast_recycles = af3_cols[1].number_input("AF3 recycles", min_value=1, max_value=48, value=10, step=1, key="benchmark_alphafast_recycles", disabled=not run_alphafast_af3)
+            alphafast_use_target_templates = af3_cols[2].checkbox(
+                "Use templates",
+                value=alphafast_use_target_templates,
+                key="benchmark_alphafast_use_target_templates",
+                disabled=not run_alphafast_af3,
+                help="Embeds the staged input target chains as AF3 templates. Binder chains and binder-interface geometry are not templated.",
+            )
+            alphafast_use_target_msa = af3_cols[3].checkbox(
+                "Use target MSAs",
+                value=alphafast_use_target_msa,
+                key="benchmark_alphafast_use_target_msa",
+                disabled=not run_alphafast_af3,
+                help="When off, AlphaFast AF3 runs with query-only/no target MSA input.",
+            )
 
         with st.expander("ColabFold Settings", expanded=run_colabfold):
             colab_cols = st.columns(5)
@@ -1152,21 +2185,20 @@ with tabs[1]:
             colabfold_recycles = colab_cols[1].number_input("ColabFold recycles", min_value=1, max_value=48, value=3, step=1, key="benchmark_colabfold_recycles", disabled=not run_colabfold)
             colabfold_models = colab_cols[2].number_input("ColabFold models", min_value=1, max_value=5, value=3, step=1, key="benchmark_colabfold_models", disabled=not run_colabfold)
             colabfold_use_target_templates = colab_cols[3].checkbox(
-                "Use target PDB templates",
+                "Use templates",
                 value=colabfold_use_target_templates,
                 key="benchmark_colabfold_use_target_templates",
                 disabled=not run_colabfold,
-                help="Passes target-chain-only PDB templates to ColabFold. Binder chains and binder-interface geometry are not templated.",
+                help="Uses the staged input target as the template. Binder chains and binder-interface geometry are not templated.",
             )
-            colabfold_max_template_hits = colab_cols[4].number_input(
-                "Max template hits",
-                min_value=1,
-                max_value=20,
-                value=4,
-                step=1,
-                key="benchmark_colabfold_max_template_hits",
-                disabled=not run_colabfold or not colabfold_use_target_templates,
+            colabfold_use_target_msa = colab_cols[4].checkbox(
+                "Use target MSAs",
+                value=bool(st.session_state.get("benchmark_colabfold_use_target_msa", True)),
+                key="benchmark_colabfold_use_target_msa",
+                disabled=not run_colabfold,
+                help="When off, ColabFold does not request or inject real target MSAs.",
             )
+            colabfold_max_template_hits = 4
 
         with st.expander("AF2 Target-Only Initial Guess Settings", expanded=run_repo_af2ig):
             af2_cols = st.columns(4)
@@ -1199,6 +2231,7 @@ with tabs[1]:
                 "Modes",
                 ["sequence", "initial_guess"],
                 default=["initial_guess"],
+                key="benchmark_esmfold2_modes",
                 disabled=not run_repo_esm,
                 format_func={"sequence": "Sequence only", "initial_guess": "Initial guess"}.get,
             )
@@ -1224,7 +2257,13 @@ with tabs[1]:
         with st.expander("Boltz-2 Settings", expanded=run_boltz2_ig):
             boltz_cols = st.columns(6)
             boltz_cols[0].text_input("Boltz-2 model cache", value=str(BOLTZ_MODELS_DIR), disabled=True)
-            boltz2_target_template = boltz_cols[1].checkbox("Use target template", value=True, disabled=not run_boltz2_ig)
+            boltz2_target_template = boltz_cols[1].checkbox(
+                "Use templates",
+                value=boltz2_target_template,
+                key="benchmark_boltz2_template",
+                disabled=not run_boltz2_ig,
+                help="Uses the staged input target as the template.",
+            )
             boltz2_use_target_msa = boltz_cols[2].checkbox(
                 "Use target MSAs",
                 value=True,
@@ -1238,22 +2277,82 @@ with tabs[1]:
             boltz2_write_full_pae = st.checkbox("Write full PAE", value=True, disabled=not run_boltz2_ig)
 
         with st.expander("RF3 Settings", expanded=run_rf3):
-            rf3_cols = st.columns(6)
+            rf3_cols = st.columns(7)
             rf3_checkpoint_path = rf3_cols[0].text_input("RF3 checkpoint", value=str(RF3_CHECKPOINT), disabled=not run_rf3)
-            rf3_use_target_msa = rf3_cols[1].checkbox(
+            rf3_use_target_template = rf3_cols[1].checkbox(
+                "Use templates",
+                value=rf3_use_target_template,
+                key="benchmark_rf3_use_target_template",
+                disabled=not run_rf3,
+                help="Uses the staged input target chains as RF3 template coordinates; binder chains remain untemplated.",
+            )
+            rf3_use_target_msa = rf3_cols[2].checkbox(
                 "Use target MSAs",
                 value=True,
                 key="benchmark_rf3_use_target_msa",
                 disabled=not run_rf3,
                 help="Default on. Each declared target chain receives its prepared A3M; binder chains remain MSA-free.",
             )
-            rf3_recycles = rf3_cols[2].number_input("RF3 recycles", min_value=1, max_value=48, value=10, step=1, key="benchmark_rf3_recycles", disabled=not run_rf3)
-            rf3_num_steps = rf3_cols[3].number_input("RF3 diffusion steps", min_value=1, max_value=1000, value=50, step=1, key="benchmark_rf3_num_steps", disabled=not run_rf3)
-            rf3_diffusion_batch_size = rf3_cols[4].number_input("RF3 samples", min_value=1, max_value=20, value=5, step=1, key="benchmark_rf3_diffusion_batch_size", disabled=not run_rf3)
-            rf3_seed = rf3_cols[5].number_input("RF3 seed", min_value=0, max_value=999999, value=0, step=1, key="benchmark_rf3_seed", disabled=not run_rf3)
-            st.caption("RF3 folds the complex from sequences and per-chain target MSAs. These controls map to RF3 Hydra settings: n_recycles, num_steps, diffusion_batch_size, and seed.")
+            rf3_recycles = rf3_cols[3].number_input("RF3 recycles", min_value=1, max_value=48, value=10, step=1, key="benchmark_rf3_recycles", disabled=not run_rf3)
+            rf3_num_steps = rf3_cols[4].number_input("RF3 diffusion steps", min_value=1, max_value=1000, value=50, step=1, key="benchmark_rf3_num_steps", disabled=not run_rf3)
+            rf3_diffusion_batch_size = rf3_cols[5].number_input("RF3 samples", min_value=1, max_value=20, value=5, step=1, key="benchmark_rf3_diffusion_batch_size", disabled=not run_rf3)
+            rf3_seed = rf3_cols[6].number_input("RF3 seed", min_value=0, max_value=999999, value=0, step=1, key="benchmark_rf3_seed", disabled=not run_rf3)
+            st.caption("RF3 folds the complex from sequences plus optional target-chain templates and per-chain target MSAs.")
 
-        with st.expander("Protenix Settings", expanded=run_protenix):
+        with st.expander("OpenFold-3 Settings", expanded=run_openfold3):
+            openfold_cols = st.columns(6)
+            openfold3_checkpoint_path = openfold_cols[0].text_input(
+                "OpenFold-3 checkpoint",
+                value=str(OPENFOLD3_CHECKPOINT),
+                key="benchmark_openfold3_checkpoint",
+                disabled=not run_openfold3,
+                help="Default shared path: /mnt/db/reference_files/openfold3/of3-p2-155k.pt.",
+            )
+            openfold3_use_target_msa = openfold_cols[1].checkbox(
+                "Use target MSAs",
+                value=True,
+                key="benchmark_openfold3_use_target_msa",
+                disabled=not run_openfold3,
+                help="Default on. Binder chains remain MSA-free; declared target chains use prepared A3M files when available.",
+            )
+            openfold3_num_diffusion_samples = openfold_cols[2].number_input(
+                "Diffusion samples",
+                min_value=1,
+                max_value=20,
+                value=5,
+                step=1,
+                key="benchmark_openfold3_samples",
+                disabled=not run_openfold3,
+            )
+            openfold3_num_model_seeds = openfold_cols[3].number_input(
+                "Model seeds",
+                min_value=1,
+                max_value=20,
+                value=1,
+                step=1,
+                key="benchmark_openfold3_seeds",
+                disabled=not run_openfold3,
+            )
+            openfold3_num_recycles = openfold_cols[4].number_input(
+                "Recycles",
+                min_value=1,
+                max_value=48,
+                value=3,
+                step=1,
+                key="benchmark_openfold3_recycles",
+                disabled=not run_openfold3,
+                help="OpenFold-3 default architecture.shared.num_recycles is 3.",
+            )
+            openfold3_use_msa_server = openfold_cols[5].checkbox(
+                "Use MSA server",
+                value=False,
+                key="benchmark_openfold3_msa_server",
+                disabled=not run_openfold3,
+                help="Default off for local/high-throughput runs. Prefer the app's shared target-MSA repository.",
+            )
+            st.caption("OpenFold-3 runs from chain sequences. Target MSAs are attached as precomputed main MSAs; binder chains are supplied without MSAs.")
+
+        with st.expander("Protenix v0.5 Settings", expanded=run_protenix):
             protenix_cols = st.columns(4)
             protenix_use_msa = protenix_cols[0].checkbox(
                 "Use target MSAs",
@@ -1269,6 +2368,33 @@ with tabs[1]:
             protenix_cycle = protenix_cols[1].number_input("Pairformer cycles", min_value=1, max_value=48, value=3, step=1, key="benchmark_protenix_cycle", disabled=not run_protenix)
             protenix_diffusion_steps = protenix_cols[2].number_input("Diffusion steps", min_value=1, max_value=1000, value=50, step=1, key="benchmark_protenix_diffusion_steps", disabled=not run_protenix)
             protenix_samples = protenix_cols[3].number_input("Samples", min_value=1, max_value=20, value=5, step=1, key="benchmark_protenix_samples", disabled=not run_protenix)
+            st.caption("Legacy PXDesign-backed Protenix v0.5 adapter.")
+
+        with st.expander("Protenix v1 Settings", expanded=run_protenix_v1):
+            protenix_v1_cols = st.columns(6)
+            protenix_v1_model_name = protenix_v1_cols[0].selectbox(
+                "Model",
+                [PROTENIX_V1_MODEL, PROTENIX_V1_20250630_MODEL],
+                index=0,
+                disabled=not run_protenix_v1,
+                key="benchmark_protenix_v1_model",
+            )
+            protenix_v1_use_msa = protenix_v1_cols[1].checkbox("Use target MSAs", value=True, key="benchmark_protenix_v1_use_msa", disabled=not run_protenix_v1)
+            protenix_v1_use_template = protenix_v1_cols[2].checkbox("Use templates", value=protenix_v1_use_template, key="benchmark_protenix_v1_template", disabled=not run_protenix_v1)
+            protenix_v1_cycle = protenix_v1_cols[3].number_input("Pairformer cycles", min_value=1, max_value=48, value=10, step=1, key="benchmark_protenix_v1_cycle", disabled=not run_protenix_v1)
+            protenix_v1_diffusion_steps = protenix_v1_cols[4].number_input("Diffusion steps", min_value=1, max_value=1000, value=200, step=1, key="benchmark_protenix_v1_steps", disabled=not run_protenix_v1)
+            protenix_v1_samples = protenix_v1_cols[5].number_input("Samples", min_value=1, max_value=20, value=5, step=1, key="benchmark_protenix_v1_samples", disabled=not run_protenix_v1)
+            st.caption("Standalone Protenix CLI using /mnt/db/reference_files/protenix for checkpoints and data.")
+
+        with st.expander("Protenix v2 Settings", expanded=run_protenix_v2):
+            protenix_v2_cols = st.columns(6)
+            protenix_v2_model_name = protenix_v2_cols[0].text_input("Model", value=PROTENIX_V2_MODEL, disabled=not run_protenix_v2, key="benchmark_protenix_v2_model")
+            protenix_v2_use_msa = protenix_v2_cols[1].checkbox("Use target MSAs", value=True, key="benchmark_protenix_v2_use_msa", disabled=not run_protenix_v2)
+            protenix_v2_use_template = protenix_v2_cols[2].checkbox("Use templates", value=protenix_v2_use_template, key="benchmark_protenix_v2_template", disabled=not run_protenix_v2)
+            protenix_v2_cycle = protenix_v2_cols[3].number_input("Pairformer cycles", min_value=1, max_value=48, value=10, step=1, key="benchmark_protenix_v2_cycle", disabled=not run_protenix_v2)
+            protenix_v2_diffusion_steps = protenix_v2_cols[4].number_input("Diffusion steps", min_value=1, max_value=1000, value=200, step=1, key="benchmark_protenix_v2_steps", disabled=not run_protenix_v2)
+            protenix_v2_samples = protenix_v2_cols[5].number_input("Samples", min_value=1, max_value=20, value=5, step=1, key="benchmark_protenix_v2_samples", disabled=not run_protenix_v2)
+            st.caption("Standalone Protenix v2 CLI using /mnt/db/reference_files/protenix for checkpoints and data.")
 
         with st.expander("BoltzGen Fold Settings", expanded=run_boltzgen_fold):
             boltzgen_cols = st.columns(3)
@@ -1372,8 +2498,14 @@ with tabs[3]:
         selected_engines.append("ESMFold2")
     if run_rf3:
         selected_engines.append("RF3")
+    if run_openfold3:
+        selected_engines.append("OpenFold-3")
     if run_protenix:
-        selected_engines.append("Protenix")
+        selected_engines.append("Protenix v0.5")
+    if run_protenix_v1:
+        selected_engines.append("Protenix v1")
+    if run_protenix_v2:
+        selected_engines.append("Protenix v2")
     if run_boltzgen_fold:
         selected_engines.append("BoltzGen fold")
     summary_cols = st.columns(4)
@@ -1386,6 +2518,11 @@ with tabs[3]:
         selected_count = int(runtime_size.get("candidate_count") or 0)
         if selected_count:
             st.success(f"This run will process exactly the {selected_count:,} checked records.")
+            st.caption(
+                f"Run benchmark will queue one combined benchmark job for "
+                f"{len(selected_targets):,} selected target(s), {selected_count:,} record(s), "
+                f"and {len(selected_engines):,} selected engine(s)."
+            )
         else:
             st.warning("No records are checked. Select at least one record in the Dataset tab.")
     estimate_engine_keys: list[str] = []
@@ -1401,8 +2538,14 @@ with tabs[3]:
         estimate_engine_keys.append("esmfold2")
     if run_rf3:
         estimate_engine_keys.append("rf3")
+    if run_openfold3:
+        estimate_engine_keys.append("openfold3")
     if run_protenix:
         estimate_engine_keys.append("protenix")
+    if run_protenix_v1:
+        estimate_engine_keys.append("protenix_v1")
+    if run_protenix_v2:
+        estimate_engine_keys.append("protenix_v2")
     if run_boltzgen_fold:
         estimate_engine_keys.append("boltzgen_fold")
     if run_common_interface_metrics or run_predicted_rosetta_metrics or run_pymol_metrics:
@@ -1437,6 +2580,7 @@ with tabs[3]:
                     hide_index=True,
                     column_config={
                         "seconds_per_candidate": st.column_config.NumberColumn("sec / candidate", format="%.1f"),
+                        "seconds_per_residue": st.column_config.NumberColumn("sec / residue", format="%.3f"),
                     },
                 )
             st.caption(
@@ -1583,27 +2727,52 @@ with tabs[3]:
                     run_rf3=bool(run_rf3),
                     rf3_checkpoint_path=Path(rf3_checkpoint_path).expanduser(),
                     rf3_use_target_msa=bool(rf3_use_target_msa),
+                    rf3_use_target_template=bool(rf3_use_target_template),
                     rf3_recycles=int(rf3_recycles),
                     rf3_num_steps=int(rf3_num_steps),
                     rf3_diffusion_batch_size=int(rf3_diffusion_batch_size),
                     rf3_seed=int(rf3_seed),
+                    run_openfold3=bool(run_openfold3),
+                    openfold3_checkpoint_path=Path(openfold3_checkpoint_path).expanduser(),
+                    openfold3_use_target_msa=bool(openfold3_use_target_msa),
+                    openfold3_num_diffusion_samples=int(openfold3_num_diffusion_samples),
+                    openfold3_num_model_seeds=int(openfold3_num_model_seeds),
+                    openfold3_num_recycles=int(openfold3_num_recycles),
+                    openfold3_use_msa_server=bool(openfold3_use_msa_server),
                     run_protenix=bool(run_protenix),
                     protenix_use_msa=bool(protenix_use_msa),
                     protenix_cycle=int(protenix_cycle),
                     protenix_diffusion_steps=int(protenix_diffusion_steps),
                     protenix_samples=int(protenix_samples),
+                    run_protenix_v1=bool(run_protenix_v1),
+                    protenix_v1_model_name=str(protenix_v1_model_name),
+                    protenix_v1_use_msa=bool(protenix_v1_use_msa),
+                    protenix_v1_use_template=bool(protenix_v1_use_template),
+                    protenix_v1_use_default_params=True,
+                    protenix_v1_cycle=int(protenix_v1_cycle),
+                    protenix_v1_diffusion_steps=int(protenix_v1_diffusion_steps),
+                    protenix_v1_samples=int(protenix_v1_samples),
+                    run_protenix_v2=bool(run_protenix_v2),
+                    protenix_v2_model_name=str(protenix_v2_model_name),
+                    protenix_v2_use_msa=bool(protenix_v2_use_msa),
+                    protenix_v2_use_template=bool(protenix_v2_use_template),
+                    protenix_v2_use_default_params=True,
+                    protenix_v2_cycle=int(protenix_v2_cycle),
+                    protenix_v2_diffusion_steps=int(protenix_v2_diffusion_steps),
+                    protenix_v2_samples=int(protenix_v2_samples),
                     run_boltzgen_fold=bool(run_boltzgen_fold),
                     boltzgen_recycling_steps=int(boltzgen_recycling_steps),
                     boltzgen_sampling_steps=int(boltzgen_sampling_steps),
                     boltzgen_diffusion_samples=int(boltzgen_diffusion_samples),
                     run_colabfold=bool(run_colabfold),
                     colabfold_cache_dir=Path(colabfold_cache_dir).expanduser(),
-                    colabfold_msa_source=str(colabfold_msa_source or "msa_repository_then_alphafast_mmseqs_gpu"),
+                    colabfold_msa_source=str(colabfold_msa_source if colabfold_use_target_msa else "repo_run_csv"),
                     msa_repository_dir=Path(msa_repository_dir).expanduser(),
                     require_real_target_msa=bool(require_real_target_msa),
                     colabfold_num_recycles=int(colabfold_recycles),
                     colabfold_num_models=int(colabfold_models),
                     colabfold_use_target_templates=bool(colabfold_use_target_templates),
+                    colabfold_use_target_msa=bool(colabfold_use_target_msa),
                     colabfold_max_template_hits=int(colabfold_max_template_hits),
                     colabfold_gpu_device=gpu_device,
                     run_alphafast_af3=bool(run_alphafast_af3),
@@ -1611,6 +2780,8 @@ with tabs[3]:
                     alphafast_weights_dir=Path(alphafast_weights_dir).expanduser(),
                     alphafast_batch_size=int(alphafast_batch_size),
                     alphafast_num_recycles=int(alphafast_recycles),
+                    alphafast_use_target_templates=bool(alphafast_use_target_templates),
+                    alphafast_query_only_msa=not bool(alphafast_use_target_msa),
                     alphafast_gpu_device=gpu_device,
                     gpu_device=gpu_device,
                     max_records=int(repo_max_records),
@@ -1627,6 +2798,7 @@ with tabs[3]:
 
 with tabs[4]:
     st.subheader("Results")
+    refresh_results_button("benchmark_refresh_results")
     rows = collect_jobs("benchmark")
     if not rows:
         st.info("No benchmark jobs yet.")
@@ -1636,9 +2808,11 @@ with tabs[4]:
             st.info("No benchmark jobs yet. Refolding evaluation runs are listed under Refolding / Validation.")
         else:
             display_cols = [
-                "result",
+                "job_code_link",
                 "kind",
                 "description",
+                "evidence_mode",
+                "evidence_detail",
                 "status",
                 "recovery",
                 "esmfold2_preset",
@@ -1649,7 +2823,6 @@ with tabs[4]:
                 "top_ap",
                 "plots",
                 "created_at",
-                "job_code",
                 "run_id",
             ]
             display_df = df[[col for col in display_cols if col in df.columns]].copy()
@@ -1662,7 +2835,7 @@ with tabs[4]:
                 on_select="rerun",
                 selection_mode="multi-row",
                 column_config={
-                    "result": st.column_config.LinkColumn("result", display_text="Open"),
+                    "job_code_link": st.column_config.LinkColumn("job_code", display_text=r"job_code=([^&]+)"),
                     "top_ap": st.column_config.NumberColumn("top AP", format="%.3f"),
                 },
             )
@@ -1794,36 +2967,55 @@ with tabs[4]:
 with tabs[5]:
     st.subheader("Benchmark Matrix")
     st.caption(
-        "Engines are rows and targets are columns. Use a matrix umbrella to decide which exact benchmark run contributes "
-        "to each engine-target cell; missing cells stay visible."
+        "Engines are rows and targets are columns. The auto current master updates from all benchmark runs; "
+        "saved umbrellas are frozen snapshots used to build reproducible collections."
     )
     rows = collect_jobs("benchmark")
+    overath_targets = _installed_overath_targets()
+    overath_target_set = set(overath_targets)
     source_rows, unavailable_rows = _available_benchmark_sources(rows)
     cells = _benchmark_matrix_cells(source_rows)
+    live_cells = _live_benchmark_matrix_cells(rows)
+    if overath_target_set:
+        if not cells.empty:
+            cells = cells[cells["target_id"].astype(str).isin(overath_target_set)].copy()
+        if not live_cells.empty:
+            live_cells = live_cells[live_cells["target_id"].astype(str).isin(overath_target_set)].copy()
+    if not live_cells.empty:
+        cells = pd.concat([cells, live_cells], ignore_index=True, sort=False) if not cells.empty else live_cells.copy()
+        cells["created_sort"] = cells["created_at"].astype(str)
+        cells["kind_rank"] = cells["kind"].map({"benchmark": 0, "collection": 1, "live benchmark": 3}).fillna(2)
+        cells = cells.sort_values(
+            ["engine_rank", "target_id", "created_sort", "kind_rank"],
+            ascending=[True, True, False, True],
+        ).copy()
     workspaces = _benchmark_matrix_workspace_jobs(rows)
     workspace_options = ["__auto__"] + [str(row["run_id"]) for row in workspaces]
     workspace_by_id = {str(row["run_id"]): row for row in workspaces}
     selected_workspace_id = st.selectbox(
         "Matrix umbrella",
         workspace_options,
-        index=1 if workspaces else 0,
+        index=0,
         format_func=lambda value: (
-            "Auto from latest completed source runs"
+            "Auto current master (live coverage)"
             if value == "__auto__"
-            else f"{workspace_by_id.get(str(value), {}).get('name', 'Benchmark matrix workspace')} | "
+            else f"Saved snapshot: {workspace_by_id.get(str(value), {}).get('name', 'Benchmark matrix workspace')} | "
             f"{workspace_by_id.get(str(value), {}).get('job_code', '')} | {value}"
         ),
-        key="benchmark_matrix_workspace",
+        key="benchmark_matrix_workspace_v2",
     )
     active_workspace = workspace_by_id.get(str(selected_workspace_id)) if selected_workspace_id != "__auto__" else None
     if active_workspace is None:
-        st.caption("No umbrella is selected. The matrix uses the latest completed non-collection run for each engine-target cell.")
+        st.caption(
+            "Auto current master mode: the matrix uses the best available completed source per engine-target cell, "
+            "plus queued/running cells where no completed source exists."
+        )
     else:
         st.caption(
-            f"Umbrella: {active_workspace.get('name')} | "
-            f"{active_workspace.get('cell_count') or 0} curated cells | {active_workspace.get('created_at')}"
+            f"Saved umbrella snapshot: {active_workspace.get('name')} | "
+            f"{active_workspace.get('cell_count') or 0} curated cells | {active_workspace.get('created_at')}. "
+            "This view is frozen; new benchmark runs appear in Auto current master until this snapshot is saved again."
         )
-    overath_targets = _installed_overath_targets()
     if cells.empty and not overath_targets:
         st.info("No completed benchmark cells with merged metrics are available yet.")
         if unavailable_rows:
@@ -1849,10 +3041,8 @@ with tabs[5]:
                     for target in (workspace_payload.get("targets") or [])
                     if str(target).strip()
                 ]
-            if workspace_targets:
-                target_options = workspace_targets
-            else:
-                target_options = sorted(canonical_cells["target_id"].dropna().astype(str).unique().tolist())
+            canonical_targets = [] if canonical_cells.empty else canonical_cells["target_id"].dropna().astype(str).unique().tolist()
+            target_options = sorted(set(overath_targets) | set(workspace_targets) | set(canonical_targets))
         plot_df = _benchmark_matrix_with_missing(
             canonical_cells,
             target_options=target_options,
@@ -1876,8 +3066,9 @@ with tabs[5]:
                 plot_df["available_runs"] = plot_df["available_runs"].fillna(0).astype(int)
             matrix_height = max(320, min(900, 72 * max(1, plot_df["engine"].nunique())))
             matrix_width = max(520, min(1400, 90 * max(1, plot_df["target_id"].nunique())))
-            chart = (
-                alt.Chart(plot_df)
+            base_chart = alt.Chart(plot_df)
+            heatmap = (
+                base_chart
                 .mark_rect()
                 .encode(
                     x=alt.X("target_id:N", title="target", sort=target_options),
@@ -1894,6 +3085,20 @@ with tabs[5]:
                         "engine",
                         "target_id",
                         "status",
+                        "batch_progress",
+                        "overall_batch_progress",
+                        "target_batch_progress",
+                        "elapsed_overall",
+                        "elapsed_target",
+                        "estimated_overall",
+                        "estimated_target",
+                        "estimated_overall_by_batch",
+                        "estimated_target_by_batch",
+                        "estimated_overall_by_residue",
+                        "estimated_target_by_residue",
+                        "remaining_overall",
+                        "remaining_target",
+                        "estimate_basis",
                         "records",
                         "kind",
                         "settings",
@@ -1903,9 +3108,42 @@ with tabs[5]:
                         "description",
                     ],
                 )
-                .properties(width=matrix_width, height=matrix_height)
             )
+            progress_text = (
+                base_chart
+                .transform_filter("datum.batch_progress != null && datum.batch_progress != ''")
+                .mark_text(color="#172033", fontSize=13, fontWeight="bold")
+                .encode(
+                    x=alt.X("target_id:N", sort=target_options),
+                    y=alt.Y("engine:N", sort=BENCHMARK_MATRIX_ENGINE_ORDER),
+                    text="batch_progress:N",
+                )
+            )
+            chart = (heatmap + progress_text).properties(width=matrix_width, height=matrix_height)
             st.altair_chart(chart, width="content")
+            running_progress = plot_df[plot_df["status"].astype(str).eq("running")].copy()
+            if not running_progress.empty:
+                st.markdown("**Live Progress**")
+                progress_columns = [
+                    "engine",
+                    "target_id",
+                    "overall_batch_progress",
+                    "target_batch_progress",
+                    "elapsed_overall",
+                    "elapsed_target",
+                    "estimated_overall",
+                    "estimated_target",
+                    "estimated_overall_by_batch",
+                    "estimated_overall_by_residue",
+                    "remaining_overall",
+                    "remaining_target",
+                    "estimate_basis",
+                ]
+                st.dataframe(
+                    running_progress[[column for column in progress_columns if column in running_progress.columns]],
+                    hide_index=True,
+                    width="stretch",
+                )
 
             st.markdown("**Curate The Matrix Umbrella**")
             st.caption(
@@ -2219,7 +3457,7 @@ with tabs[6]:
                 }
             )
             continue
-        engines_available = benchmark_engines_in_metrics(metrics_path)
+        engines_available = _benchmark_engines_available_for_run(run_dir, input_payload, metrics_path)
         if not engines_available:
             unavailable_rows.append(
                 {

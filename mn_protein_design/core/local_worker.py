@@ -47,12 +47,93 @@ def run_worker_job(run_dir: Path) -> int:
 
             run_design_campaign(run_dir)
             return 0
+        if kind == "target_preparation":
+            from mn_protein_design.workflows.target_prep import run_queued_target_preparation
+
+            kwargs = _restore_worker_kwargs(request)
+            run_queued_target_preparation(run_dir, **kwargs)
+            return 0
+        if kind == "sequence_design_pipeline":
+            from mn_protein_design.core.candidates import read_candidates
+            from mn_protein_design.workflows.benchmark import enqueue_candidate_refolding_evaluation
+            from mn_protein_design.workflows.sequence_design import (
+                run_foundry_mpnn_sequence_design,
+                run_ligandmpnn_sequence_design,
+            )
+
+            kwargs = dict(request.get("kwargs") or {})
+            backend = str(kwargs.pop("backend") or "")
+            source_run_dir = Path(str(kwargs.pop("source_run_dir"))).expanduser()
+            candidates_jsonl = Path(str(kwargs.pop("candidates_jsonl"))).expanduser()
+            design_kwargs = dict(kwargs.pop("design_kwargs") or {})
+            validation_kwargs = dict(kwargs.pop("validation_kwargs") or {})
+            resume = bool(kwargs.pop("resume", False))
+            job = JobPaths(task_group="design", run_id=run_dir.name, run_dir=run_dir)
+            designed_candidates = run_dir / "artifacts" / "normalized_candidates" / "candidates.jsonl"
+            if not (resume and designed_candidates.exists()):
+                if backend == "shared_ligandmpnn":
+                    run_ligandmpnn_sequence_design(
+                        source_run_dir=source_run_dir,
+                        candidates_jsonl=candidates_jsonl,
+                        existing_job=job,
+                        **design_kwargs,
+                    )
+                elif backend == "foundry_mpnn":
+                    run_foundry_mpnn_sequence_design(
+                        source_run_dir=source_run_dir,
+                        candidates_jsonl=candidates_jsonl,
+                        existing_job=job,
+                        **design_kwargs,
+                    )
+                else:
+                    raise ValueError(f"Unsupported sequence-design backend: {backend}")
+
+            if validation_kwargs:
+                if not designed_candidates.exists():
+                    raise RuntimeError("Sequence design completed without normalized candidates for validation.")
+                metadata = read_json(run_dir / "metadata.json")
+                existing_validation_run = Path(str(metadata.get("validation_run_dir") or "")).expanduser()
+                if resume and existing_validation_run.exists() and (existing_validation_run / "worker_request.json").exists():
+                    validation_metadata = read_json(existing_validation_run / "metadata.json")
+                    validation_result = read_json(existing_validation_run / "result.json")
+                    if str(validation_metadata.get("status") or "") != "completed" or validation_result.get("success") is not True:
+                        from mn_protein_design.core.jobs import resume_job
+
+                        resume_job(existing_validation_run, gpu_device=validation_kwargs.get("gpu_device"))
+                else:
+                    validation_kwargs["resume"] = bool(validation_kwargs.get("resume") or resume)
+                    validation_run = enqueue_candidate_refolding_evaluation(
+                        source_run_dir=run_dir,
+                        candidates_jsonl=designed_candidates,
+                        selected_candidate_ids=[str(row.get("candidate_id") or "") for row in read_candidates(run_dir)],
+                        evaluation_name="Sequence design validation",
+                        job_type="sequence_design_validation",
+                        tool_name="sequence_design_validation",
+                        **validation_kwargs,
+                    )
+                    metadata["validation_run_id"] = validation_run.name
+                    metadata["validation_run_dir"] = str(validation_run)
+                    write_json(run_dir / "metadata.json", metadata)
+                    spawn_worker_for_run(validation_run)
+            return 0
         if kind in {"de_novo_binder_scoring_dataset", "candidate_refolding_evaluation"}:
             from mn_protein_design.workflows.benchmark import run_de_novo_binder_scoring_dataset
 
             kwargs = _restore_worker_kwargs(request)
-            job = JobPaths(task_group="benchmark", run_id=run_dir.name, run_dir=run_dir)
+            metadata = read_json(run_dir / "metadata.json")
+            job = JobPaths(
+                task_group=str(metadata.get("task_group") or "benchmark"),
+                run_id=run_dir.name,
+                run_dir=run_dir,
+            )
             run_de_novo_binder_scoring_dataset(existing_job=job, **kwargs)
+            return 0
+        if kind == "monomer_refolding":
+            from mn_protein_design.workflows.refolding import run_monomer_refolding_contract
+
+            kwargs = _restore_worker_kwargs(request)
+            job = JobPaths(task_group="refolding-validation", run_id=run_dir.name, run_dir=run_dir)
+            run_monomer_refolding_contract(existing_job=job, **kwargs)
             return 0
         if kind == "benchmark_pyrosetta_backfill":
             from mn_protein_design.workflows.benchmark import run_missing_pyrosetta_benchmark_metrics
@@ -66,8 +147,14 @@ def run_worker_job(run_dir: Path) -> int:
             kwargs = _restore_worker_kwargs(request)
             run_capacity_benchmark_scheduler(run_dir, **kwargs)
             return 0
+        if kind == "design_capacity_scheduler":
+            from mn_protein_design.workflows.capacity_benchmark import run_design_capacity_scheduler
+
+            kwargs = _restore_worker_kwargs(request)
+            run_design_capacity_scheduler(run_dir, **kwargs)
+            return 0
         if kind == "detection_tool":
-            from mn_protein_design.workflows.detection import run_masif_seed, run_scannet, run_surf2spot
+            from mn_protein_design.workflows.detection import run_masif_seed, run_pesto, run_scannet, run_surf2spot
 
             metadata = read_json(run_dir / "metadata.json")
             input_payload = read_json(run_dir / "input.json")
@@ -89,6 +176,14 @@ def run_worker_job(run_dir: Path) -> int:
                 return 0
             if tool == "surf2spot":
                 run_surf2spot(target_pdb, gpu_device=gpu_device, existing_job=job)
+                return 0
+            if tool == "pesto":
+                run_pesto(
+                    target_pdb,
+                    [str(chain) for chain in inputs.get("chains") or []],
+                    gpu_device=gpu_device,
+                    existing_job=job,
+                )
                 return 0
             if tool == "masif_seed":
                 run_masif_seed(
