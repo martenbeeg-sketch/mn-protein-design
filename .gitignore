@@ -7,5 +7,5 @@ mn-protein-design-workdir
 mn_protein_design.egg-info/
 
 smoke_tests/
-tools_to_implement/
+/tools_to_implement
 ui_inspiration/
