@@ -4,15 +4,19 @@ services:
   scannet:
     image: mn-scannet:cpu
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/protein-design/scannet/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/scannet/Dockerfile
       platforms: ["linux/x86_64"]
 
   surf2spot:
     image: mn-surf2spot:cu128
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/protein-design/surf2spot/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/surf2spot/Dockerfile
       platforms: ["linux/x86_64"]
       args:
         INSTALL_ESMFOLD: "false"
@@ -20,23 +24,29 @@ services:
   pesto:
     image: mn-pesto:cu128
     build:
-      context: ../ovo-ligand
-      dockerfile: ../mn-tool-containers/shared/pesto/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: shared/pesto/Dockerfile
       platforms: ["linux/x86_64"]
     gpus: all
 
   masif-seed:
     image: mn-masif-seed:cpu
     build:
-      context: tools_to_implement/masif_seed
-      dockerfile: ../../../mn-tool-containers/protein-design/masif-seed/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/masif-seed/Dockerfile
       platforms: ["linux/x86_64"]
 
   genie3:
     image: mn-genie3:cu128
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/protein-design/genie3/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/genie3/Dockerfile
       platforms: ["linux/x86_64"]
       args:
         DOWNLOAD_WEIGHTS: "false"
@@ -45,50 +55,116 @@ services:
   pxdesign:
     image: mn-pxdesign:cu128
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/protein-design/pxdesign/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/pxdesign/Dockerfile
       platforms: ["linux/x86_64"]
 
   protenix:
     image: mn-protenix:cu128
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/protein-design/protenix/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/protenix/Dockerfile
       platforms: ["linux/x86_64"]
     gpus: all
     volumes:
       - /mnt/db/reference_files/protenix:/ref/protenix:rw
 
+  proteina-complexa:
+    image: mn-proteina-complexa:5ae24b0
+    build:
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+        complexa: https://github.com/NVIDIA-Digital-Bio/Proteina-Complexa.git#5ae24b055d828918296f2aad63616b1f4cc0e491
+      dockerfile: protein-design/proteina-complexa/Dockerfile
+      platforms: ["linux/x86_64"]
+    gpus: all
+
+  boltzgen:
+    image: mn-boltzgen:latest
+    build:
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/boltzgen/Dockerfile
+      platforms: ["linux/x86_64"]
+    gpus: all
+
+  scoring-python:
+    image: mn-protein-scoring-python:latest
+    build:
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/de-novo-binder-scoring/Dockerfile
+      args:
+        BASE_IMAGE: mn-python-structure:latest
+      platforms: ["linux/x86_64"]
+
+  scoring-pyrosetta:
+    image: mn-protein-scoring-pyrosetta:latest
+    build:
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/de-novo-binder-scoring/Dockerfile
+      args:
+        BASE_IMAGE: mn-bindcraft:latest
+      platforms: ["linux/x86_64"]
+
+  scoring-ipsae:
+    image: mn-protein-scoring-ipsae:latest
+    build:
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/de-novo-binder-scoring/Dockerfile
+      args:
+        BASE_IMAGE: mn-ipsae:latest
+      platforms: ["linux/x86_64"]
+
   protpardelle-1c:
     image: mn-protpardelle-1c:cu128
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/protein-design/protpardelle-1c/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/protpardelle-1c/Dockerfile
       platforms: ["linux/x86_64"]
 
   biohub-esm:
-    image: mn-biohub-esm:cu128
+    image: mn-biohub-esm:3.4.1-cu128
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/shared/biohub-esm/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: shared/biohub-esm/Dockerfile
       platforms: ["linux/x86_64"]
     gpus: all
     volumes:
       - biohub-esm-hf-cache:/cache/huggingface
-      - /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro
+      - ${MN_PROTEIN_DESIGN_REFERENCE_DIR:-/mnt/db/reference_files}/biohub-esm:/ref/biohub-esm:ro
 
   colabfold:
     image: mn-colabfold:1.6.1-cu12
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/protein-design/colabfold/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/colabfold/Dockerfile
       platforms: ["linux/x86_64"]
 
   openfold3:
     image: mn-openfold3:cu13
     build:
-      context: .
-      dockerfile: ../mn-tool-containers/protein-design/openfold3/Dockerfile
+      context: ../mn-tool-containers
+      additional_contexts:
+        app: .
+      dockerfile: protein-design/openfold3/Dockerfile
       platforms: ["linux/x86_64"]
       args:
         PIXI_ENV: openfold3-cuda13

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import hashlib
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.request import urlopen
 
 import numpy as np
 import pandas as pd
@@ -33,18 +35,18 @@ from mn_protein_design.core.jobs import (
     write_json,
 )
 from mn_protein_design.core.structures import filter_pdb_text
-from mn_protein_design.runtime import runs_root
+from mn_protein_design.runtime import app_home, runs_root
 from mn_protein_design.workflows import esm_binder as esm_binder_workflow
 from mn_protein_design.workflows import chain_roles
 from mn_protein_design.workflows import refolding as refolding_workflow
 from mn_protein_design.workflows import target_msa as target_msa_workflow
+from mn_protein_design.workflows.esmfold2_runtime import run_esmfold2_batch, stage_esmfold2_msa
 
 
 BENCHMARK_GROUP = "benchmark"
-ESMFOLD2_IMAGE = "mn-biohub-esm:cu128"
-SCORING_SCRIPTS_IMAGE = "mn-python-structure:latest"
-PYROSETTA_METRICS_IMAGE = "mn-bindcraft:latest"
-PYMOL_PYTHON = Path("/home/user/mambaforge/envs/mn-protein-design/bin/python")
+ESMFOLD2_IMAGE = "mn-biohub-esm:3.4.1-cu128"
+SCORING_SCRIPTS_IMAGE = "mn-protein-scoring-python:latest"
+PYROSETTA_METRICS_IMAGE = "mn-protein-scoring-pyrosetta:latest"
 AF2_INITIAL_GUESS_IMAGE = "mn-bindcraft:latest"
 COLABFOLD_IMAGE = "mn-colabfold:1.6.1-cu12"
 COLABFOLD_CACHE_DIR = Path("/mnt/db/reference_files/alphafold_models")
@@ -55,8 +57,13 @@ ALPHAFAST_DB_DIR = Path("/mnt/db/reference_files/alignment")
 ALPHAFAST_WEIGHTS_DIR = Path("/mnt/db/reference_files/alphafold3")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BIOHUB_ESM_ROOT = Path("/mnt/db/reference_files/biohub-esm")
-DE_NOVO_BINDER_SCORING_DIR = REPO_ROOT / "tools_to_implement" / "de_novo_binder_scoring"
-PUBLISHED_DATASET = DE_NOVO_BINDER_SCORING_DIR / "analysis" / "data" / "prepared_training_dataset.csv"
+DE_NOVO_BINDER_SCORING_DIR = Path("/opt/de_novo_binder_scoring")
+PUBLISHED_DATASET = app_home() / "reference_files" / "benchmark" / "prepared_training_dataset.csv"
+PUBLISHED_DATASET_URL = (
+    "https://raw.githubusercontent.com/DigBioLab/de_novo_binder_scoring/"
+    "3d4fc2710ae23e578190503164777240f99ce976/analysis/data/prepared_training_dataset.csv"
+)
+PUBLISHED_DATASET_SHA256 = "21b42bac60283f86eaa05a616f95e8bd6eb1125296773fd0be4f89d26ef2fd71"
 TARGET_MSA_REQUIRED_MIN_LENGTH = 30
 CHAIN_INDEXED_CONFIDENCE_FEATURE_RE = re.compile(
     r"(?:^|_)(?:"
@@ -218,6 +225,26 @@ def _repo_and_runs_mounts() -> list[str]:
     except ValueError:
         mounts.extend(["-v", f"{run_root}:{run_root}"])
     return mounts
+
+
+def _ensure_published_benchmark_dataset() -> Path:
+    """Fetch the pinned public dataset into managed app data when first used."""
+    if PUBLISHED_DATASET.is_file():
+        return PUBLISHED_DATASET
+    PUBLISHED_DATASET.parent.mkdir(parents=True, exist_ok=True)
+    temporary = PUBLISHED_DATASET.with_suffix(PUBLISHED_DATASET.suffix + ".download")
+    digest = hashlib.sha256()
+    try:
+        with urlopen(PUBLISHED_DATASET_URL, timeout=60) as response, temporary.open("wb") as output:
+            while chunk := response.read(1024 * 1024):
+                digest.update(chunk)
+                output.write(chunk)
+        if digest.hexdigest() != PUBLISHED_DATASET_SHA256:
+            raise ValueError("Downloaded benchmark dataset checksum does not match the pinned copy.")
+        temporary.replace(PUBLISHED_DATASET)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return PUBLISHED_DATASET
 
 
 def _csv_data_row_count(path: Path) -> int:
@@ -1788,7 +1815,16 @@ def _prepare_benchmark_records(
             if not chain or not raw_msa or raw_msa.lower() == "no_msa":
                 continue
             resolved_msa = _resolve_input_path(raw_msa, base_dir)
-            msa_paths[chain] = str(resolved_msa or raw_msa)
+            if resolved_msa is None:
+                continue
+            staged_msa = _copy_input(resolved_msa, input_dir, candidate_id, f"msa_{_safe_id(chain)}")
+            if staged_msa is not None:
+                try:
+                    relative_msa = staged_msa.resolve().relative_to(input_dir.resolve().parents[2])
+                except ValueError:
+                    msa_paths[chain] = str(staged_msa)
+                else:
+                    msa_paths[chain] = relative_msa.as_posix()
         label = _truthy_label(_row_value(row, "label", "binder", "is_binder", "binds"))
         records.append(
             {
@@ -1814,33 +1850,6 @@ def _prepare_benchmark_records(
     if not records:
         raise ValueError("Benchmark CSV did not contain any rows.")
     return records
-
-
-def _load_esmfold2_msa(msa_cls: Any, msa_path: object, expected_sequence: str) -> tuple[Any | None, str | None]:
-    raw_path = str(msa_path or "").strip()
-    if not raw_path or raw_path.lower() == "no_msa":
-        return None, None
-    path = Path(raw_path)
-    if not path.exists():
-        return None, f"missing:{raw_path}"
-    try:
-        msa = msa_cls.from_a3m(path)
-    except Exception as exc:
-        try:
-            with tempfile.NamedTemporaryFile("w", suffix=".a3m", delete=True) as handle:
-                refolding_workflow._copy_a3m_match_columns_only(path, Path(handle.name))
-                handle.flush()
-                msa = msa_cls.from_a3m(Path(handle.name))
-        except Exception as sanitized_exc:
-            return None, f"invalid:{path.name}:{exc}; sanitized_invalid:{sanitized_exc}"
-        sanitized_note = f"sanitized:{path.name}"
-    else:
-        sanitized_note = None
-    query = "".join(str(getattr(msa, "query", "") or "").upper().split())
-    expected = "".join(str(expected_sequence or "").upper().split())
-    if query and expected and query != expected:
-        return None, f"query_mismatch:{path.name}"
-    return msa, sanitized_note
 
 
 def _manual_auroc(labels: list[int], scores: list[float]) -> float | None:
@@ -3329,7 +3338,7 @@ def run_precomputed_metric_benchmark(
     max_rows: int = 0,
     max_columns: int = 250,
 ) -> Path:
-    source_csv = PUBLISHED_DATASET if use_published_dataset else input_csv
+    source_csv = _ensure_published_benchmark_dataset() if use_published_dataset else input_csv
     job = create_job(
         BENCHMARK_GROUP,
         "metric_dataset_benchmark",
@@ -5307,8 +5316,14 @@ def _run_benchmark_metric_postprocessing(
             pymol_files_dir.mkdir(parents=True, exist_ok=True)
             write_json(pymol_files_dir / "pdb_dirs.json", pymol_dirs)
             pymol_cmd = [
-                str(PYMOL_PYTHON),
-                "-m",
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{job_run_dir}:/work",
+                "-w",
+                f"/work/{pymol_files_dir.relative_to(job_run_dir)}",
+                SCORING_SCRIPTS_IMAGE,
                 "pymol",
                 "-c",
                 "-d",
@@ -8180,24 +8195,17 @@ def _run_esmfold2_benchmark_worker(
     device: str,
     contact_cutoff: float,
     use_target_msa: bool,
+    gpu_device: object = "0",
 ) -> None:
     records = json.loads(records_json.read_text())
-    esm_binder_workflow._ensure_esm_import_path()
-    from esm.models.esmfold2 import (
-        DistogramConditioning,
-        ESMFold2InputBuilder,
-        ProteinInput,
-        StructurePredictionInput,
-    )
-    from esm.utils.msa import MSA
-
-    model = esm_binder_workflow._load_esmfold2_model(device)
-    builder = ESMFold2InputBuilder(ccd_cache=esm_binder_workflow.ESMFOLD2_MODEL_DIR)
     raw_root = run_dir / "artifacts" / "raw" / "esmfold2_benchmark"
-    raw_root.mkdir(parents=True, exist_ok=True)
+    input_root = raw_root / "inputs"
+    input_root.mkdir(parents=True, exist_ok=True)
     candidates: list[dict[str, Any]] = []
     table_rows: list[dict[str, Any]] = []
     fold_index = 0
+    prepared: list[dict[str, Any]] = []
+    requests: list[dict[str, Any]] = []
     with (run_dir / "stdout.log").open("a") as stdout:
         for record in records:
             source_candidate = {
@@ -8211,9 +8219,11 @@ def _run_esmfold2_benchmark_worker(
                 "hotspots": record.get("hotspots") or [],
                 "stage": STAGE_BENCHMARK,
             }
-            target_pdb = Path(str(record.get("target_pdb") or ""))
-            if not target_pdb.exists():
+            source_target_pdb = Path(str(record.get("target_pdb") or ""))
+            if not source_target_pdb.is_file():
                 raise ValueError(f"Benchmark record {record['candidate_id']} has no readable target_pdb.")
+            target_pdb = input_root / f"{_safe_id(record['candidate_id'])}_target.pdb"
+            shutil.copy2(source_target_pdb, target_pdb)
             source_run_dir = run_dir
             binder_sequence = str(record.get("binder_sequence") or "").strip()
             if not binder_sequence:
@@ -8250,14 +8260,12 @@ def _run_esmfold2_benchmark_worker(
                     target_sequences = {chain: declared_target_sequences[chain] for chain in declared_target_chains}
                     residue_maps = {}
                     fragment_specs = refolding_workflow._target_fragment_specs_from_declared_sequences(
-                        target_pdb,
+                        source_target_pdb,
                         declared_target_sequences,
                         declared_target_chains,
                     )
                     if fragment_specs:
-                        staged_target_dir = raw_root / "staged_targets"
-                        staged_target_dir.mkdir(parents=True, exist_ok=True)
-                        staged_target_pdb = staged_target_dir / f"{_safe_id(record['candidate_id'])}_target_fragments.pdb"
+                        staged_target_pdb = input_root / f"{_safe_id(record['candidate_id'])}_target_fragments.pdb"
                         target_lines: list[str] = []
                         next_atom = 1
                         for spec in fragment_specs:
@@ -8267,7 +8275,7 @@ def _run_esmfold2_benchmark_worker(
                                 else None
                             )
                             chain_lines, next_atom = refolding_workflow._renumber_structure_chain(
-                                target_pdb,
+                                source_target_pdb,
                                 str(spec["engine_chain"]),
                                 next_atom,
                                 {str(spec["source_chain"])},
@@ -8288,22 +8296,28 @@ def _run_esmfold2_benchmark_worker(
             )[0]
             mapped_hotspots = esm_binder_workflow._mapped_hotspots(record.get("hotspots") or [], residue_maps)
             record_msa_paths = record.get("msa_paths") if use_target_msa and isinstance(record.get("msa_paths"), dict) else {}
-            target_msas: dict[str, Any] = {}
+            target_msas: dict[str, Path] = {}
             msa_notes: list[str] = []
-            for target_chain, target_sequence in target_sequences.items():
-                msa, note = _load_esmfold2_msa(MSA, record_msa_paths.get(target_chain), target_sequence)
-                if msa is not None:
-                    target_msas[target_chain] = msa
-                if note:
-                    msa_notes.append(f"{target_chain}:{note}")
+            if use_target_msa:
+                for msa_index, (target_chain, target_sequence) in enumerate(target_sequences.items(), start=1):
+                    raw_msa_path = str(record_msa_paths.get(target_chain) or "").strip()
+                    if raw_msa_path and not Path(raw_msa_path).is_absolute():
+                        raw_msa_path = str((run_dir / raw_msa_path).resolve())
+                    msa_path, note = stage_esmfold2_msa(
+                        raw_msa_path,
+                        target_sequence,
+                        input_root / f"{_safe_id(record['candidate_id'])}_chain_{msa_index:02d}.a3m",
+                    )
+                    if msa_path is not None:
+                        target_msas[target_chain] = msa_path
+                    if note:
+                        msa_notes.append(f"{target_chain}:{note}")
 
             for mode in modes:
                 use_initial_guess = mode == "initial_guess"
                 fold_index += 1
                 mode_label = "ig" if use_initial_guess else "seq"
                 candidate_id = f"{record['candidate_id']}_esmfold2bm_{mode_label}"
-                mode_dir = raw_root / mode_label
-                mode_dir.mkdir(parents=True, exist_ok=True)
                 distogram_conditioning = None
                 initial_guess_note = None
                 if use_initial_guess:
@@ -8315,109 +8329,161 @@ def _run_esmfold2_benchmark_worker(
                             len(target_sequence),
                         )
                         if distogram is not None:
-                            distogram_conditioning.append(DistogramConditioning(chain_id=target_chain, distogram=distogram))
+                            distogram_conditioning.append({"chain_id": target_chain, "array": distogram})
                         elif note and initial_guess_note is None:
                             initial_guess_note = note
                     initial_guess_note = "target distogram conditioning applied" if distogram_conditioning else initial_guess_note
                 stdout.write(f"Folding benchmark {candidate_id} mode={mode}\n")
                 stdout.flush()
-                spi = StructurePredictionInput(
-                    sequences=[
-                        *[
-                            ProteinInput(id=chain, sequence=sequence, msa=target_msas.get(chain))
-                            for chain, sequence in target_sequences.items()
-                        ],
-                        *([] if target_only else [ProteinInput(id=binder_chain, sequence=binder_sequence, msa=None)]),
-                    ],
-                    distogram_conditioning=distogram_conditioning,
-                )
-                result = builder.fold(
-                    model,
-                    spi,
-                    num_loops=int(num_loops),
-                    num_sampling_steps=int(num_sampling_steps),
-                    num_diffusion_samples=1,
-                    seed=int(seed) + fold_index - 1,
-                    complex_id=candidate_id,
-                )
-                complex_path = mode_dir / f"{candidate_id}.cif"
-                complex_path.write_text(result.complex.to_mmcif())
-                confidence_metrics, confidence_analysis = refolding_workflow._esmfold2_confidence_analysis(
-                    result,
-                    binder_chain=binder_chain,
-                    target_chains=target_chains,
-                    contact_cutoff=float(contact_cutoff),
-                    output_prefix=mode_dir / candidate_id,
-                )
-                hotspot_metrics = esm_binder_workflow._hotspot_metrics_from_complex(
-                    result.complex,
-                    binder_chain=binder_chain,
-                    target_chains=target_chains,
-                    mapped_hotspots=mapped_hotspots,
-                    contact_cutoff=float(contact_cutoff),
-                )
-                metrics = {
-                    "benchmark_backend": "esmfold2",
-                    "benchmark_mode": mode,
-                    "complex_refolding_backend": f"esmfold2_benchmark_{mode}",
-                    "label": record.get("label"),
-                    "iptm": float(result.iptm) if result.iptm is not None else None,
-                    "ptm": float(result.ptm) if result.ptm is not None else None,
-                    "plddt_mean": esm_binder_workflow._mean_plddt(result),
-                    "binder_length": 0 if target_only else len(binder_sequence),
-                    "target_length": sum(len(sequence) for sequence in target_sequences.values()) if target_only else None,
-                    "initial_guess_used": bool(distogram_conditioning),
-                    "initial_guess_note": initial_guess_note,
-                    "target_msa_enabled": bool(use_target_msa),
-                    "target_msa_count": len(target_msas),
-                    "target_msa_notes": ";".join(msa_notes) if msa_notes else None,
-                    **confidence_metrics,
-                    **hotspot_metrics,
-                }
-                metrics["esmfold2_benchmark_score"] = _score_record_metrics(metrics)
-                candidate = {
-                    "candidate_id": candidate_id,
-                    "stage": STAGE_BENCHMARK,
-                    "source_tool": "esmfold2_benchmark",
-                    "tool": "esmfold2_benchmark",
-                    "target_pdb": str(target_pdb),
-                    "complex_pdb": str(complex_path.relative_to(run_dir)),
-                    "binder_sequence": binder_sequence,
-                    "target_chains": target_chains,
-                    "binder_chains": [] if target_only else [binder_chain],
-                    "legacy_capacity_binder_chains": target_chains if target_only else [],
-                    "target_only": bool(target_only),
-                    "hotspots": list(record.get("hotspots") or []),
-                    "binder_length": "0" if target_only else str(len(binder_sequence)),
-                    "metrics": metrics,
-                    "parents": [str(record["candidate_id"])],
-                    "raw_metadata": {
-                        "benchmark_record": record,
-                        "confidence": confidence_analysis,
-                        "confidence_json": confidence_metrics.get("esmfold2_confidence_json"),
-                        "confidence_arrays": confidence_metrics.get("esmfold2_confidence_arrays"),
-                        "capacity_target_only": bool(target_only),
-                        "staged_target_chains": target_chains if target_only else [],
-                        "biological_target_chains": target_chains if target_only else [],
-                        "legacy_capacity_binder_chains": target_chains if target_only else [],
-                        "pae_path": str((mode_dir / str(confidence_metrics.get("esmfold2_pae_json") or "")).relative_to(run_dir))
-                        if confidence_metrics.get("esmfold2_pae_json")
-                        else None,
-                    },
-                }
-                candidates.append(candidate)
-                table_rows.append(
+                sequences = [
                     {
-                        "candidate_id": candidate_id,
-                        "parent_id": record["candidate_id"],
-                        "target_id": record.get("target_id"),
-                        "source": record.get("source"),
-                        "label": record.get("label"),
-                        "label_raw": record.get("label_raw"),
-                        "mode": mode,
-                        **{key: value for key, value in metrics.items() if isinstance(value, (str, int, float, bool)) or value is None},
+                        "id": chain,
+                        "sequence": sequence,
+                        **({"msa_path": str(target_msas[chain])} if chain in target_msas else {}),
+                    }
+                    for chain, sequence in target_sequences.items()
+                ]
+                if not target_only:
+                    sequences.append({"id": binder_chain, "sequence": binder_sequence})
+                requests.append(
+                    {
+                        "request_id": candidate_id,
+                        "sequences": sequences,
+                        "distogram_conditioning": distogram_conditioning or [],
+                        "seed": int(seed) + fold_index - 1,
                     }
                 )
+                prepared.append(
+                    {
+                        "record": record,
+                        "candidate_id": candidate_id,
+                        "mode": mode,
+                        "target_pdb": target_pdb,
+                        "target_only": target_only,
+                        "target_sequences": target_sequences,
+                        "target_chains": target_chains,
+                        "binder_sequence": binder_sequence,
+                        "binder_chain": binder_chain,
+                        "mapped_hotspots": mapped_hotspots,
+                        "initial_guess_used": bool(distogram_conditioning),
+                        "initial_guess_note": initial_guess_note,
+                        "target_msa_count": len(target_msas),
+                        "msa_notes": msa_notes,
+                        "benchmark_record": {
+                            key: value
+                            for key, value in record.items()
+                            if key not in {"raw_input", "msa_paths"}
+                        }
+                        | {
+                            "msa_artifacts": {
+                                chain: str(path.relative_to(run_dir)) for chain, path in target_msas.items()
+                            }
+                        },
+                    }
+                )
+
+    predictions = run_esmfold2_batch(
+        run_dir=run_dir,
+        requests=requests,
+        gpu_device=gpu_device,
+        device=device,
+        num_loops=int(num_loops),
+        num_sampling_steps=int(num_sampling_steps),
+        seed=int(seed),
+        shm_size="64G",
+    )
+
+    for row in prepared:
+        record = row["record"]
+        candidate_id = row["candidate_id"]
+        mode = row["mode"]
+        target_only = row["target_only"]
+        target_chains = row["target_chains"]
+        binder_chain = row["binder_chain"]
+        target_pdb = row["target_pdb"]
+        binder_sequence = row["binder_sequence"]
+        mode_label = "ig" if mode == "initial_guess" else "seq"
+        mode_dir = raw_root / mode_label
+        mode_dir.mkdir(parents=True, exist_ok=True)
+        result = predictions[candidate_id].result
+        complex_path = mode_dir / f"{candidate_id}.cif"
+        shutil.copy2(predictions[candidate_id].complex_path, complex_path)
+        confidence_metrics, confidence_analysis = refolding_workflow._esmfold2_confidence_analysis(
+            result,
+            binder_chain=binder_chain,
+            target_chains=target_chains,
+            contact_cutoff=float(contact_cutoff),
+            output_prefix=mode_dir / candidate_id,
+        )
+        hotspot_metrics = esm_binder_workflow._hotspot_metrics_from_complex(
+            result.complex,
+            binder_chain=binder_chain,
+            target_chains=target_chains,
+            mapped_hotspots=row["mapped_hotspots"],
+            contact_cutoff=float(contact_cutoff),
+        )
+        metrics = {
+            "benchmark_backend": "esmfold2",
+            "benchmark_mode": mode,
+            "complex_refolding_backend": f"esmfold2_benchmark_{mode}",
+            "label": record.get("label"),
+            "iptm": float(result.iptm) if result.iptm is not None else None,
+            "ptm": float(result.ptm) if result.ptm is not None else None,
+            "plddt_mean": esm_binder_workflow._mean_plddt(result),
+            "binder_length": 0 if target_only else len(binder_sequence),
+            "target_length": sum(len(sequence) for sequence in row["target_sequences"].values()) if target_only else None,
+            "initial_guess_used": row["initial_guess_used"],
+            "initial_guess_note": row["initial_guess_note"],
+            "target_msa_enabled": bool(use_target_msa),
+            "target_msa_count": row["target_msa_count"],
+            "target_msa_notes": ";".join(row["msa_notes"]) if row["msa_notes"] else None,
+            **confidence_metrics,
+            **hotspot_metrics,
+        }
+        metrics["esmfold2_benchmark_score"] = _score_record_metrics(metrics)
+        candidate = {
+            "candidate_id": candidate_id,
+            "stage": STAGE_BENCHMARK,
+            "source_tool": "esmfold2_benchmark",
+            "tool": "esmfold2_benchmark",
+            "target_pdb": str(target_pdb.relative_to(run_dir)),
+            "complex_pdb": str(complex_path.relative_to(run_dir)),
+            "binder_sequence": binder_sequence,
+            "target_chains": target_chains,
+            "binder_chains": [] if target_only else [binder_chain],
+            "legacy_capacity_binder_chains": target_chains if target_only else [],
+            "target_only": bool(target_only),
+            "hotspots": list(record.get("hotspots") or []),
+            "binder_length": "0" if target_only else str(len(binder_sequence)),
+            "metrics": metrics,
+            "parents": [str(record["candidate_id"])],
+            "raw_metadata": {
+                "benchmark_record": row["benchmark_record"],
+                "confidence": confidence_analysis,
+                "confidence_json": confidence_metrics.get("esmfold2_confidence_json"),
+                "confidence_arrays": confidence_metrics.get("esmfold2_confidence_arrays"),
+                "capacity_target_only": bool(target_only),
+                "staged_target_chains": target_chains if target_only else [],
+                "biological_target_chains": target_chains if target_only else [],
+                "legacy_capacity_binder_chains": target_chains if target_only else [],
+                "pae_path": str((mode_dir / str(confidence_metrics.get("esmfold2_pae_json") or "")).relative_to(run_dir))
+                if confidence_metrics.get("esmfold2_pae_json")
+                else None,
+            },
+        }
+        candidates.append(candidate)
+        table_rows.append(
+            {
+                "candidate_id": candidate_id,
+                "parent_id": record["candidate_id"],
+                "target_id": record.get("target_id"),
+                "source": record.get("source"),
+                "label": record.get("label"),
+                "label_raw": record.get("label_raw"),
+                "mode": mode,
+                **{key: value for key, value in metrics.items() if isinstance(value, (str, int, float, bool)) or value is None},
+            }
+        )
 
     candidates.sort(key=lambda candidate: candidate["metrics"].get("esmfold2_benchmark_score") or 0.0, reverse=True)
     for rank, candidate in enumerate(candidates, start=1):
@@ -8484,7 +8550,8 @@ def run_esmfold2_binder_benchmark(
             "gpu_device": normalize_gpu_device(gpu_device),
             "contact_cutoff": contact_cutoff,
             "use_target_msa": use_target_msa,
-            "use_docker": use_docker,
+            "use_docker_requested": use_docker,
+            "backend": "biohub_esmfold2_container",
             "image": ESMFOLD2_IMAGE,
         },
     )
@@ -8513,55 +8580,17 @@ def run_esmfold2_binder_benchmark(
     records_json.write_text(json.dumps(records, indent=2) + "\n")
     update_status(job.run_dir, "running")
 
-    if use_docker:
-        command = [
-            "docker",
-            "run",
-            "--rm",
-            *docker_gpu_args(gpu_device),
-            "--shm-size=64G",
-            *_repo_and_runs_mounts(),
-            "-v",
-            f"{BIOHUB_ESM_ROOT}:{BIOHUB_ESM_ROOT}:ro",
-            "-v",
-            "/mnt/db/reference_files:/mnt/db/reference_files:ro",
-            "-w",
-            str(REPO_ROOT),
-            "-e",
-            f"PYTHONPATH={REPO_ROOT}:{REPO_ROOT / 'tools_to_implement' / 'esm'}",
-            ESMFOLD2_IMAGE,
-            "python",
-            "-m",
-            "mn_protein_design.workflows.benchmark",
-            "worker",
-            "--run-dir",
-            str(job.run_dir),
-            "--records-json",
-            str(records_json),
-            "--modes",
-            ",".join(selected_modes),
-            "--num-loops",
-            str(num_loops),
-            "--num-sampling-steps",
-            str(num_sampling_steps),
-            "--seed",
-            str(seed),
-            "--device",
-            device,
-            "--contact-cutoff",
-            str(contact_cutoff),
-            "--use-target-msa",
-            "1" if use_target_msa else "0",
-        ]
-        write_json(job.run_dir / "command.json", {"mode": "docker", "command": command})
-        with (job.run_dir / "stdout.log").open("a") as stdout, (job.run_dir / "stderr.log").open("a") as stderr:
-            stdout.write(f"$ {' '.join(command)}\n")
-            stdout.flush()
-            proc = subprocess.run(command, stdout=stdout, stderr=stderr, check=False)
-        if proc.returncode != 0:
-            finish_job(job.run_dir, False, {"metrics": {"return_code": int(proc.returncode)}})
-            raise RuntimeError(f"ESMFold2 benchmark Docker job failed with return code {proc.returncode}.")
-    else:
+    write_json(
+        job.run_dir / "command.json",
+        {
+            "mode": "biohub_esmfold2_container",
+            "image": ESMFOLD2_IMAGE,
+            "note": "The app prepares records locally and sends only prediction requests to the shared Biohub ESM container.",
+            "device": device,
+            "gpu_device": normalize_gpu_device(gpu_device),
+        },
+    )
+    try:
         _run_esmfold2_benchmark_worker(
             run_dir=job.run_dir,
             records_json=records_json,
@@ -8572,7 +8601,13 @@ def run_esmfold2_binder_benchmark(
             device=device,
             contact_cutoff=contact_cutoff,
             use_target_msa=use_target_msa,
+            gpu_device=gpu_device,
         )
+    except Exception as exc:
+        with (job.run_dir / "stderr.log").open("a") as stderr:
+            stderr.write(f"{type(exc).__name__}: {exc}\n")
+        finish_job(job.run_dir, False, {"metrics": {"error": str(exc)}})
+        raise
     return job.run_dir
 
 
@@ -8588,6 +8623,7 @@ def _worker_cli(argv: list[str]) -> int:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--contact-cutoff", type=float, default=8.0)
     parser.add_argument("--use-target-msa", default="0")
+    parser.add_argument("--gpu-device", default="0")
     args = parser.parse_args(argv)
     _run_esmfold2_benchmark_worker(
         run_dir=Path(args.run_dir),
@@ -8599,6 +8635,7 @@ def _worker_cli(argv: list[str]) -> int:
         device=args.device,
         contact_cutoff=args.contact_cutoff,
         use_target_msa=str(args.use_target_msa).lower() in {"1", "true", "yes", "on"},
+        gpu_device=args.gpu_device,
     )
     return 0
 

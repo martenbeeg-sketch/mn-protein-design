@@ -307,7 +307,7 @@ def _foundry_mpnn_model_from_checkpoint(checkpoint_path: str) -> str:
 
 
 def _bindcraft_advanced_setting_options() -> dict[tuple[str, str], list[str]]:
-    settings_dir = Path("/home/user/programs/ovo-git/ovo/resources/bindcraft/settings_advanced")
+    settings_dir = design_workflow.BINDCRAFT_RESOURCE_DIR / "settings_advanced"
     options: dict[tuple[str, str], list[str]] = {}
     for path in sorted(settings_dir.glob("*.json")):
         stem = path.stem
@@ -346,7 +346,7 @@ def _bindcraft_preset_from_file(settings_file: str) -> tuple[str, str, str]:
 
 
 def _bindcraft_resource_json(folder: str, filename: str) -> dict:
-    path = Path("/home/user/programs/ovo-git/ovo/resources/bindcraft") / folder / filename
+    path = design_workflow.BINDCRAFT_RESOURCE_DIR / folder / filename
     if not path.exists():
         return {"error": f"Missing BindCraft resource: {path}"}
     try:

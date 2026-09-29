@@ -33,8 +33,12 @@ def main() -> None:
     print(f"esmfold2_dir_exists={esmfold2_dir.exists()}")
     print(f"esmc_dir_exists={esmc_dir.exists()}")
 
-    from esm.models.esmfold2 import ESMFold2InputBuilder, ProteinInput, StructurePredictionInput
-    from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
+    from esm.models.esmfold2 import (
+        ESMFold2InputBuilder,
+        EsmFold2Model,
+        ProteinInput,
+        StructurePredictionInput,
+    )
 
     _ = ESMFold2InputBuilder(ccd_cache=esmfold2_dir)
     _ = StructurePredictionInput(sequences=[ProteinInput(id="A", sequence="ACDEFGHIK")])
@@ -46,9 +50,11 @@ def main() -> None:
         if not esmc_dir.exists():
             raise FileNotFoundError(f"ESMC-6B directory is missing: {esmc_dir}")
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = ESMFold2Model.from_pretrained(str(esmfold2_dir), load_esmc=False)
-        model.load_esmc(str(esmc_dir))
-        model = model.to(device).eval()
+        model = EsmFold2Model.from_pretrained(
+            str(esmfold2_dir), load_esmc=False, device=device
+        )
+        model.load_esmc(str(esmc_dir), precision="bf16")
+        model = model.eval()
         print(f"esmfold2_loaded=ok device={model.device}")
 
 

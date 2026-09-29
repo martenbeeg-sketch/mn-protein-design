@@ -23,9 +23,9 @@ from mn_protein_design.core.scheduler import apply_docker_cpu_limits_to_steps
 
 
 ANALYSIS_GROUP = "analysis"
-IPSAE_RUNNER = Path("/home/user/programs/ovo-git/ovo/pipelines/ipsae-tool/bin/run_ipsae.py")
-IPSAE_FULL_RUNNER = Path("tools_to_implement/de_novo_binder_scoring/scripts/ipsae_w_ipae.py")
-IPSAE_IMAGE = "mn-ipsae:latest"
+IPSAE_RUNNER = Path("/opt/mn-ipsae/run_ipsae.py")
+IPSAE_FULL_RUNNER = Path("/opt/de_novo_binder_scoring/scripts/ipsae_w_ipae.py")
+IPSAE_IMAGE = "mn-protein-scoring-ipsae:latest"
 
 
 DEFAULT_THRESHOLDS = {
@@ -715,20 +715,18 @@ def _run_ipsae(source_run_dir: Path, run_dir: Path, candidates: list[dict[str, A
         )
         engine, pae_format = _ipsae_engine(candidate, staged_pae)
         full_runner = Path(IPSAE_FULL_RUNNER)
-        if full_runner.exists() and staged_pae.suffix.lower() == ".json" and staged_structure.suffix.lower() == ".pdb":
+        if staged_pae.suffix.lower() == ".json" and staged_structure.suffix.lower() == ".pdb":
             command = [
                 "docker",
                 "run",
                 "--rm",
                 "-v",
                 f"{run_dir}:/work",
-                "-v",
-                f"{full_runner.resolve().parent}:/scripts:ro",
                 "-w",
                 "/work",
                 IPSAE_IMAGE,
                 "python3",
-                f"/scripts/{full_runner.name}",
+                str(full_runner),
                 f"/work/artifacts/analysis/ipsae/inputs/{safe_id}/{staged_pae.name}",
                 f"/work/artifacts/analysis/ipsae/inputs/{safe_id}/{staged_structure.name}",
                 str(pae_cutoff),
@@ -741,13 +739,11 @@ def _run_ipsae(source_run_dir: Path, run_dir: Path, candidates: list[dict[str, A
                 "--rm",
                 "-v",
                 f"{run_dir}:/work",
-                "-v",
-                f"{IPSAE_RUNNER.parent}:/scripts:ro",
                 "-w",
                 "/work",
                 IPSAE_IMAGE,
                 "python3",
-                "/scripts/run_ipsae.py",
+                str(IPSAE_RUNNER),
                 "--id",
                 safe_id,
                 "--structure",

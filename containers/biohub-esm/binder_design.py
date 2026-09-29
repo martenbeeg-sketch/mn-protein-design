@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from transformers.models.esmc.modeling_esmc import ESMCForMaskedLM
+from esm.models.esmc import EsmcForMaskedLM
 
 
 def _load_tutorial(path: Path):
@@ -38,14 +38,20 @@ def _finite_or_none(value: Any) -> float | None:
 def _load_model(module: Any, model_dir: Path, esmc_dir: Path) -> Any:
     if not model_dir.exists():
         raise FileNotFoundError(f"Experimental ESMFold2 checkpoint is missing: {model_dir}")
-    model = module.ESMFold2ExperimentalModel.from_pretrained(
+    model = module.EsmFold2ExperimentalModel.from_pretrained(
         str(model_dir),
         load_esmc=False,
         local_files_only=True,
+        device="cuda",
     )
     model.load_esmc(str(esmc_dir))
     model.configure_lm_dropout(0.5, force_lm_dropout_during_inference=True)
-    model.set_kernel_backend("cuequivariance" if module.CUE_AVAILABLE else None)
+    backend = None
+    if module.TRITON_KERNELS_AVAILABLE:
+        backend = module.BACKEND_FUSED
+    elif module.CUE_AVAILABLE:
+        backend = module.BACKEND_CUEQ
+    model.set_kernel_backend(backend)
     return model.cuda().eval().requires_grad_(False)
 
 
@@ -73,14 +79,14 @@ def main() -> None:
         reference_root / "binder-design" / model_name,
         reference_root / "ESMC-6B",
     )
-    esmc_model = ESMCForMaskedLM.from_pretrained(
+    esmc_model = EsmcForMaskedLM.from_pretrained(
         str(reference_root / "ESMC-6B"),
-        torch_dtype=torch.float32,
-        local_files_only=True,
+        dtype=torch.float32,
+        device="cpu",
     )
     del esmc_model.esmc
     torch.cuda.empty_cache()
-    esmc_model.esmc = shared_model._esmc
+    esmc_model.esmc = shared_model.esmc
     esmc_model = esmc_model.cuda().eval().requires_grad_(False)
 
     engine = tutorial.ESMFold2Design()

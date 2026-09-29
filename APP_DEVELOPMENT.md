@@ -160,9 +160,9 @@ the main pages and selection of lazy result/setup panels. Tests use temporary
 run roots and small synthetic structures; they do not launch design or
 refolding engines. Native Docker/GPU checks remain in `smoke_tests/`.
 
-Tests under `tools_to_implement/` and `ui_inspiration/` belong to upstream or
-reference projects and are not the app regression suite. Container/GPU smoke
-tests remain separate from the local test baseline.
+Tests from archived upstream checkouts and `ui_inspiration/` belong to reference
+projects and are not the app regression suite. Container/GPU smoke tests remain
+separate from the local test baseline.
 
 ## Safe development procedure
 

@@ -846,5 +846,6 @@ particular:
   folders under `/mnt/db/reference_files`.
 * Standalone Protenix v1/v2 requires the `mn-protenix:cu128` image
   and keeps model/cache/parameter files under `/mnt/db/reference_files/protenix`.
-* External source folders such as `tools_to_implement/` may be intentionally
-  untracked but required for Docker image builds.
+* Upstream source checkouts may be kept outside this repository as optional
+  references. Container builds fetch pinned source revisions and patches from
+  the sibling `mn-tool-containers` repository.

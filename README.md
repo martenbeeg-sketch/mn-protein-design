@@ -118,9 +118,10 @@ export MN_PROTEIN_DESIGN_REFERENCE_DIR=/path/to/reference_files
 export TMPDIR=/path/to/tmp
 ```
 
-`Settings` shows effective runtime, reference, executable, and image paths. Some
-workflow adapters still contain direct shared-reference or checkout assumptions;
-see `APP_MISSING.md`.
+`Settings` shows effective runtime, reference, executable, and image paths.
+Scientific source code is installed in the app environment or fetched into
+Docker images from pinned revisions. Large model weights and reference data
+remain under the configured reference root.
 
 New job JSON, candidate structure, and artifact records use run-relative paths
 or managed references (`runs:///`, `reference:///`, and `app:///`) where
@@ -191,9 +192,9 @@ Run the first-party CPU/local suite with:
 ```
 
 These tests do not require Docker, a GPU, model weights, or network access.
-Engine-native Docker/GPU smoke tests remain separate. Tests inside
-`tools_to_implement/` and `ui_inspiration/` belong to upstream/reference projects,
-not this app's regression suite.
+Engine-native Docker/GPU smoke tests remain separate. Archived upstream source
+checkouts are optional references; container builds fetch pinned source
+revisions from the sibling `mn-tool-containers` repository.
 
 ## Repository caution
 

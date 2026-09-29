@@ -303,11 +303,8 @@ with st.expander("MSA and reference data", expanded=True):
 
 with st.expander("Local executables and helper scripts", expanded=True):
     executable_rows = [
-        _path_row("PyMOL Python", benchmark_workflow.PYMOL_PYTHON, "benchmark.PYMOL_PYTHON", "Used for PyMOL/interface geometry metrics."),
-        _path_row("Boltz prepare_inputs.py", refolding_workflow.BOLTZ_PREPARE_INPUTS, "refolding.BOLTZ_PREPARE_INPUTS", "Used by Boltz-2 refolding adapter."),
-        _path_row("Vendored de-novo binder scoring tools", benchmark_workflow.DE_NOVO_BINDER_SCORING_DIR, "repo-local"),
-        _path_row("Vendored ESM tools", esm_binder_workflow.VENDORED_ESM_DIR, "repo-local"),
-        _path_row("BoltzGen local source", refolding_workflow.BOLTZGEN_LOCAL_SOURCE, "repo-local"),
+        _path_row("Benchmark dataset", benchmark_workflow.PUBLISHED_DATASET, "app workdir; fetched from pinned upstream on first use"),
+        _path_row("Scoring scripts in Docker", benchmark_workflow.DE_NOVO_BINDER_SCORING_DIR, "container image path"),
     ]
     st.dataframe(pd.DataFrame(executable_rows), hide_index=True, use_container_width=True)
 
@@ -316,7 +313,10 @@ with st.expander("Docker images", expanded=False):
     image_rows = [
         _image_row("AlphaFast AF3 / MMseqs", benchmark_workflow.ALPHAFAST_IMAGE),
         _image_row("ColabFold", benchmark_workflow.COLABFOLD_IMAGE),
-        _image_row("AF2 initial guess / PyRosetta base", benchmark_workflow.AF2_INITIAL_GUESS_IMAGE),
+        _image_row("AF2 initial guess", benchmark_workflow.AF2_INITIAL_GUESS_IMAGE),
+        _image_row("Scoring scripts", benchmark_workflow.SCORING_SCRIPTS_IMAGE),
+        _image_row("PyRosetta metrics", benchmark_workflow.PYROSETTA_METRICS_IMAGE),
+        _image_row("IPSAE scoring", "mn-protein-scoring-ipsae:latest"),
         _image_row("Boltz-2", benchmark_workflow.BOLTZ2_IMAGE),
         _image_row("RF3 / Foundry", refolding_workflow.RF3_IMAGE),
         _image_row("OpenFold-3", refolding_workflow.OPENFOLD3_IMAGE),

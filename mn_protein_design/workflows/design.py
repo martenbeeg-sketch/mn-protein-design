@@ -36,8 +36,9 @@ from mn_protein_design.workflows.target_msa import (
 
 DESIGN_GROUP = "design"
 RFDIFFUSION_SCAFFOLD_LIBRARY_CONTAINER_DIR = "/models/ppi_scaffolds"
+BINDCRAFT_RESOURCE_DIR = Path(__file__).resolve().parents[1] / "data" / "bindcraft"
 RFDIFFUSION_BUNDLED_SCAFFOLD_TAR = (
-    Path(__file__).resolve().parents[2] / "tools_to_implement" / "RFdiffusion" / "examples" / "ppi_scaffolds_subset.tar.gz"
+    Path(__file__).resolve().parents[1] / "data" / "reference" / "ppi_scaffolds_subset.tar.gz"
 )
 AA3_TO_1 = {
     "ALA": "A",
@@ -324,8 +325,8 @@ def parse_binder_lengths(text: str) -> list[int]:
     return [lengths[0]] if len(lengths) == 2 and lengths[0] == lengths[1] else lengths
 
 
-def _ovo_bindcraft_resource(*parts: str) -> Path:
-    return Path("/home/user/programs/ovo-git/ovo/resources/bindcraft").joinpath(*parts)
+def _bindcraft_resource(*parts: str) -> Path:
+    return BINDCRAFT_RESOURCE_DIR.joinpath(*parts)
 
 
 def _read_json_file(path: Path) -> dict:
@@ -341,7 +342,7 @@ def _bindcraft_advanced_settings(
     max_mpnn_sequences_override: int | None = None,
     enable_mpnn: bool = True,
 ) -> dict:
-    settings = _read_json_file(_ovo_bindcraft_resource("settings_advanced", settings_file))
+    settings = _read_json_file(_bindcraft_resource("settings_advanced", settings_file))
     settings.update(
         {
             "max_trajectories": max_trajectories,
@@ -387,7 +388,7 @@ def _copy_bindcraft_settings(run_dir: Path, params: dict) -> None:
             bool(params.get("enable_mpnn", True)),
         ),
     )
-    filters_path = _ovo_bindcraft_resource("settings_filters", params["filter_settings"])
+    filters_path = _bindcraft_resource("settings_filters", params["filter_settings"])
     write_json(bindcraft_dir / "settings_filters.json", _read_json_file(filters_path))
 
 
@@ -2967,7 +2968,7 @@ def run_bindcraft(
         raise ValueError("Time limit should be at least 60 seconds.")
     if max_trajectories < 1:
         raise ValueError("Max trajectories must be at least 1.")
-    advanced_settings_path = _ovo_bindcraft_resource("settings_advanced", advanced_settings_file)
+    advanced_settings_path = _bindcraft_resource("settings_advanced", advanced_settings_file)
     if not advanced_settings_path.exists():
         raise ValueError(f"Unknown BindCraft advanced settings file: {advanced_settings_file}")
     manifest = load_manifest("bindcraft")
@@ -4325,7 +4326,6 @@ def run_proteina_complexa(
     params["target_input"] = target_input
     write_json(out_root / "input" / "target_config.json", {"target_input": target_input, **params})
 
-    tool = Path.cwd() / "tools_to_implement" / "Proteina-Complexa"
     task_name = "MN_APP_TARGET"
     hotspots_arg = "[" + ",".join(hotspots.split(",")) + "]" if hotspots else "[]"
     overrides = [
@@ -4378,8 +4378,6 @@ def run_proteina_complexa(
                 *docker_gpu_args(gpu_device),
                 "-v",
                 f"{job.run_dir}:/work",
-                "-v",
-                f"{tool}:/workspace/protein-foundation-models",
                 "-v",
                 "/mnt/db/reference_files/proteina-complexa/ckpts:/workspace/protein-foundation-models/ckpts:ro",
                 "-v",

@@ -34,6 +34,8 @@ include = ["mn_protein_design*"]
   "*.yaml",
   "pipelines/**/*.nf",
   "pipelines/**/*.config",
+  "data/**/*.tar.gz",
+  "data/bindcraft/**/*.json",
   "app/components/molstar_viewer/frontend/build/*",
 ]
 

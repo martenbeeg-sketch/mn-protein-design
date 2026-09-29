@@ -4,7 +4,6 @@ import json
 import random
 import re
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,16 +14,17 @@ from mn_protein_design.core.gpu import docker_gpu_args, normalize_gpu_device
 from mn_protein_design.core.jobs import create_job, finish_job, update_status, write_json
 from mn_protein_design.core.scheduler import apply_docker_cpu_limit
 from mn_protein_design.core.structures import filter_pdb_text
+from mn_protein_design.runtime import reference_root
+from mn_protein_design.workflows.esmfold2_runtime import run_esmfold2_batch
 
 
 DESIGN_GROUP = "design"
-BIOHUB_ESM_ROOT = Path("/mnt/db/reference_files/biohub-esm")
+BIOHUB_ESM_ROOT = reference_root() / "biohub-esm"
 ESMFOLD2_MODEL_DIR = BIOHUB_ESM_ROOT / "ESMFold2"
 ESMC_MODEL_DIR = BIOHUB_ESM_ROOT / "ESMC-6B"
 ESMFOLD2_BINDER_MODEL_ROOT = BIOHUB_ESM_ROOT / "binder-design"
-ESMFOLD2_BINDER_IMAGE = "mn-biohub-esm:cu128"
+ESMFOLD2_BINDER_IMAGE = "mn-biohub-esm:3.4.1-cu128"
 DEFAULT_BINDER_MODEL = "ESMFold2-Experimental-Fast"
-VENDORED_ESM_DIR = Path(__file__).resolve().parents[2] / "tools_to_implement" / "esm"
 AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
 SOLUBLE_AA_WEIGHTS = {
     "A": 0.07,
@@ -215,35 +215,6 @@ def _choose_binder_chain(target_chains: list[str]) -> str:
     return "Z"
 
 
-def _ensure_esm_import_path() -> None:
-    vendored = str(VENDORED_ESM_DIR)
-    if vendored not in sys.path:
-        sys.path.insert(0, vendored)
-
-
-def _load_esmfold2_model(device: str):
-    _ensure_esm_import_path()
-    try:
-        import torch
-        from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
-    except Exception as exc:  # pragma: no cover - dependency/runtime specific
-        raise RuntimeError(
-            "ESMFold2 runtime dependencies are not importable. "
-            "Install/use the Biohub ESM environment before running this workflow."
-        ) from exc
-    if not ESMFOLD2_MODEL_DIR.exists():
-        raise FileNotFoundError(f"ESMFold2 model directory not found: {ESMFOLD2_MODEL_DIR}")
-    resolved_device = device
-    if device == "auto":
-        resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
-    if not ESMC_MODEL_DIR.exists():
-        raise FileNotFoundError(f"ESMC-6B model directory not found: {ESMC_MODEL_DIR}")
-    model = ESMFold2Model.from_pretrained(str(ESMFOLD2_MODEL_DIR), load_esmc=False)
-    model.load_esmc(str(ESMC_MODEL_DIR))
-    model = model.to(resolved_device).eval()
-    return model
-
-
 def _chain_residue_atoms(complex_obj: Any) -> dict[str, dict[int, list[np.ndarray]]]:
     chain_lookup = dict(getattr(complex_obj.metadata, "chain_lookup", {}) or {})
     residues: dict[str, dict[int, list[np.ndarray]]] = {}
@@ -369,6 +340,7 @@ def run_esmfold2_binder_screening(
     seed: int = 0,
     device: str = "auto",
     contact_cutoff: float = 8.0,
+    gpu_device: object | None = None,
 ) -> Path:
     """Run an experimental ESMFold2 target+binder screening loop.
 
@@ -401,6 +373,7 @@ def run_esmfold2_binder_screening(
             "num_sampling_steps": num_sampling_steps,
             "seed": seed,
             "device": device,
+            "gpu_device": gpu_device,
             "contact_cutoff": contact_cutoff,
             "binder_sequences_supplied": bool(binder_sequences_text.strip()),
         },
@@ -410,6 +383,8 @@ def run_esmfold2_binder_screening(
     update_status(job.run_dir, "running")
     raw_dir = job.run_dir / "artifacts" / "raw" / "esmfold2_binder"
     raw_dir.mkdir(parents=True, exist_ok=True)
+    target_artifact = raw_dir / "target.pdb"
+    target_artifact.write_text(target_pdb.read_text(errors="ignore"))
     (raw_dir / "binder_sequences.fasta").write_text(
         "".join(f">esm_binder_{index:05d}\n{sequence}\n" for index, sequence in enumerate(sequences, start=1))
     )
@@ -425,17 +400,31 @@ def run_esmfold2_binder_screening(
     )
 
     try:
-        _ensure_esm_import_path()
-        try:
-            from esm.models.esmfold2 import ESMFold2InputBuilder, ProteinInput, StructurePredictionInput
-        except Exception as exc:  # pragma: no cover - dependency/runtime specific
-            raise RuntimeError(
-                "ESMFold2 runtime dependencies are not importable. "
-                "Install/use the Biohub ESM environment before running this workflow."
-            ) from exc
-
-        model = _load_esmfold2_model(device)
-        builder = ESMFold2InputBuilder(ccd_cache=ESMFOLD2_MODEL_DIR)
+        requests = [
+            {
+                "request_id": f"esmfold2_{index:05d}",
+                "sequences": [
+                    *[
+                        {"id": chain, "sequence": sequence}
+                        for chain, sequence in target_sequences.items()
+                    ],
+                    {"id": binder_chain, "sequence": binder_sequence},
+                ],
+                "num_loops": int(num_loops),
+                "num_sampling_steps": int(num_sampling_steps),
+                "seed": int(seed) + index - 1,
+            }
+            for index, binder_sequence in enumerate(sequences, start=1)
+        ]
+        predictions = run_esmfold2_batch(
+            run_dir=job.run_dir,
+            requests=requests,
+            gpu_device=gpu_device,
+            device=device,
+            num_loops=int(num_loops),
+            num_sampling_steps=int(num_sampling_steps),
+            seed=int(seed),
+        )
         candidates: list[dict[str, Any]] = []
         with (job.run_dir / "stdout.log").open("a") as stdout:
             stdout.write(
@@ -447,28 +436,11 @@ def run_esmfold2_binder_screening(
                 candidate_id = f"esmfold2_{index:05d}"
                 stdout.write(f"Folding {candidate_id} length={len(binder_sequence)}\n")
                 stdout.flush()
-                spi = StructurePredictionInput(
-                    sequences=[
-                        *[
-                            ProteinInput(id=chain, sequence=sequence)
-                            for chain, sequence in target_sequences.items()
-                        ],
-                        ProteinInput(id=binder_chain, sequence=binder_sequence),
-                    ]
-                )
-                result = builder.fold(
-                    model,
-                    spi,
-                    num_loops=int(num_loops),
-                    num_sampling_steps=int(num_sampling_steps),
-                    num_diffusion_samples=1,
-                    seed=int(seed) + index - 1,
-                    complex_id=candidate_id,
-                )
-                complex_path = raw_dir / f"{candidate_id}.cif"
-                complex_path.write_text(result.complex.to_mmcif())
+                prediction = predictions[candidate_id]
+                result = prediction.result
+                complex_path = prediction.complex_path
                 metrics = {
-                    "complex_refolding_backend": "esmfold2_local",
+                        "complex_refolding_backend": "esmfold2_container",
                     "result_kind": "experimental_screening",
                     "iptm": float(result.iptm) if result.iptm is not None else None,
                     "ptm": float(result.ptm) if result.ptm is not None else None,
@@ -488,7 +460,7 @@ def run_esmfold2_binder_screening(
                         "candidate_id": candidate_id,
                         "source_tool": "esmfold2_binder",
                         "stage": STAGE_COMPLEX_REFOLDING,
-                        "target_pdb": str(target_pdb),
+                        "target_pdb": str(target_artifact.relative_to(job.run_dir)),
                         "complex_pdb": str(complex_path.relative_to(job.run_dir)),
                         "binder_pdb": None,
                         "binder_sequence": binder_sequence,
@@ -500,7 +472,7 @@ def run_esmfold2_binder_screening(
                         "metrics": metrics,
                         "raw_metadata": {
                             "result_kind": "experimental_screening",
-                            "warning": "Not Biohub's unreleased ESMFold2 inversion protocol.",
+                            "warning": "Not Biohub's gradient-guided ESMFold2 inversion protocol.",
                             "mapped_hotspots": [f"{chain}{residue}" for chain, residue in mapped_hotspot_ids],
                         },
                     }
@@ -617,7 +589,7 @@ def run_esmfold2_native_binder_design(
         "model_name": model_name,
         "compile": bool(compile_model),
         "checkpoint_lm": bool(checkpoint_lm),
-        "tutorial_path": "/opt/esm/cookbook/tutorials/binder_design.py",
+        "tutorial_path": "/opt/esm-binder-design/binder_design.py",
         "reference_root": "/ref/biohub-esm",
         "output_dir": "/work/artifacts/raw/esmfold2_binder_design/output",
     }

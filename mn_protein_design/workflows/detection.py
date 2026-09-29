@@ -612,18 +612,17 @@ def run_masif_seed(target_pdb: Path, chain_id: str, gpu_device: object = "0", ex
     input_pdb = artifact_path(job.run_dir, "masif_seed", "input", "target.pdb")
     shutil.copyfile(target_pdb, input_pdb)
     target_id = f"TGT1_{chain_id}"
-    repo = PROJECT_DIR / "tools_to_implement" / "masif_seed"
     script = (
         "set -euxo pipefail; "
-        "cd /work/masif_seed_search/data/masif_targets; "
+        "cd /opt/masif_seed/masif_seed_search/data/masif_targets; "
         f"./data_prepare_one.sh --file /job/artifacts/masif_seed/input/target.pdb {target_id}; "
         f"./predict_site.sh {target_id}; "
         f"./color_site.sh {target_id}; "
         f"./compute_descriptors.sh {target_id}; "
         "mkdir -p /job/artifacts/masif_seed/pred_surfaces /job/artifacts/masif_seed/pred_data /job/artifacts/masif_seed/target_run; "
-        f"cp -av output/all_feat_3l/pred_surfaces/{target_id}.ply /job/artifacts/masif_seed/pred_surfaces/ 2>/dev/null || true; "
-        f"cp -av output/all_feat_3l/pred_data/pred_{target_id}.npy /job/artifacts/masif_seed/pred_data/ 2>/dev/null || true; "
-        f"cp -a targets/{target_id} /job/artifacts/masif_seed/target_run/ 2>/dev/null || true"
+        f"cp -av /opt/masif_seed/masif_seed_search/data/masif_targets/output/all_feat_3l/pred_surfaces/{target_id}.ply /job/artifacts/masif_seed/pred_surfaces/ 2>/dev/null || true; "
+        f"cp -av /opt/masif_seed/masif_seed_search/data/masif_targets/output/all_feat_3l/pred_data/pred_{target_id}.npy /job/artifacts/masif_seed/pred_data/ 2>/dev/null || true; "
+        f"cp -a /opt/masif_seed/masif_seed_search/data/masif_targets/targets/{target_id} /job/artifacts/masif_seed/target_run/ 2>/dev/null || true"
     )
     steps = [
         {
@@ -634,11 +633,9 @@ def run_masif_seed(target_pdb: Path, chain_id: str, gpu_device: object = "0", ex
                 "--rm",
                 *docker_gpu_args(normalized_gpu),
                 "-v",
-                f"{repo}:/work",
-                "-v",
                 f"{job.run_dir}:/job",
                 "-w",
-                "/work",
+                "/opt/masif_seed",
                 manifest["image"],
                 "bash",
                 "-lc",

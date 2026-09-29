@@ -3225,12 +3225,13 @@ with legacy_tab:
     )
     esm_device = st.segmented_control(
         "ESMFold2 device",
-        ["auto", "cuda", "cpu"],
+        ["auto", "cuda"],
         selection_mode="single",
         default="auto",
-        format_func={"auto": "Auto", "cuda": "CUDA", "cpu": "CPU"}.get,
+        format_func={"auto": "Auto (scheduled GPU)", "cuda": "CUDA"}.get,
         key="esmfold2_validation_device",
     )
+    st.caption("Biohub ESMFold2 requires CUDA. The scheduler assigns its GPU and limits the container's CPU cores.")
     esm_validation_cpu_cores = cpu_run_panel(key="esmfold2_validation", default=4)
     if st.button("Run ESMFold2 validation", type="primary"):
         try:

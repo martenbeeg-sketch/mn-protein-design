@@ -2430,7 +2430,8 @@ with tabs[1]:
             simple_recycling_loops = simple_cols[2].number_input("Recycling loops", min_value=1, max_value=64, value=10, step=1, key="benchmark_simple_recycling_loops")
             simple_seed = simple_cols[3].number_input("Seed", min_value=0, max_value=999999, value=0, step=1, key="benchmark_simple_seed")
             simple_contact_cutoff = simple_cols[4].number_input("Contact cutoff", min_value=2.0, max_value=20.0, value=8.0, step=0.5, key="benchmark_simple_contact_cutoff")
-            simple_device = simple_cols[5].selectbox("Device", ["cuda", "auto", "cpu"], index=0)
+            simple_device = simple_cols[5].selectbox("Device", ["cuda", "auto"], index=0)
+            st.caption("Biohub ESMFold2 requires CUDA and a scheduled GPU allocation.")
 
 with tabs[2]:
     st.subheader("Metrics")

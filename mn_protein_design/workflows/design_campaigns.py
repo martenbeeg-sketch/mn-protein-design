@@ -328,9 +328,9 @@ def _restrict_fragmented_target_evaluation(config: dict[str, Any], *, target_pdb
     config["refolders"] = refolders or [str(config.get("refolder") or "AF2-IG")]
     return config
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PYROSETTA_METRICS_SCRIPT = REPO_ROOT / "tools_to_implement" / "de_novo_binder_scoring" / "scripts" / "compute_rosetta_metrics.py"
-PYROSETTA_METRICS_WORKDIR = REPO_ROOT / "tools_to_implement" / "de_novo_binder_scoring"
-PYROSETTA_METRICS_IMAGE = "mn-bindcraft:latest"
+PYROSETTA_METRICS_SCRIPT = Path("/opt/de_novo_binder_scoring/scripts/compute_rosetta_metrics.py")
+PYROSETTA_METRICS_WORKDIR = Path("/opt/de_novo_binder_scoring")
+PYROSETTA_METRICS_IMAGE = "mn-protein-scoring-pyrosetta:latest"
 COMMON_AF2_THRESHOLDS = {
     "model_1_binder_plddt": (80.0, "higher"),
     "model_2_binder_plddt": (80.0, "higher"),

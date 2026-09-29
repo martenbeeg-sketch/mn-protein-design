@@ -28,6 +28,7 @@ from mn_protein_design.core.jobs import JobPaths, create_job, finish_job, mark_i
 from mn_protein_design.core.scheduler import apply_docker_cpu_limits_to_steps
 from mn_protein_design.workflows import esm_binder as esm_binder_workflow
 from mn_protein_design.workflows import chain_roles
+from mn_protein_design.workflows.esmfold2_runtime import run_esmfold2_batch, stage_esmfold2_msa
 from mn_protein_design.workflows import target_msa as target_msa_workflow
 
 
@@ -35,7 +36,6 @@ REFOLDING_GROUP = "refolding-validation"
 BOLTZ_MODELS_DIR = Path("/mnt/db/reference_files/boltz_models")
 ALPHAFOLD_MODELS_DIR = Path("/mnt/db/reference_files/alphafold_models")
 AF2_BINDER_EVAL = Path(__file__).resolve().parents[1] / "tools" / "af2_initial_guess_binder_eval.py"
-BOLTZ_PREPARE_INPUTS = Path("/home/user/programs/ovo/original/src/ovo/pipelines/boltz-refolding/bin/prepare_inputs.py")
 RF3_IMAGE = "mn-foundry:cu128"
 RF3_CHECKPOINT = Path("/mnt/db/reference_files/foundry/rf3_foundry_01_24_latest_remapped.ckpt")
 PROTENIX_IMAGE = "mn-pxdesign:cu128"
@@ -62,8 +62,7 @@ OPENFOLD3_RUNNER_YAML_TEMPLATE = """model_update:
         eval:
           use_deepspeed_evo_attention: false
 """
-BOLTZGEN_LOCAL_SOURCE = Path(__file__).resolve().parents[2] / "tools_to_implement" / "boltzgen" / "src" / "boltzgen"
-BOLTZGEN_BENCHMARK_PAE_CONFIG = Path(__file__).resolve().parents[2] / "tools_to_implement" / "boltzgen" / "config" / "fold_benchmark_pae.yaml"
+BOLTZGEN_BENCHMARK_PAE_CONFIG = "/app/config/fold_benchmark_pae.yaml"
 
 MONOMER_SUFFIXES = (
     "_boltz2_monomer",
@@ -3373,7 +3372,7 @@ def run_esmfold2_monomer_refolding(
             "seed": seed,
             "device": device,
             "gpu_device": normalize_gpu_device(gpu_device),
-            "backend": "biohub_esmfold2_local",
+            "backend": "biohub_esmfold2_container",
             "model_dir": str(esm_binder_workflow.ESMFOLD2_MODEL_DIR),
             "esmc_model_dir": str(esm_binder_workflow.ESMC_MODEL_DIR),
         },
@@ -3381,9 +3380,9 @@ def run_esmfold2_monomer_refolding(
     write_json(
         job.run_dir / "command.json",
         {
-            "mode": "python",
+            "mode": "docker",
             "tool": "esmfold2_monomer",
-            "backend": "biohub_esmfold2_local",
+            "backend": "biohub_esmfold2_container",
             "source_run_dir": str(source_run_dir),
             "candidates_jsonl": str(candidates_jsonl),
             "device": device,
@@ -3398,19 +3397,10 @@ def run_esmfold2_monomer_refolding(
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        esm_binder_workflow._ensure_esm_import_path()
-        try:
-            from esm.models.esmfold2 import ESMFold2InputBuilder, ProteinInput, StructurePredictionInput
-        except Exception as exc:  # pragma: no cover - dependency/runtime specific
-            raise RuntimeError(
-                "ESMFold2 runtime dependencies are not importable. "
-                "Run this from the Biohub ESM environment/container before starting monomer refolding."
-            ) from exc
-
-        model = esm_binder_workflow._load_esmfold2_model(device)
-        builder = ESMFold2InputBuilder(ccd_cache=esm_binder_workflow.ESMFOLD2_MODEL_DIR)
         candidates: list[dict[str, Any]] = []
         input_rows: list[dict[str, Any]] = []
+        prepared: list[tuple[int, dict[str, Any], str, str, str]] = []
+        requests: list[dict[str, Any]] = []
         with (job.run_dir / "stdout.log").open("a") as stdout:
             stdout.write("ESMFold2 binder-only monomer refolding.\n")
             stdout.flush()
@@ -3420,79 +3410,86 @@ def run_esmfold2_monomer_refolding(
                 binder_sequence = _candidate_sequence(source_run_dir, source)
                 if not binder_sequence:
                     raise ValueError(f"Candidate {parent_id} does not have a readable binder sequence.")
+                prepared.append((index, source, parent_id, candidate_id, binder_sequence))
+                requests.append(
+                    {
+                        "request_id": candidate_id,
+                        "sequences": [{"id": "A", "sequence": binder_sequence}],
+                        "seed": int(seed) + index - 1,
+                    }
+                )
                 stdout.write(
                     f"Folding {candidate_id} binder_length={len(binder_sequence)} "
                     f"seed={int(seed) + index - 1}\n"
                 )
                 stdout.flush()
-                spi = StructurePredictionInput(
-                    sequences=[ProteinInput(id="A", sequence=binder_sequence)],
-                    distogram_conditioning=None,
-                )
-                result = builder.fold(
-                    model,
-                    spi,
-                    num_loops=int(num_loops),
-                    num_sampling_steps=int(num_sampling_steps),
-                    num_diffusion_samples=1,
-                    seed=int(seed) + index - 1,
-                    complex_id=candidate_id,
-                )
-                complex_path = raw_dir / f"{candidate_id}.cif"
-                complex_path.write_text(result.complex.to_mmcif())
-                metrics = dict(source.get("metrics") or {})
-                plddt_mean = esm_binder_workflow._mean_plddt(result)
-                metrics.update(
-                    {
-                        "monomer_refolding_backend": "esmfold2_monomer",
-                        "min_plddt": min_plddt,
-                        "iptm": float(result.iptm) if result.iptm is not None else None,
-                        "ptm": float(result.ptm) if result.ptm is not None else None,
-                        "plddt_mean": plddt_mean,
-                        "plddt": plddt_mean,
-                        "esmfold2_monomer_iptm": float(result.iptm) if result.iptm is not None else None,
-                        "esmfold2_monomer_ptm": float(result.ptm) if result.ptm is not None else None,
-                        "esmfold2_monomer_plddt_mean": plddt_mean,
-                        "passes_monomer_plddt": plddt_mean >= float(min_plddt) if plddt_mean is not None else None,
-                        "binder_length": len(binder_sequence),
-                    }
-                )
-                reference_backbone = _resolve_candidate_path(source_run_dir, source.get("complex_pdb"))
-                binder_chain = _candidate_chains(source, "binder_chains", ["A"])[0]
-                metrics.update(_monomer_refolding_rmsd(reference_backbone, complex_path, binder_chain=binder_chain))
-                candidates.append(
-                    {
-                        **source,
-                        "candidate_id": candidate_id,
-                        "stage": STAGE_MONOMER_REFOLDING,
-                        "source_tool": "esmfold2_monomer",
-                        "tool": "esmfold2_monomer",
-                        "binder_pdb": None,
-                        "complex_pdb": _rel_path(job.run_dir, complex_path),
-                        "binder_sequence": binder_sequence,
-                        "binder_chains": ["A"],
-                        "target_chains": [],
-                        "binder_length": str(len(binder_sequence)),
-                        "metrics": metrics,
-                        "parents": [parent_id],
-                        "raw_metadata": {
-                            **dict(source.get("raw_metadata") or {}),
-                            "source_candidate": source,
-                            "backend_status": "biohub_esmfold2_local",
-                            "prediction_dir": _rel_path(job.run_dir, raw_dir),
-                            "upstream_source_run_dir": str(source_run_dir),
-                            "input_complex": source.get("complex_pdb"),
-                        },
-                    }
-                )
-                input_rows.append(
-                    {
-                        "candidate_id": candidate_id,
-                        "parent_id": parent_id,
-                        "binder_length": len(binder_sequence),
-                        "source_complex": source.get("complex_pdb"),
-                    }
-                )
+
+        predictions = run_esmfold2_batch(
+            run_dir=job.run_dir,
+            requests=requests,
+            gpu_device=gpu_device,
+            device=device,
+            num_loops=int(num_loops),
+            num_sampling_steps=int(num_sampling_steps),
+            seed=int(seed),
+        )
+        for index, source, parent_id, candidate_id, binder_sequence in prepared:
+            result = predictions[candidate_id].result
+            complex_path = raw_dir / f"{candidate_id}.cif"
+            shutil.copy2(predictions[candidate_id].complex_path, complex_path)
+            metrics = dict(source.get("metrics") or {})
+            plddt_mean = esm_binder_workflow._mean_plddt(result)
+            metrics.update(
+                {
+                    "monomer_refolding_backend": "esmfold2_monomer_container",
+                    "min_plddt": min_plddt,
+                    "iptm": float(result.iptm) if result.iptm is not None else None,
+                    "ptm": float(result.ptm) if result.ptm is not None else None,
+                    "plddt_mean": plddt_mean,
+                    "plddt": plddt_mean,
+                    "esmfold2_monomer_iptm": float(result.iptm) if result.iptm is not None else None,
+                    "esmfold2_monomer_ptm": float(result.ptm) if result.ptm is not None else None,
+                    "esmfold2_monomer_plddt_mean": plddt_mean,
+                    "passes_monomer_plddt": plddt_mean >= float(min_plddt) if plddt_mean is not None else None,
+                    "binder_length": len(binder_sequence),
+                }
+            )
+            reference_backbone = _resolve_candidate_path(source_run_dir, source.get("complex_pdb"))
+            binder_chain = _candidate_chains(source, "binder_chains", ["A"])[0]
+            metrics.update(_monomer_refolding_rmsd(reference_backbone, complex_path, binder_chain=binder_chain))
+            candidates.append(
+                {
+                    **source,
+                    "candidate_id": candidate_id,
+                    "stage": STAGE_MONOMER_REFOLDING,
+                    "source_tool": "esmfold2_monomer",
+                    "tool": "esmfold2_monomer",
+                    "binder_pdb": None,
+                    "complex_pdb": _rel_path(job.run_dir, complex_path),
+                    "binder_sequence": binder_sequence,
+                    "binder_chains": ["A"],
+                    "target_chains": [],
+                    "binder_length": str(len(binder_sequence)),
+                    "metrics": metrics,
+                    "parents": [parent_id],
+                    "raw_metadata": {
+                        **dict(source.get("raw_metadata") or {}),
+                        "source_candidate": source,
+                        "backend_status": "biohub_esmfold2_container",
+                        "prediction_dir": _rel_path(job.run_dir, raw_dir),
+                        "upstream_source_run_dir": str(source_run_dir),
+                        "input_complex": source.get("complex_pdb"),
+                    },
+                }
+            )
+            input_rows.append(
+                {
+                    "candidate_id": candidate_id,
+                    "parent_id": parent_id,
+                    "binder_length": len(binder_sequence),
+                    "source_complex": source.get("complex_pdb"),
+                }
+            )
 
         (raw_dir / "binder_sequences.fasta").write_text(
             "".join(f">{candidate['candidate_id']}\n{candidate['binder_sequence']}\n" for candidate in candidates)
@@ -3508,7 +3505,7 @@ def run_esmfold2_monomer_refolding(
                 "metrics": {
                     "candidate_count": len(normalized),
                     "artifact_count": len(artifacts),
-                    "backend": "biohub_esmfold2_local",
+                    "backend": "biohub_esmfold2_container",
                 },
                 "downstream_artifacts": {
                     "candidates_jsonl": "artifacts/normalized_candidates/candidates.jsonl",
@@ -3930,38 +3927,22 @@ def run_esmfold2_complex_validation(
             "contact_cutoff": contact_cutoff,
             "use_initial_guess": use_initial_guess,
             "use_target_msa": use_target_msa,
-            "backend": "biohub_esmfold2_local",
+            "backend": "biohub_esmfold2_container",
             "model_dir": str(esm_binder_workflow.ESMFOLD2_MODEL_DIR),
             "esmc_model_dir": str(esm_binder_workflow.ESMC_MODEL_DIR),
         },
     )
     update_status(job.run_dir, "running")
     raw_dir = job.run_dir / "artifacts" / "raw" / tool_name
+    input_dir = raw_dir / "inputs"
     raw_dir.mkdir(parents=True, exist_ok=True)
+    input_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        esm_binder_workflow._ensure_esm_import_path()
-        try:
-            from esm.models.esmfold2 import (
-                DistogramConditioning,
-                ESMFold2InputBuilder,
-                ProteinInput,
-                StructurePredictionInput,
-            )
-            from esm.utils.msa import MSA
-        except Exception as exc:  # pragma: no cover - dependency/runtime specific
-            raise RuntimeError(
-                "ESMFold2 runtime dependencies are not importable. "
-                "Run this from the Biohub ESM environment/container before starting validation."
-            ) from exc
-
-        model = esm_binder_workflow._load_esmfold2_model(device)
-        builder = ESMFold2InputBuilder(ccd_cache=esm_binder_workflow.ESMFOLD2_MODEL_DIR)
-        candidates: list[dict[str, Any]] = []
-        input_rows: list[dict[str, Any]] = []
-        confidence_rows: list[dict[str, Any]] = []
+        prepared: list[dict[str, Any]] = []
+        requests: list[dict[str, Any]] = []
         with (job.run_dir / "stdout.log").open("a") as stdout:
-            stdout.write(f"{tool_name} of existing candidates only.\n")
+            stdout.write(f"{tool_name} of existing candidates using the Biohub ESM container.\n")
             stdout.flush()
             for index, source in enumerate(source_candidates, start=1):
                 parent_id = str(source.get("candidate_id") or f"candidate_{index:05d}")
@@ -3970,47 +3951,45 @@ def run_esmfold2_complex_validation(
                 target_pdb = _target_pdb_for_candidate(source_run_dir, source)
                 if target_pdb is None or not target_pdb.exists():
                     raise ValueError(f"Candidate {parent_id} does not have a readable target PDB.")
+                staged_target = input_dir / f"{safe_parent_id}_target.pdb"
+                shutil.copy2(target_pdb, staged_target)
                 source_complex = _resolve_candidate_path(source_run_dir, source.get("complex_pdb"))
                 binder_sequence = _candidate_binder_sequence(source_run_dir, source)
                 binder_chains, inferred_target_chains = _infer_chain_roles(source_run_dir, source, source_complex)
                 target_sequences, residue_maps = esm_binder_workflow._target_sequences(target_pdb, inferred_target_chains)
                 target_chains = list(target_sequences)
-                target_msas: dict[str, Any] = {}
+                target_msas: dict[str, Path] = {}
                 msa_notes: list[str] = []
+                sequence_inputs: list[dict[str, str]] = []
                 if use_target_msa:
-                    for target_chain, target_sequence in target_sequences.items():
+                    for msa_index, (target_chain, target_sequence) in enumerate(target_sequences.items(), start=1):
                         msa_path, msa_source = target_msa_workflow.find_cached_msa_for_sequence(target_sequence)
                         if msa_path is None:
                             msa_notes.append(f"{target_chain}:missing:{msa_source}")
                             continue
-                        try:
-                            msa = MSA.from_a3m(msa_path)
-                        except Exception as exc:
-                            try:
-                                with tempfile.NamedTemporaryFile("w", suffix=".a3m", delete=True) as handle:
-                                    _copy_a3m_match_columns_only(Path(msa_path), Path(handle.name))
-                                    handle.flush()
-                                    msa = MSA.from_a3m(Path(handle.name))
-                            except Exception as sanitized_exc:
-                                msa_notes.append(
-                                    f"{target_chain}:invalid:{Path(msa_path).name}:{exc}; sanitized_invalid:{sanitized_exc}"
-                                )
-                                continue
-                            msa_notes.append(f"{target_chain}:sanitized:{Path(msa_path).name}")
-                        query = "".join(str(getattr(msa, "query", "") or "").upper().split())
-                        expected = "".join(str(target_sequence or "").upper().split())
-                        if query and expected and query != expected:
-                            msa_notes.append(f"{target_chain}:query_mismatch:{Path(msa_path).name}")
+                        staged_msa, note = stage_esmfold2_msa(
+                            msa_path,
+                            target_sequence,
+                            input_dir / f"{safe_parent_id}_chain_{msa_index:02d}.a3m",
+                        )
+                        if staged_msa is None:
+                            msa_notes.append(f"{target_chain}:{note or 'invalid'}")
                             continue
-                        target_msas[target_chain] = msa
-                        msa_notes.append(f"{target_chain}:loaded:{msa_source}:{msa_path}")
+                        target_msas[target_chain] = staged_msa
+                        if note:
+                            msa_notes.append(f"{target_chain}:{note}")
+                        msa_notes.append(f"{target_chain}:loaded:{msa_source}:{Path(msa_path).name}")
+                for target_chain, sequence in target_sequences.items():
+                    chain_input: dict[str, str] = {"id": target_chain, "sequence": sequence}
+                    if target_chain in target_msas:
+                        chain_input["msa_path"] = str(target_msas[target_chain])
+                    sequence_inputs.append(chain_input)
                 binder_chain = esm_binder_workflow._choose_binder_chain(target_chains)
                 hotspots = source.get("hotspots") or []
                 mapped_hotspots = esm_binder_workflow._mapped_hotspots(hotspots, residue_maps)
-                distogram_conditioning = None
+                conditioning: list[dict[str, Any]] = []
                 initial_guess_note = None
                 if use_initial_guess:
-                    distogram_conditioning = []
                     notes: list[str] = []
                     for target_chain, target_sequence in target_sequences.items():
                         distogram, note = _chain_initial_guess_distogram(
@@ -4019,143 +3998,163 @@ def run_esmfold2_complex_validation(
                             len(target_sequence),
                         )
                         if distogram is not None:
-                            distogram_conditioning.append(
-                                DistogramConditioning(chain_id=target_chain, distogram=distogram)
-                            )
+                            conditioning.append({"chain_id": target_chain, "array": distogram})
                         elif note:
                             notes.append(note)
-                    if distogram_conditioning:
+                    if conditioning:
                         initial_guess_note = "target distogram conditioning applied"
                     else:
                         initial_guess_note = "; ".join(notes) if notes else "target distogram conditioning unavailable"
+                request = {
+                    "request_id": candidate_id,
+                    "sequences": [
+                        *sequence_inputs,
+                        {"id": binder_chain, "sequence": binder_sequence},
+                    ],
+                    "distogram_conditioning": conditioning,
+                    "seed": int(seed) + index - 1,
+                }
+                requests.append(request)
+                prepared.append(
+                    {
+                        "source": source,
+                        "parent_id": parent_id,
+                        "candidate_id": candidate_id,
+                        "target_pdb": staged_target,
+                        "target_chains": target_chains,
+                        "inferred_target_chains": inferred_target_chains,
+                        "binder_sequence": binder_sequence,
+                        "binder_chain": binder_chain,
+                        "mapped_hotspots": mapped_hotspots,
+                        "hotspots": hotspots,
+                        "conditioning": conditioning,
+                        "initial_guess_note": initial_guess_note,
+                        "target_msas": target_msas,
+                        "msa_notes": msa_notes,
+                    }
+                )
                 stdout.write(
-                    f"Folding {candidate_id} target_chains={','.join(target_chains)} "
+                    f"Queued {candidate_id} target_chains={','.join(target_chains)} "
                     f"binder_chain={binder_chain} binder_length={len(binder_sequence)}"
-                    f" initial_guess={bool(distogram_conditioning)} target_msa_count={len(target_msas)}\n"
+                    f" initial_guess={bool(conditioning)} target_msa_count={len(target_msas)}\n"
                 )
                 stdout.flush()
-                spi = StructurePredictionInput(
-                    sequences=[
-                        *[
-                            ProteinInput(id=chain, sequence=sequence, msa=target_msas.get(chain))
-                            for chain, sequence in target_sequences.items()
-                        ],
-                        ProteinInput(id=binder_chain, sequence=binder_sequence),
-                    ],
-                    distogram_conditioning=distogram_conditioning,
-                )
-                result = builder.fold(
-                    model,
-                    spi,
-                    num_loops=int(num_loops),
-                    num_sampling_steps=int(num_sampling_steps),
-                    num_diffusion_samples=1,
-                    seed=int(seed) + index - 1,
-                    complex_id=candidate_id,
-                )
-                complex_path = raw_dir / f"{candidate_id}.cif"
-                complex_path.write_text(result.complex.to_mmcif())
-                confidence_metrics, confidence_analysis = _esmfold2_confidence_analysis(
-                    result,
-                    binder_chain=binder_chain,
-                    target_chains=target_chains,
-                    contact_cutoff=float(contact_cutoff),
-                    output_prefix=raw_dir / candidate_id,
-                )
-                metrics = dict(source.get("metrics") or {})
-                _update_source_monomer_rmsd(source_run_dir, source, metrics)
-                metrics.update(
-                    {
-                        "complex_refolding_backend": backend_name,
-                        "initial_guess_used": bool(distogram_conditioning),
-                        "initial_guess_note": initial_guess_note,
+
+        predictions = run_esmfold2_batch(
+            run_dir=job.run_dir,
+            requests=requests,
+            device=device,
+            num_loops=int(num_loops),
+            num_sampling_steps=int(num_sampling_steps),
+            seed=int(seed),
+            shm_size="64G",
+        )
+        candidates: list[dict[str, Any]] = []
+        input_rows: list[dict[str, Any]] = []
+        confidence_rows: list[dict[str, Any]] = []
+        for row in prepared:
+            source = row["source"]
+            candidate_id = row["candidate_id"]
+            parent_id = row["parent_id"]
+            target_chains = row["target_chains"]
+            binder_chain = row["binder_chain"]
+            prediction = predictions[candidate_id]
+            result = prediction.result
+            complex_path = raw_dir / f"{candidate_id}.cif"
+            shutil.copy2(prediction.complex_path, complex_path)
+            confidence_metrics, confidence_analysis = _esmfold2_confidence_analysis(
+                result,
+                binder_chain=binder_chain,
+                target_chains=target_chains,
+                contact_cutoff=float(contact_cutoff),
+                output_prefix=raw_dir / candidate_id,
+            )
+            metrics = dict(source.get("metrics") or {})
+            _update_source_monomer_rmsd(source_run_dir, source, metrics)
+            metrics.update(
+                {
+                    "complex_refolding_backend": backend_name,
+                    "initial_guess_used": bool(row["conditioning"]),
+                    "initial_guess_note": row["initial_guess_note"],
+                    "target_msa_enabled": bool(use_target_msa),
+                    "target_msa_count": len(row["target_msas"]),
+                    "target_msa_notes": ";".join(row["msa_notes"]) if row["msa_notes"] else None,
+                    "iptm": float(result.iptm) if result.iptm is not None else None,
+                    "ptm": float(result.ptm) if result.ptm is not None else None,
+                    "plddt_mean": esm_binder_workflow._mean_plddt(result),
+                    "binder_length": len(row["binder_sequence"]),
+                    **confidence_metrics,
+                    **esm_binder_workflow._hotspot_metrics_from_complex(
+                        result.complex,
+                        binder_chain=binder_chain,
+                        target_chains=target_chains,
+                        mapped_hotspots=row["mapped_hotspots"],
+                        contact_cutoff=float(contact_cutoff),
+                    ),
+                }
+            )
+            metrics["esmfold2_validation_score"] = esm_binder_workflow._ranking_score(metrics)
+            candidates.append(
+                {
+                    **source,
+                    "candidate_id": candidate_id,
+                    "stage": STAGE_COMPLEX_REFOLDING,
+                    "source_tool": tool_name,
+                    "tool": tool_name,
+                    "target_pdb": _rel_path(job.run_dir, row["target_pdb"]),
+                    "complex_pdb": _rel_path(job.run_dir, complex_path),
+                    "binder_sequence": row["binder_sequence"],
+                    "target_chains": target_chains,
+                    "binder_chains": [binder_chain],
+                    "binder_length": str(len(row["binder_sequence"])),
+                    "metrics": metrics,
+                    "parents": [parent_id],
+                    "raw_metadata": {
+                        **dict(source.get("raw_metadata") or {}),
+                        "source_candidate": source,
+                        "backend_status": "biohub_esmfold2_container",
+                        "initial_guess_used": bool(row["conditioning"]),
+                        "initial_guess_note": row["initial_guess_note"],
                         "target_msa_enabled": bool(use_target_msa),
-                        "target_msa_count": len(target_msas),
-                        "target_msa_notes": ";".join(msa_notes) if msa_notes else None,
-                        "iptm": float(result.iptm) if result.iptm is not None else None,
-                        "ptm": float(result.ptm) if result.ptm is not None else None,
-                        "plddt_mean": esm_binder_workflow._mean_plddt(result),
-                        "binder_length": len(binder_sequence),
-                        **confidence_metrics,
-                        **esm_binder_workflow._hotspot_metrics_from_complex(
-                            result.complex,
-                            binder_chain=binder_chain,
-                            target_chains=target_chains,
-                            mapped_hotspots=mapped_hotspots,
-                            contact_cutoff=float(contact_cutoff),
-                        ),
-                    }
-                )
-                metrics["esmfold2_validation_score"] = esm_binder_workflow._ranking_score(metrics)
-                candidates.append(
-                    {
-                        **source,
-                        "candidate_id": candidate_id,
-                        "stage": STAGE_COMPLEX_REFOLDING,
-                        "source_tool": tool_name,
-                        "tool": tool_name,
-                        "target_pdb": str(target_pdb),
-                        "complex_pdb": _rel_path(job.run_dir, complex_path),
-                        "binder_sequence": binder_sequence,
-                        "target_chains": target_chains,
-                        "binder_chains": [binder_chain],
-                        "binder_length": str(len(binder_sequence)),
-                        "metrics": metrics,
-                        "parents": [parent_id],
-                        "raw_metadata": {
-                            **dict(source.get("raw_metadata") or {}),
-                            "source_candidate": source,
-                            "backend_status": "biohub_esmfold2_local",
-                            "initial_guess_used": bool(distogram_conditioning),
-                            "initial_guess_note": initial_guess_note,
-                            "target_msa_enabled": bool(use_target_msa),
-                            "target_msa_count": len(target_msas),
-                            "target_msa_notes": ";".join(msa_notes) if msa_notes else None,
-                            "confidence_json": confidence_metrics.get("esmfold2_confidence_json"),
-                            "confidence_arrays": confidence_metrics.get("esmfold2_confidence_arrays"),
-                            "pae_path": _rel_path(job.run_dir, raw_dir / str(confidence_metrics.get("esmfold2_pae_json") or "")) if confidence_metrics.get("esmfold2_pae_json") else None,
-                            "prediction_dir": _rel_path(job.run_dir, raw_dir),
-                            "input_target_chains": inferred_target_chains,
-                            "mapped_hotspots": [f"{chain}{residue}" for chain, residue in mapped_hotspots],
-                        },
-                    }
-                )
-                confidence_rows.append(
-                    {
-                        "candidate_id": candidate_id,
-                        "parent_id": parent_id,
-                        "confidence": confidence_analysis,
-                    }
-                )
-                input_rows.append(
-                    {
-                        "candidate_id": candidate_id,
-                        "parent_id": parent_id,
-                        "target_pdb": str(target_pdb),
-                        "target_chains": target_chains,
-                        "binder_chain": binder_chain,
-                        "binder_length": len(binder_sequence),
-                        "initial_guess_used": bool(distogram_conditioning),
-                        "initial_guess_note": initial_guess_note,
-                        "target_msa_enabled": bool(use_target_msa),
-                        "target_msa_count": len(target_msas),
-                        "target_msa_notes": ";".join(msa_notes) if msa_notes else None,
-                        "hotspots": hotspots,
-                    }
-                )
+                        "target_msa_count": len(row["target_msas"]),
+                        "target_msa_notes": ";".join(row["msa_notes"]) if row["msa_notes"] else None,
+                        "confidence_json": confidence_metrics.get("esmfold2_confidence_json"),
+                        "confidence_arrays": confidence_metrics.get("esmfold2_confidence_arrays"),
+                        "pae_path": _rel_path(job.run_dir, raw_dir / str(confidence_metrics.get("esmfold2_pae_json") or ""))
+                        if confidence_metrics.get("esmfold2_pae_json")
+                        else None,
+                        "prediction_dir": _rel_path(job.run_dir, raw_dir),
+                        "input_target_chains": row["inferred_target_chains"],
+                        "mapped_hotspots": [f"{chain}{residue}" for chain, residue in row["mapped_hotspots"]],
+                    },
+                }
+            )
+            confidence_rows.append(
+                {"candidate_id": candidate_id, "parent_id": parent_id, "confidence": confidence_analysis}
+            )
+            input_rows.append(
+                {
+                    "candidate_id": candidate_id,
+                    "parent_id": parent_id,
+                    "target_pdb": _rel_path(job.run_dir, row["target_pdb"]),
+                    "target_chains": target_chains,
+                    "binder_chain": binder_chain,
+                    "binder_length": len(row["binder_sequence"]),
+                    "initial_guess_used": bool(row["conditioning"]),
+                    "initial_guess_note": row["initial_guess_note"],
+                    "target_msa_enabled": bool(use_target_msa),
+                    "target_msa_count": len(row["target_msas"]),
+                    "target_msa_notes": ";".join(row["msa_notes"]) if row["msa_notes"] else None,
+                    "hotspots": row["hotspots"],
+                }
+            )
 
         (raw_dir / "binder_sequences.fasta").write_text(
-            "".join(
-                f">{candidate['candidate_id']}\n{candidate['binder_sequence']}\n"
-                for candidate in candidates
-            )
+            "".join(f">{candidate['candidate_id']}\n{candidate['binder_sequence']}\n" for candidate in candidates)
         )
         write_json(raw_dir / "input_mapping.json", input_rows)
         write_json(raw_dir / "confidence_summary.json", {"candidates": confidence_rows})
-        candidates.sort(
-            key=lambda candidate: candidate["metrics"].get("esmfold2_validation_score") or 0.0,
-            reverse=True,
-        )
+        candidates.sort(key=lambda candidate: candidate["metrics"].get("esmfold2_validation_score") or 0.0, reverse=True)
         for rank, candidate in enumerate(candidates, start=1):
             candidate["metrics"]["esmfold2_validation_rank"] = rank
         normalized = write_candidates(job.run_dir, tool_name, candidates)
@@ -4169,6 +4168,7 @@ def run_esmfold2_complex_validation(
                     "candidate_count": len(normalized),
                     "artifact_count": len(artifacts),
                     "best_score": normalized[0]["metrics"].get("esmfold2_validation_score") if normalized else None,
+                    "backend": "biohub_esmfold2_container",
                 },
                 "downstream_artifacts": {
                     "candidates_jsonl": "artifacts/normalized_candidates/candidates.jsonl",
@@ -4608,8 +4608,6 @@ def run_boltz2_complex_refolding(
         "--rm",
         "-v",
         f"{job.run_dir}:/work",
-        "-v",
-        f"{BOLTZ_PREPARE_INPUTS.parent}:/scripts:ro",
         "-w",
         "/work",
         "--entrypoint",
@@ -4618,7 +4616,7 @@ def run_boltz2_complex_refolding(
         "-lc",
         (
             "source /opt/conda/etc/profile.d/conda.sh && conda activate boltz2 && "
-            "python /scripts/prepare_inputs.py "
+            "python /opt/mn-protein-design/prepare_inputs.py "
             "--input_dir /work/artifacts/raw/boltz2_initial_guess/input_pdbs "
             "--output_dir /work/artifacts/raw/boltz2_initial_guess/yaml_inputs "
             f"--design_type {'scaffold' if all_target_only else 'binder'} "
@@ -5829,13 +5827,7 @@ def run_boltzgen_fold_complex_refolding(
         np.savez(input_dir / f"{safe_id}.npz", design_mask=design_mask)
     output_root = raw_root / "output"
     output_root.mkdir(parents=True, exist_ok=True)
-    hot_patch_mounts: list[str] = []
-    if BOLTZGEN_LOCAL_SOURCE.exists():
-        hot_patch_mounts.extend(["-v", f"{BOLTZGEN_LOCAL_SOURCE}:/app/src/boltzgen:ro"])
-    boltzgen_config_path = "/app/config/fold.yaml"
-    if BOLTZGEN_BENCHMARK_PAE_CONFIG.exists():
-        boltzgen_config_path = "/app/config/fold_benchmark_pae.yaml"
-        hot_patch_mounts.extend(["-v", f"{BOLTZGEN_BENCHMARK_PAE_CONFIG}:{boltzgen_config_path}:ro"])
+    boltzgen_config_path = BOLTZGEN_BENCHMARK_PAE_CONFIG
     command = [
         "docker",
         "run",
@@ -5844,7 +5836,6 @@ def run_boltzgen_fold_complex_refolding(
         "--shm-size=32G",
         "-v",
         f"{job.run_dir}:/work",
-        *hot_patch_mounts,
         "-w",
         "/work",
         "--entrypoint",

@@ -91,11 +91,11 @@ Then run normal jobs with references mounted read-only.
 | PXDesign | `mn-pxdesign:cu128` | Yes, CUDA 12.8 | Binder design / target preparation | Real target-parse and tiny inference smoke tests passed |
 | Protpardelle-1c | `mn-protpardelle-1c:cu128` | Yes, CUDA 12.8 | Binder backbone design / motif scaffolding | PDL1 binder backbone smoke test |
 | BindCraft 2 | `mn-bindcraft2:4a56313-cu13` | Yes, CUDA 13 | Full vanilla binder design | JAX GPU and AF2 checkpoint checks passed on RTX 4090; RTX 5090 host check pending |
-| Biohub ESM | `mn-biohub-esm:cu128` | Yes, CUDA 12.8 | ESMFold2 complex folding / native binder design / screening | Native one-step binder-design smoke passed |
+| Biohub ESM | `mn-biohub-esm:3.4.1-cu128` | Yes, CUDA 12.8 | ESMFold2 complex folding / native binder design / screening | ESMFold2 and experimental binder checkpoints loaded successfully |
 | OpenFold-3 | `mn-openfold3:cu13` | Yes, CUDA 13 | Complex refolding / validation | Docker image scaffolded for RTX 5090 |
 
-Build all configured images, including shared AlphaFast, Boltz-2, PeSTo, and
-Biohub ESM images:
+Build all configured images, including shared AlphaFast, Boltz-2, and PeSTo,
+plus the Protein Design Biohub ESM image:
 
 ```bash
 ../mn-tool-containers/build.sh mn-protein-design
@@ -341,16 +341,17 @@ Purpose in app:
 Image:
 
 ```text
-mn-biohub-esm:cu128
+mn-biohub-esm:3.4.1-cu128
 ```
 
 Runtime:
 
 - GPU recommended for useful ESMFold2 runs
 - CUDA 12.8 runtime for RTX 5090 / Blackwell
-- PyTorch 2.7.1 CUDA 12.8
+- PyTorch 2.11.0 CUDA 12.8
 - Python 3.12 from Ubuntu 24.04
-- installs the vendored `tools_to_implement/esm` package and Biohub transformers fork
+- installs `esm==3.4.1.post1` from PyPI and downloads the binder-design tutorial at a pinned upstream commit
+- does not require an ESM git checkout or private Transformers access
 - uses `/cache/huggingface` for writable Hugging Face cache metadata
 - disables Hugging Face Xet and loads local `/ref/biohub-esm/ESMC-6B` for ESMFold2
 - sets `TORCH_CUDA_ARCH_LIST` through `12.0` for RTX 5090 compatibility
@@ -370,7 +371,7 @@ Binder-design checkpoint setup:
 ```bash
 docker run --rm \
   -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm \
-  mn-biohub-esm:cu128 \
+  mn-biohub-esm:3.4.1-cu128 \
   hf download biohub/ESMFold2-Experimental-Fast \
   --local-dir /ref/biohub-esm/binder-design/ESMFold2-Experimental-Fast
 ```
@@ -387,7 +388,7 @@ Light smoke test:
 docker run --rm --gpus all \
   -v biohub-esm-hf-cache:/cache/huggingface \
   -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro \
-  mn-biohub-esm:cu128
+  mn-biohub-esm:3.4.1-cu128
 ```
 
 Heavier ESMFold2 weight-load smoke test:
@@ -396,7 +397,7 @@ Heavier ESMFold2 weight-load smoke test:
 docker run --rm --gpus all \
   -v biohub-esm-hf-cache:/cache/huggingface \
   -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro \
-  mn-biohub-esm:cu128 \
+  mn-biohub-esm:3.4.1-cu128 \
   biohub-esm-smoke-test --load-esmfold2
 ```
 
@@ -407,7 +408,7 @@ docker run --rm --gpus all \
   -v biohub-esm-hf-cache:/cache/huggingface \
   -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro \
   -v /tmp/mn-protein-design-jobs/<job_id>:/work \
-  mn-biohub-esm:cu128 \
+  mn-biohub-esm:3.4.1-cu128 \
   python /work/config/run_esmfold2_job.py
 ```
 
