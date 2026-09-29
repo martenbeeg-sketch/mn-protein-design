@@ -1,6 +1,6 @@
 # mn-protein-design Product and Feature Architecture
 
-Updated: 2026-07-24
+Updated: 2026-09-29
 
 This document describes the current conceptual product shape and the design
 ideas worth retaining. `APP_FEATURES.md` remains the detailed feature inventory.
@@ -53,8 +53,11 @@ Hidden
 
 The app is scientifically broad and already supports many engines. Its main
 architecture is a file-backed job store plus normalized candidate JSONL files.
-Some tasks run through spawned local workers, while some direct design paths
-still execute synchronously from Streamlit.
+Heavy design, refolding, sequence-design, analysis, detection, and benchmark
+jobs run through the separate local queue service. Jobs reserve CPU slots and
+their selected GPU; child steps share their parent allocation. Docker receives
+thread limits for the reserved CPU slots and applies a quota when supported by
+the host cgroup configuration.
 
 ## Central scientific contracts
 
@@ -202,7 +205,8 @@ Retain the current product and candidate model, but evolve toward:
 
 - portable run-relative typed artifact references;
 - a manifest-driven engine registry;
-- one supervised worker and resource-admission model;
+- extend resource admission to memory and scratch space, and strengthen worker
+  recovery controls;
 - smaller workflow and result-renderer modules;
 - reusable result frames with tool-specific extensions;
 - explicit workflow parent/child state;

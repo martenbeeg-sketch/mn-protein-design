@@ -16,10 +16,10 @@ import streamlit.components.v1 as components
 from mn_protein_design.app.pages.common import (
     esmfold2_preset_label,
     esmfold2_preset_selector,
+    cpu_run_panel,
     gpu_run_panel,
     refresh_results_button,
     result_link,
-    run_steps_after_source,
     selected_dataframe_rows,
     show_delete_jobs_dialog,
     show_pipeline_links,
@@ -33,6 +33,8 @@ from mn_protein_design.core.candidates import (
 )
 from mn_protein_design.core.local_worker import spawn_worker_for_run
 from mn_protein_design.core.jobs import ACTIVE_STATUSES, collect_jobs, read_json
+from mn_protein_design.core.workflow_queue import queued_workflow_alias
+from mn_protein_design.workflows.campaigns import run_validation_sequence
 from mn_protein_design.core.runtime_estimator import estimate_engines
 from mn_protein_design.workflows import benchmark as benchmark_workflow
 from mn_protein_design.workflows import refolding as refolding_workflow
@@ -45,6 +47,20 @@ from mn_protein_design.workflows.benchmark import (
 from mn_protein_design.workflows.capacity_benchmark import capacity_warnings
 from mn_protein_design.workflows.esm_binder import ESMFOLD2_MODEL_DIR
 from mn_protein_design.workflows.refolding import BOLTZ_MODELS_DIR
+
+
+queue_esmfold2_complex_validation = queued_workflow_alias(
+    refolding_workflow.run_esmfold2_complex_validation,
+    task_group="refolding-validation",
+    tool="esmfold2_complex_validation",
+    job_type="complex_refolding",
+)
+queue_validation_sequence = queued_workflow_alias(
+    run_validation_sequence,
+    task_group="refolding-validation",
+    tool="full_validation_pipeline",
+    job_type="validation_sequence",
+)
 from mn_protein_design.workflows.modules import candidate_sources, load_source_candidates
 
 
@@ -3215,10 +3231,11 @@ with legacy_tab:
         format_func={"auto": "Auto", "cuda": "CUDA", "cpu": "CPU"}.get,
         key="esmfold2_validation_device",
     )
+    esm_validation_cpu_cores = cpu_run_panel(key="esmfold2_validation", default=4)
     if st.button("Run ESMFold2 validation", type="primary"):
         try:
-            with st.spinner("Running ESMFold2 complex validation..."):
-                run_dir = refolding_workflow.run_esmfold2_complex_validation(
+            with st.spinner("Queueing ESMFold2 complex validation..."):
+                run_dir = queue_esmfold2_complex_validation(
                     source_run_dir=Path(str(source["run_dir"])),
                     candidates_jsonl=Path(str(source["candidates_jsonl"])),
                     max_candidates=int(esm_max_candidates),
@@ -3229,9 +3246,9 @@ with legacy_tab:
                     contact_cutoff=float(esm_contact_cutoff),
                     use_initial_guess=str(esm_mode or "sequence") == "initial_guess",
                     use_target_msa=bool(esm_use_target_msa),
+                    queue_cpu_cores=esm_validation_cpu_cores,
                 )
-            result = read_json(run_dir / "result.json")
-            st.success("ESMFold2 validation finished.") if result.get("success") is True else st.error("ESMFold2 validation failed. Open the job logs for details.")
+            st.success("ESMFold2 validation queued. It will continue if you close Streamlit.")
             show_pipeline_links(run_dir, [run_dir])
         except Exception as exc:
             st.error(str(exc))
@@ -3316,17 +3333,18 @@ with legacy_tab:
             },
         },
     ]
+    validation_cpu_cores = cpu_run_panel(key="full_validation", default=4)
     if st.button("Run full validation", type="primary"):
         try:
-            with st.spinner("Running monomer refolding, complex refolding, and analysis..."):
-                campaign_run, child_runs = run_steps_after_source(
-                    f"Validation from {source['job_code']} {source['tool']}",
-                    source_from_run_dir(Path(str(source["run_dir"]))),
-                    steps,
+            with st.spinner("Queueing monomer refolding, complex refolding, and analysis..."):
+                run_dir = queue_validation_sequence(
+                    campaign_name=f"Validation from {source['job_code']} {source['tool']}",
+                    initial_source=source_from_run_dir(Path(str(source["run_dir"]))),
+                    steps=steps,
+                    cpu_cores=int(validation_cpu_cores),
+                    gpu_device="0",
                 )
-            if child_runs:
-                final_result = read_json(child_runs[-1] / "result.json")
-                st.error("Validation stopped on a failed step. Open the child job for logs.") if final_result.get("success") is not True else st.success("Full validation workflow finished.")
-            show_pipeline_links(campaign_run, child_runs)
+            st.success("Full validation queued. Its refolding and analysis steps will continue if you close Streamlit.")
+            show_pipeline_links(None, [run_dir])
         except Exception as exc:
             st.error(str(exc))

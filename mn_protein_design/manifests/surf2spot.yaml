@@ -1,6 +1,6 @@
 tool: surf2spot
 group: hotspot-detection
-image: mnprot-surf2spot-cu128:latest
+image: mn-surf2spot:cu128
 gpu: true
 description: Surf2Spot hotspot prediction pipeline.
 inputs:

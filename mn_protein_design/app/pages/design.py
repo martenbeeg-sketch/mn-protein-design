@@ -12,32 +12,48 @@ from mn_protein_design.app.components.molstar_viewer import (
     StructureVisualization,
     molstar_custom_component,
 )
-from mn_protein_design.app.pages.common import gpu_run_panel, result_link
+from mn_protein_design.app.pages.common import cpu_run_panel, gpu_run_panel, result_link
 from mn_protein_design.core.candidates import candidate_stage_counts, read_candidates
 from mn_protein_design.core.detection_annotations import detection_score_sources, sidechain_sasa_by_residue
 from mn_protein_design.core.jobs import read_json
+from mn_protein_design.core.workflow_queue import queued_workflow_alias
 from mn_protein_design.core.structures import filter_pdb_text
 from mn_protein_design.workflows import design as design_workflow
 from mn_protein_design.workflows import esm_binder as esm_binder_workflow
+from mn_protein_design.workflows import bindcraft2 as bindcraft2_workflow
 
 design_workflow = importlib.reload(design_workflow)
 esm_binder_workflow = importlib.reload(esm_binder_workflow)
+bindcraft2_workflow = importlib.reload(bindcraft2_workflow)
 build_rfdiffusion_run_parameters = design_workflow.build_rfdiffusion_run_parameters
 default_target_contig = design_workflow.default_target_contig
 design_jobs_for_target = design_workflow.design_jobs_for_target
 prepare_rfdiffusion_scaffold_library = design_workflow.prepare_rfdiffusion_scaffold_library
 prepared_design_targets = design_workflow.prepared_design_targets
 rfdiffusion_scaffold_library_status = design_workflow.rfdiffusion_scaffold_library_status
-run_boltzgen = design_workflow.run_boltzgen
-run_bindcraft = design_workflow.run_bindcraft
-run_genie3 = design_workflow.run_genie3
-run_proteina_complexa = design_workflow.run_proteina_complexa
-run_protpardelle_1c = design_workflow.run_protpardelle_1c
-run_pxdesign = design_workflow.run_pxdesign
-run_rfdiffusion3_foundry = design_workflow.run_rfdiffusion3_foundry
-run_rfdiffusion_classic = design_workflow.run_rfdiffusion_classic
-run_esmfold2_native_binder_design = esm_binder_workflow.run_esmfold2_native_binder_design
-run_esmfold2_binder_screening = esm_binder_workflow.run_esmfold2_binder_screening
+
+
+def _queued_design_workflow(function, tool: str, job_type: str = "design_campaign"):
+    return queued_workflow_alias(function, task_group="design", tool=tool, job_type=job_type)
+
+
+run_boltzgen = _queued_design_workflow(design_workflow.run_boltzgen, "boltzgen")
+run_bindcraft = _queued_design_workflow(design_workflow.run_bindcraft, "bindcraft")
+run_genie3 = _queued_design_workflow(design_workflow.run_genie3, "genie3")
+run_proteina_complexa = _queued_design_workflow(design_workflow.run_proteina_complexa, "proteina_complexa")
+run_protpardelle_1c = _queued_design_workflow(design_workflow.run_protpardelle_1c, "protpardelle_1c")
+run_pxdesign = _queued_design_workflow(design_workflow.run_pxdesign, "pxdesign")
+run_rfdiffusion3_foundry = _queued_design_workflow(design_workflow.run_rfdiffusion3_foundry, "rfdiffusion3_foundry")
+run_rfdiffusion_classic = _queued_design_workflow(design_workflow.run_rfdiffusion_classic, "rfdiffusion_classic")
+run_esmfold2_native_binder_design = _queued_design_workflow(
+    esm_binder_workflow.run_esmfold2_native_binder_design,
+    "esmfold2_binder_design",
+)
+run_esmfold2_binder_screening = _queued_design_workflow(
+    esm_binder_workflow.run_esmfold2_binder_screening,
+    "esmfold2_binder",
+    "esmfold2_binder_screening",
+)
 target_label = design_workflow.target_label
 normalize_rfdiffusion3_contig = design_workflow._normalize_rfdiffusion3_contig
 
@@ -605,13 +621,18 @@ with campaign_cols[1]:
 with campaign_cols[2]:
     st.caption("GPU")
 with st.expander("Compute", expanded=True):
-    design_gpu_device = gpu_run_panel(key=f"design_{source_key}", default=str(loaded_params.get("gpu_device") or "0"))
+    compute_cols = st.columns(2)
+    with compute_cols[0]:
+        design_gpu_device = gpu_run_panel(key=f"design_{source_key}", default=str(loaded_params.get("gpu_device") or "0"))
+    with compute_cols[1]:
+        design_cpu_cores = cpu_run_panel(key=f"design_{source_key}", default=4)
 
 st.subheader("Generator")
-rfdiffusion_tab, bindcraft_tab, foundry_tab, boltzgen_tab, pxdesign_tab, genie3_tab, esm_tab, protpardelle_tab, complexa_tab = st.tabs(
+rfdiffusion_tab, bindcraft_tab, bindcraft2_tab, foundry_tab, boltzgen_tab, pxdesign_tab, genie3_tab, esm_tab, protpardelle_tab, complexa_tab = st.tabs(
     [
         "RFdiffusion classic",
         "BindCraft",
+        "BindCraft 2",
         "RFdiffusion3 / Foundry",
         "BoltzGen",
         "PXDesign",
@@ -1246,7 +1267,7 @@ with rfdiffusion_tab:
     _tool_payload_expander(
         "RFdiffusion classic",
         {
-            "docker_image": "ovo-rfdiffusion:latest",
+            "docker_image": "mn-rfdiffusion:latest",
             "pipeline": "mn_protein_design/pipelines/rfdiffusion_backbone" if execution_backend == "nextflow" else "direct docker run",
             "input_pdb": "artifacts/input/target.pdb",
             "staged_files": {
@@ -1313,7 +1334,7 @@ with rfdiffusion_tab:
     run_label = "Run RFdiffusion full pipeline" if full_pipeline else "Run RFdiffusion generation"
     if st.button(run_label, type="primary", disabled=not target_chains):
         try:
-            with st.spinner("Running RFdiffusion generation..."):
+            with st.spinner("Queueing RFdiffusion generation..."):
                 run_dir = run_rfdiffusion_classic(
                     target_pdb=target_pdb,
                     target_chains=target_chains,
@@ -1379,8 +1400,9 @@ with rfdiffusion_tab:
                         ),
                     },
                     gpu_device=design_gpu_device,
+                    queue_cpu_cores=design_cpu_cores,
                 )
-            st.success("RFdiffusion job finished.")
+            st.success("RFdiffusion job queued. It will continue if you close Streamlit.")
             st.link_button("Open result", result_link("design", run_dir.name))
         except Exception as exc:
             st.error(str(exc))
@@ -1528,7 +1550,7 @@ with bindcraft_tab:
     _tool_payload_expander(
         "BindCraft",
         {
-            "docker_image": "ovo-bindcraft:latest",
+            "docker_image": "mn-bindcraft:latest",
             "input_json": {
                 "design_path": "output",
                 "starting_pdb": "target.pdb",
@@ -1555,7 +1577,7 @@ with bindcraft_tab:
     )
     if st.button("Run BindCraft campaign", type="primary", disabled=not target_chains):
         try:
-            with st.spinner("Running BindCraft..."):
+            with st.spinner("Queueing BindCraft..."):
                 run_dir = run_bindcraft(
                     target_pdb=target_pdb,
                     target_chains=target_chains,
@@ -1573,9 +1595,169 @@ with bindcraft_tab:
                     filter_settings=bindcraft_filter_settings,
                     advanced_settings_file=bindcraft_advanced_settings_file,
                     gpu_device=design_gpu_device,
+                    queue_cpu_cores=design_cpu_cores,
                 )
-            st.success("BindCraft job finished.")
+            st.success("BindCraft job queued. It will continue if you close Streamlit.")
             st.link_button("Open result", result_link("design", run_dir.name))
+        except Exception as exc:
+            st.error(str(exc))
+
+with bindcraft2_tab:
+    st.caption(
+        "Runs the full BindCraft 2 campaign: gradient design, ProteinMPNN redesign, AlphaFold validation, "
+        "native filters, and ranking. This is submitted as a background GPU job."
+    )
+    st.info("BindCraft 2 requires an NVIDIA GPU and cannot run in CPU mode.")
+
+    image_ready = bindcraft2_workflow.bindcraft2_image_available()
+    if image_ready:
+        st.success(f"Container available: {bindcraft2_workflow.BINDCRAFT2_IMAGE}")
+    else:
+        st.warning(f"Container is not built: {bindcraft2_workflow.BINDCRAFT2_IMAGE}")
+        st.code("bash containers/bindcraft2/build.sh", language="bash")
+
+    reference_dir = bindcraft2_workflow.bindcraft2_reference_directory()
+    missing_parameters = bindcraft2_workflow.missing_bindcraft2_parameters()
+    if missing_parameters:
+        st.error(
+            f"BindCraft 2 needs seven AlphaFold checkpoints under {reference_dir}. "
+            f"Missing or incomplete: {', '.join(missing_parameters)}"
+        )
+    else:
+        st.caption(f"AlphaFold parameters: {reference_dir} (mounted read-only into the container)")
+
+    bc2_cols = st.columns(3)
+    with bc2_cols[0]:
+        bc2_binder_format = st.selectbox(
+            "BC2 binder format",
+            bindcraft2_workflow.BC2_BINDER_FORMATS,
+            index=0,
+            key=f"bindcraft2_modality_{source_key}",
+            help="Choose one of BindCraft 2's native binder-format presets. These are different from BC1 settings presets.",
+        )
+    with bc2_cols[1]:
+        bc2_final_designs = st.number_input(
+            "Desired accepted designs",
+            min_value=1,
+            max_value=100,
+            value=1,
+            step=1,
+            key=f"bindcraft2_final_designs_{source_key}",
+        )
+    with bc2_cols[2]:
+        bc2_attempts = st.number_input(
+            "Maximum trajectories",
+            min_value=1,
+            max_value=1000,
+            value=int(num_candidates),
+            step=1,
+            help="BC2 may stop earlier if it accepts the requested number of designs.",
+            key=f"bindcraft2_attempts_{source_key}",
+        )
+
+    bc2_objective_options = [None, *bindcraft2_workflow.BC2_CONFORMATIONAL_OBJECTIVES] if bc2_binder_format == "binder" else [None]
+    bc2_objective = st.selectbox(
+        "BC2 conformational objective",
+        bc2_objective_options,
+        format_func=lambda value: "None" if value is None else value,
+        key=f"bindcraft2_objective_{source_key}",
+        help="induced_fit and fold_switch are optional objectives available with the de novo binder format.",
+    )
+    bc2_modality = [bc2_binder_format] + ([bc2_objective] if bc2_objective else [])
+    bc2_binder_length = st.text_input(
+        "BC2 binder-length override (optional)",
+        value="",
+        key=f"bindcraft2_binder_length_{source_key}_{bc2_binder_format}",
+        help="Leave blank to use the selected BC2 modality preset's length choices. Enter one length or a min-max range to override.",
+    ).strip()
+    preset_lengths = bindcraft2_workflow.BC2_PRESET_LENGTHS.get(bc2_binder_format)
+    st.caption(
+        "BC2 preset lengths: "
+        + (f"{preset_lengths[0]}–{preset_lengths[1]} residues" if preset_lengths else "defined by the selected scaffold")
+        + ". The shared length setting for other design engines does not override this BC2 preset."
+    )
+    bc2_properties = st.multiselect(
+        "BC2 design properties",
+        list(bindcraft2_workflow.BC2_PROPERTY_PRESETS),
+        format_func=lambda value: value.replace("_", " "),
+        key=f"bindcraft2_properties_{source_key}",
+        help="Optional native BC2 properties. forced_targeting requires target hotspots; some combinations are incompatible.",
+    )
+    st.caption("BC2 loads its own native modality and property presets. The selected target hotspots above are applied here.")
+
+    resource_cols = st.columns(3)
+    bc2_cpu_options, bc2_default_cpu_cores = bindcraft2_workflow.bindcraft2_cpu_options()
+    with resource_cols[0]:
+        bc2_workers = st.selectbox(
+            "Workers per GPU",
+            bindcraft2_workflow.WORKERS_PER_GPU_OPTIONS,
+            index=0,
+            format_func=lambda value: "BC2 automatic" if value == "auto" else str(value),
+            help="The queue reserves the selected GPU for this job. Automatic uses BC2's memory-aware worker packing.",
+            key=f"bindcraft2_workers_per_gpu_{source_key}",
+        )
+    with resource_cols[1]:
+        bc2_cpu_cores = st.selectbox(
+            "Reserved CPU cores",
+            bc2_cpu_options,
+            index=bc2_cpu_options.index(bc2_default_cpu_cores),
+            help="The local job scheduler reserves these CPU slots and applies the same limit to Docker.",
+            key=f"bindcraft2_cpu_cores_{source_key}",
+        )
+    with resource_cols[2]:
+        bc2_seed = st.number_input(
+            "Campaign seed",
+            min_value=0,
+            max_value=2_147_483_647,
+            value=0,
+            step=1,
+            key=f"bindcraft2_seed_{source_key}",
+        )
+
+    with st.expander("Review BindCraft 2 campaign settings", expanded=False):
+        try:
+            st.json(
+                bindcraft2_workflow.build_bindcraft2_settings(
+                    target_chains=target_chains,
+                    binder_length=bc2_binder_length or None,
+                    hotspots=hotspots,
+                    campaign_name=campaign_name,
+                    modality=bc2_modality,
+                    design_properties=bc2_properties,
+                    number_of_final_designs=int(bc2_final_designs),
+                    max_trajectories=int(bc2_attempts),
+                    campaign_seed=int(bc2_seed),
+                    workers_per_gpu=bc2_workers,
+                )
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+
+    bc2_ready = bool(target_chains) and image_ready and not missing_parameters
+    if st.button(
+        "Queue BindCraft 2 campaign",
+        type="primary",
+        disabled=not bc2_ready,
+        key=f"run_bindcraft2_{source_key}",
+    ):
+        try:
+            run_dir = bindcraft2_workflow.enqueue_bindcraft2_design(
+                target_pdb=target_pdb,
+                target_chains=target_chains,
+                binder_length=bc2_binder_length or None,
+                hotspots=hotspots,
+                campaign_name=campaign_name,
+                modality=bc2_modality,
+                design_properties=bc2_properties,
+                number_of_final_designs=int(bc2_final_designs),
+                max_trajectories=int(bc2_attempts),
+                campaign_seed=int(bc2_seed),
+                workers_per_gpu=bc2_workers,
+                cpu_cores=int(bc2_cpu_cores),
+                gpu_device=design_gpu_device,
+            )
+            st.success("BindCraft 2 campaign queued. It will continue if you close Streamlit.")
+            st.link_button("Open job", result_link("design", run_dir.name))
         except Exception as exc:
             st.error(str(exc))
 
@@ -1697,7 +1879,7 @@ with foundry_tab:
     _tool_payload_expander(
         "RFdiffusion3 / Foundry",
         {
-            "docker_image": "ovoex-foundry-cu128:latest",
+            "docker_image": "mn-foundry:cu128",
             "mode": "vanilla_foundry_pipeline" if foundry_vanilla_pipeline else "rfd3_generation_only",
             "rfd3_input_json": {
                 "design_1": {
@@ -1736,7 +1918,7 @@ with foundry_tab:
     foundry_run_label = "Run Foundry vanilla pipeline" if foundry_vanilla_pipeline else "Run RFD3 generation"
     if st.button(foundry_run_label, type="primary", disabled=not target_chains):
         try:
-            with st.spinner("Running RFdiffusion3 / Foundry..."):
+            with st.spinner("Queueing RFdiffusion3 / Foundry..."):
                 run_dir = run_rfdiffusion3_foundry(
                     target_pdb=target_pdb,
                     target_chains=target_chains,
@@ -1754,8 +1936,9 @@ with foundry_tab:
                     mpnn_checkpoint_path=foundry_mpnn_checkpoint,
                     prepare_target_msa=bool(foundry_prepare_target_msa),
                     gpu_device=design_gpu_device,
+                    queue_cpu_cores=design_cpu_cores,
                 )
-            st.success("RFdiffusion3 / Foundry job finished.")
+            st.success("RFdiffusion3 / Foundry job queued. It will continue if you close Streamlit.")
             st.link_button("Open result", result_link("design", run_dir.name))
         except Exception as exc:
             st.error(str(exc))
@@ -1813,7 +1996,7 @@ with boltzgen_tab:
     _tool_payload_expander(
         "BoltzGen",
         {
-            "docker_image": "boltzgen:latest",
+            "docker_image": "mn-boltzgen:latest",
             "yaml_spec": {
                 "entities": [
                     {"protein": {"id": "B", "sequence": binder_length}},
@@ -1847,7 +2030,7 @@ with boltzgen_tab:
     boltzgen_run_label = "Run BoltzGen vanilla pipeline" if boltzgen_vanilla_pipeline else "Run BoltzGen generation"
     if st.button(boltzgen_run_label, type="primary", disabled=not target_chains):
         try:
-            with st.spinner("Running BoltzGen..."):
+            with st.spinner("Queueing BoltzGen..."):
                 run_dir = run_boltzgen(
                     target_pdb=target_pdb,
                     target_chains=target_chains,
@@ -1859,8 +2042,9 @@ with boltzgen_tab:
                     sampling_steps=int(boltzgen_sampling_steps),
                     run_vanilla_pipeline=boltzgen_vanilla_pipeline,
                     gpu_device=design_gpu_device,
+                    queue_cpu_cores=design_cpu_cores,
                 )
-            st.success("BoltzGen job finished.")
+            st.success("BoltzGen job queued. It will continue if you close Streamlit.")
             st.link_button("Open BoltzGen result", result_link("design", run_dir.name))
         except Exception as exc:
             st.error(str(exc))
@@ -1987,7 +2171,7 @@ with pxdesign_tab:
     _tool_payload_expander(
         "PXDesign",
         {
-            "docker_image": "mnprot-pxdesign-cu128:latest",
+            "docker_image": "mn-pxdesign:cu128",
             "yaml_spec": {
                 "target": {
                     "file": "input/target.pdb",
@@ -2018,7 +2202,7 @@ with pxdesign_tab:
     px_run_label = "Run PXDesign generation" if pxdesign_mode == "generation_only" else f"Run PXDesign {pxdesign_preset} pipeline"
     if st.button(px_run_label, type="primary", disabled=not target_chains):
         try:
-            with st.spinner("Running PXDesign..."):
+            with st.spinner("Queueing PXDesign..."):
                 run_dir = run_pxdesign(
                     target_pdb=target_pdb,
                     target_chains=target_chains,
@@ -2035,8 +2219,9 @@ with pxdesign_tab:
                     use_deepspeed_evo_attention=bool(pxdesign_use_deepspeed),
                     prepare_target_msa=bool(pxdesign_prepare_msa),
                     gpu_device=design_gpu_device,
+                    queue_cpu_cores=design_cpu_cores,
                 )
-            st.success("PXDesign job finished.")
+            st.success("PXDesign job queued. It will continue if you close Streamlit.")
             st.link_button("Open result", result_link("design", run_dir.name))
         except Exception as exc:
             st.error(str(exc))
@@ -2188,7 +2373,7 @@ with genie3_tab:
     _tool_payload_expander(
         "Genie3",
         {
-            "docker_image": "mnprot-genie3-cu128:latest",
+            "docker_image": "mn-genie3:cu128",
             "command": "genie3 run" if genie3_full_pipeline else "genie3 generate",
             "experiment_yaml": "artifacts/raw/genie3/experiment.yaml",
             "dataset": "artifacts/raw/genie3/dataset/mn_app",
@@ -2217,7 +2402,7 @@ with genie3_tab:
     genie3_run_label = "Run Genie3 full vanilla pipeline" if genie3_full_pipeline else "Run Genie3 generation"
     if st.button(genie3_run_label, type="primary", disabled=not target_chains):
         try:
-            with st.spinner("Running Genie3..."):
+            with st.spinner("Queueing Genie3..."):
                 run_dir = run_genie3(
                     target_pdb=target_pdb,
                     target_chains=target_chains,
@@ -2239,8 +2424,9 @@ with genie3_tab:
                     enable_beam_search=bool(genie3_beam),
                     beam_width=int(genie3_beam_width),
                     gpu_device=design_gpu_device,
+                    queue_cpu_cores=design_cpu_cores,
                 )
-            st.success("Genie3 job finished.")
+            st.success("Genie3 job queued. It will continue if you close Streamlit.")
             st.link_button("Open result", result_link("design", run_dir.name))
         except Exception as exc:
             st.error(str(exc))
@@ -2359,7 +2545,7 @@ with esm_tab:
         )
         if st.button("Run ESMFold2 binder design", type="primary", disabled=not target_chains):
             try:
-                with st.spinner("Running native ESMFold2 binder design..."):
+                with st.spinner("Queueing native ESMFold2 binder design..."):
                     run_dir = run_esmfold2_native_binder_design(
                         target_pdb=target_pdb,
                         target_chain=esm_target_chain,
@@ -2374,12 +2560,9 @@ with esm_tab:
                         compile_model=bool(esm_native_compile),
                         checkpoint_lm=bool(esm_native_checkpoint_lm),
                         gpu_device=design_gpu_device,
+                        queue_cpu_cores=design_cpu_cores,
                     )
-                result = read_json(run_dir / "result.json")
-                if result.get("success"):
-                    st.success("ESMFold2 binder-design job finished.")
-                else:
-                    st.error("ESMFold2 binder-design job failed. Open the logs for details.")
+                st.success("ESMFold2 binder-design job queued. It will continue if you close Streamlit.")
                 st.link_button("Open result", result_link("design", run_dir.name))
             except Exception as exc:
                 st.error(str(exc))
@@ -2435,7 +2618,7 @@ with esm_tab:
         )
         if st.button("Run ESMFold2 screening", type="primary", disabled=not target_chains):
             try:
-                with st.spinner("Running ESMFold2 screening..."):
+                with st.spinner("Queueing ESMFold2 screening..."):
                     run_dir = run_esmfold2_binder_screening(
                         target_pdb=target_pdb,
                         target_chains=target_chains,
@@ -2449,8 +2632,9 @@ with esm_tab:
                         seed=int(esm_seed),
                         device="auto",
                         contact_cutoff=float(esm_contact_cutoff),
+                        queue_cpu_cores=design_cpu_cores,
                     )
-                st.success("ESMFold2 screening job finished.")
+                st.success("ESMFold2 screening job queued. It will continue if you close Streamlit.")
                 st.link_button("Open result", result_link("design", run_dir.name))
             except Exception as exc:
                 st.error(str(exc))
@@ -2552,7 +2736,7 @@ with protpardelle_tab:
     lengths = design_workflow.parse_binder_lengths(binder_length)
     binder_range = [lengths[0], lengths[0]] if len(lengths) == 1 else [lengths[0], lengths[1]]
     protpardelle_preview = {
-        "docker_image": "mnprot-protpardelle-1c-cu128:latest",
+        "docker_image": "mn-protpardelle-1c:cu128",
         "reference_mount": "/mnt/db/reference_files/protpardelle-1c:/ref/protpardelle-1c:ro",
         "target_chains": target_chains,
         "hotspots_original_numbering": hotspots,
@@ -2582,7 +2766,7 @@ with protpardelle_tab:
     )
     if st.button("Run Protpardelle-1c native pipeline", type="primary", disabled=not target_chains):
         try:
-            with st.spinner("Running Protpardelle-1c..."):
+            with st.spinner("Queueing Protpardelle-1c..."):
                 run_dir = run_protpardelle_1c(
                     target_pdb=target_pdb,
                     target_chains=target_chains,
@@ -2600,8 +2784,9 @@ with protpardelle_tab:
                     batch_size=int(protpardelle_batch_size),
                     seed=int(protpardelle_seed),
                     gpu_device=design_gpu_device,
+                    queue_cpu_cores=design_cpu_cores,
                 )
-            st.success("Protpardelle-1c job finished.")
+            st.success("Protpardelle-1c job queued. It will continue if you close Streamlit.")
             st.link_button("Open result", result_link("design", run_dir.name))
         except Exception as exc:
             st.error(str(exc))
@@ -2653,7 +2838,7 @@ with complexa_tab:
     _tool_payload_expander(
         "Proteina-Complexa",
         {
-            "docker_image": "ovoex-proteina-complexa:latest",
+            "docker_image": "mn-proteina-complexa:latest",
             "contract": "configs/search_binder_local_pipeline.yaml",
             "stages": ["design"],
             "command_args": {
@@ -2676,7 +2861,7 @@ with complexa_tab:
     )
     if st.button("Run Proteina-Complexa vanilla pipeline", type="primary"):
         try:
-            with st.spinner("Running Proteina-Complexa..."):
+            with st.spinner("Queueing Proteina-Complexa..."):
                 run_dir = run_proteina_complexa(
                     target_pdb=target_pdb,
                     target_chains=target_chains,
@@ -2689,8 +2874,9 @@ with complexa_tab:
                     seed=int(complexa_seed),
                     batch_size=int(complexa_batch_size),
                     gpu_device=design_gpu_device,
+                    queue_cpu_cores=design_cpu_cores,
                 )
-            st.success("Proteina-Complexa job finished.")
+            st.success("Proteina-Complexa job queued. It will continue if you close Streamlit.")
             st.link_button("Open result", result_link("design", run_dir.name))
         except Exception as exc:
             st.error(str(exc))

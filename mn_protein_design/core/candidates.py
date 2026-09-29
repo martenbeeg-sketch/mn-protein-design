@@ -17,6 +17,13 @@ from mn_protein_design.core.hotspot_metrics import (
     calculate_reference_aligned_hotspot_atom_contact_metrics,
 )
 from mn_protein_design.core.jobs import write_json
+from mn_protein_design.core.portable_paths import (
+    is_portable_path,
+    portable_path,
+    resolve_managed_paths,
+    resolve_stored_path,
+    store_managed_paths,
+)
 
 
 CANDIDATE_SCHEMA_VERSION = "mn-protein-design.candidate.v1"
@@ -116,9 +123,7 @@ def _candidate_roots(run_dir: Path, candidate: dict[str, Any]) -> list[Path]:
     source_run_dir = None
     source_run_dir_text = raw_metadata.get("source_run_dir")
     if source_run_dir_text:
-        candidate_dir = Path(str(source_run_dir_text)).expanduser()
-        if candidate_dir.exists():
-            source_run_dir = candidate_dir
+        source_run_dir = resolve_stored_path(source_run_dir_text, must_exist=True)
     roots = [run_dir]
     if source_run_dir is not None:
         roots.insert(0, source_run_dir)
@@ -128,13 +133,10 @@ def _candidate_roots(run_dir: Path, candidate: dict[str, Any]) -> list[Path]:
 def _resolve_candidate_path(run_dir: Path, value: object, candidate: dict[str, Any]) -> Path | None:
     if not value:
         return None
-    path = Path(str(value)).expanduser()
-    if path.is_absolute() and path.exists():
-        return path
     for root in _candidate_roots(run_dir, candidate):
-        candidate_path = root / path
-        if candidate_path.exists():
-            return candidate_path
+        resolved = resolve_stored_path(value, run_dir=root, must_exist=True)
+        if resolved is not None:
+            return resolved
     return None
 
 
@@ -814,16 +816,27 @@ def write_candidates(run_dir: Path, source_tool: str, candidates: list[dict[str,
     ]
     out_dir = candidates_dir(run_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    persisted = []
+    for candidate in normalized:
+        row = dict(candidate)
+        for key in ("target_pdb", "complex_pdb", "binder_pdb"):
+            if row.get(key):
+                row[key] = portable_path(str(row[key]), run_dir=run_dir)
+        persisted.append(store_managed_paths(row, run_dir=run_dir))
     candidates_jsonl_path(run_dir).write_text(
-        "".join(json.dumps(candidate, sort_keys=True) + "\n" for candidate in normalized)
+        "".join(json.dumps(candidate, sort_keys=True) + "\n" for candidate in persisted)
     )
-    write_json(campaign_result_path(run_dir), {"schema_version": CANDIDATE_SCHEMA_VERSION, "source_tool": source_tool, "candidates": normalized})
+    write_json(campaign_result_path(run_dir), {"schema_version": CANDIDATE_SCHEMA_VERSION, "source_tool": source_tool, "candidates": persisted})
     return normalized
 
 
 def read_candidates(path: Path) -> list[dict[str, Any]]:
+    path = Path(path)
+    run_dir = path if path.is_dir() else None
     if path.is_dir():
         path = candidates_jsonl_path(path)
+    elif path.parent.name == "normalized_candidates" and path.parent.parent.name == "artifacts":
+        run_dir = path.parent.parent.parent
     if not path.exists():
         return []
     rows: list[dict[str, Any]] = []
@@ -831,7 +844,15 @@ def read_candidates(path: Path) -> list[dict[str, Any]]:
         if not line.strip():
             continue
         try:
-            rows.append(normalize_candidate(json.loads(line)))
+            candidate = normalize_candidate(json.loads(line))
+            candidate = resolve_managed_paths(candidate, run_dir=run_dir)
+            for key in ("target_pdb", "complex_pdb", "binder_pdb"):
+                value = candidate.get(key)
+                if is_portable_path(value) or (value and Path(str(value)).expanduser().is_absolute()):
+                    resolved = resolve_stored_path(value, run_dir=run_dir)
+                    if resolved is not None:
+                        candidate[key] = str(resolved)
+            rows.append(candidate)
         except json.JSONDecodeError:
             continue
     return rows

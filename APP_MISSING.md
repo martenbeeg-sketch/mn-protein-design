@@ -1,6 +1,6 @@
 # mn-protein-design Missing Work and Improvement Roadmap
 
-Updated: 2026-09-28
+Updated: 2026-09-29
 
 This is a conceptual audit. It does not mean the existing application should be
 rewritten. The app already contains substantial scientific functionality. The
@@ -18,6 +18,8 @@ Implemented strengths include:
 - target MSA reuse and evidence-mode controls;
 - binder and capacity benchmark workflows;
 - queued local-worker execution for several long-running paths;
+- shared CPU-slot and per-GPU admission across heavy workflow launchers;
+- scheduled CPU thread settings for Docker and local worker processes;
 - runtime estimation and result matrices;
 - native output preservation and detailed result views.
 
@@ -29,18 +31,11 @@ user-specific data out of source commits.
 
 ### 1. First-party automated tests
 
-No top-level first-party `tests/` suite or pytest configuration was found.
-`pytest` is not installed in the documented `mn-protein-design` environment.
-Tests inside vendored `tools_to_implement/` and `ui_inspiration/` trees do not
-validate this application.
+The first-party suite now establishes a CPU/local baseline for job creation,
+workflow queue handoff, CPU/GPU admission, candidate, GPU-selection, and
+chain-role contracts. Extend it to cover:
 
-Add a CPU/local suite covering:
-
-- job creation and state transitions;
-- normalized candidate reading/writing;
 - run-relative path resolution;
-- explicit and legacy chain roles;
-- queue/resource lock behavior;
 - candidate import and rank preservation;
 - target gap/break analysis;
 - workflow parent/child provenance;
@@ -49,8 +44,8 @@ Add a CPU/local suite covering:
 - runtime estimates;
 - Streamlit AppTest coverage for major pages and result routes.
 
-Docker, GPUs, checkpoints, external databases, and networks should remain
-separate integration tests.
+Docker, GPUs, checkpoints, external databases, and networks remain separate
+integration tests.
 
 ### 2. Packaging and documentation consistency
 
@@ -67,13 +62,23 @@ The default app home and temporary directory are inside the checkout. Several
 workflow constants and Docker mounts still use `/mnt/db/reference_files`
 directly, and Settings explicitly lists partially migrated areas.
 
-Future improvements:
+Remaining improvements:
 
 - persisted runtime configuration with clear precedence;
 - configurable app home, runs, temporary files, references, caches, and datasets;
 - no source-checkout mount requirement for installed operation;
-- compatibility resolution for existing absolute paths;
+- compatibility resolution for all path-bearing job metadata and workflow inputs;
+- broader path portability for every optional tool-specific field;
 - no bulk rewrite of historical runs.
+
+The current mapper in `core/portable_paths.py` covers managed run, reference,
+and app-home references in candidate structure fields and artifact records. It
+resolves `runs:///`, `reference:///`, and `app:///` against the active settings
+and supports selected legacy absolute paths. The `portability` CLI now audits,
+exports, verifies, and imports a checksummed copy of the complete workdir and
+configured runs. It leaves the source untouched and keeps reference files and
+Docker images outside the bundle. Paths outside managed workdir/runs/reference
+roots stop export rather than being silently retained in the portable copy.
 
 ### 4. Typed artifacts and lineage
 
@@ -93,22 +98,27 @@ Move incrementally toward:
 The normalized candidate contract should remain; typed artifacts should
 strengthen it rather than replace its scientific content.
 
-### 5. Durable worker and resource scheduling
+### 5. Worker and resource scheduling
 
-The current app uses `worker_request.json`, spawned local worker processes,
-heuristic GPU classification, and filesystem resource locks. This supports
-background work but is less robust than a supervised durable worker model.
+Queued jobs with `worker_request.json` now use a separate persistent local
+service. The service starts automatically when the UI queues a supported job,
+records a heartbeat, dispatches work while Streamlit is closed, reserves CPU
+slots and selected GPU devices, passes CPU thread settings into jobs, and shows
+queue wait reasons and active allocations. Docker quotas are applied when the
+host exposes cgroup quota controls. The default service capacity is up to 32
+CPU slots; `MN_PROTEIN_DESIGN_WORKER_CPU_SLOTS` changes it. `mn-protein-design
+worker` can also run it directly; `worker-status` and `worker-stop` expose
+service controls.
 
-Possible improvements:
+Remaining improvements:
 
-- supervised workers with stable identities and heartbeats;
-- atomic claims and per-GPU leases;
-- CPU, RAM, VRAM, scratch, and exclusivity admission;
-- structured waiting reasons;
-- exact container CID tracking and cleanup;
-- consistent cancellation and immutable retry;
-- workflow-child replacement semantics;
-- migration of remaining synchronous Streamlit execution.
+- inventory and migrate any remaining compute-heavy Streamlit paths;
+- add RAM, VRAM, scratch-space, and richer exclusivity admission;
+- make job claims and leases robust across shared filesystems and abrupt power
+  loss;
+- track exact container IDs for targeted cleanup;
+- strengthen worker heartbeats, retry/idempotency, and crash recovery;
+- define replacement and cancellation behavior for nested workflow jobs.
 
 ### 6. Module size and ownership
 

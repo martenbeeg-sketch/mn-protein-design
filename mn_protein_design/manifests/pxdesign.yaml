@@ -1,5 +1,5 @@
 tool: pxdesign
 group: design
-image: mnprot-pxdesign-cu128:latest
+image: mn-pxdesign:cu128
 gpu: true
 description: PXDesign inference contract.

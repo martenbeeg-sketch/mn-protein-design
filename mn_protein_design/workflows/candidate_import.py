@@ -20,7 +20,13 @@ _STRUCTURE_SUFFIXES = {".pdb", ".cif", ".mmcif"}
 _TABLE_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".xls"}
 
 
-def _split_chains(value: str | None) -> list[str]:
+def _split_chains(value: object) -> list[str]:
+    try:
+        if value is None or bool(pd.isna(value)):
+            return []
+    except (TypeError, ValueError):
+        if value is None:
+            return []
     if not value:
         return []
     return [part.strip() for part in str(value).replace(";", ",").split(",") if part.strip()]
@@ -36,7 +42,12 @@ def _rel_path(run_dir: Path, path: Path | None) -> str | None:
 
 
 def _safe_name(value: object) -> str:
-    text = str(value or "candidate").strip() or "candidate"
+    try:
+        missing = value is None or bool(pd.isna(value))
+    except (TypeError, ValueError):
+        missing = value is None
+    text = "candidate" if missing else str(value).strip()
+    text = text or "candidate"
     return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in text)
 
 
@@ -54,7 +65,13 @@ def _json_safe(value: Any) -> Any:
 
 
 def _clean_sequence(value: object) -> str:
-    return "".join(ch for ch in str(value or "").upper() if ch.isalpha())
+    try:
+        if value is None or bool(pd.isna(value)):
+            return ""
+    except (TypeError, ValueError):
+        if value is None:
+            return ""
+    return "".join(ch for ch in str(value).upper() if ch.isalpha())
 
 
 def _copy_or_link(source: Path, target: Path, *, copy_files: bool) -> Path:
@@ -490,13 +507,17 @@ def run_generic_table_import(
         rows = rows[: int(max_candidates)]
     for index, row in enumerate(rows, start=1):
         raw_id = row.get(id_column) if id_column else ""
-        candidate_id = _safe_name(raw_id or f"candidate_{index:05d}")
+        try:
+            missing_id = raw_id is None or bool(pd.isna(raw_id))
+        except (TypeError, ValueError):
+            missing_id = raw_id is None
+        candidate_id = _safe_name(f"candidate_{index:05d}" if missing_id or not str(raw_id).strip() else raw_id)
         seen_ids[candidate_id] = seen_ids.get(candidate_id, 0) + 1
         if seen_ids[candidate_id] > 1:
             candidate_id = f"{candidate_id}_{seen_ids[candidate_id]:03d}"
 
-        binder_chains = _split_chains(str(row.get(binder_chains_column) or "")) if binder_chains_column else []
-        target_chains = _split_chains(str(row.get(target_chains_column) or "")) if target_chains_column else []
+        binder_chains = _split_chains(row.get(binder_chains_column)) if binder_chains_column else []
+        target_chains = _split_chains(row.get(target_chains_column)) if target_chains_column else []
         binder_chains = binder_chains or selected_binder_chains
         target_chains = target_chains or selected_target_chains
 

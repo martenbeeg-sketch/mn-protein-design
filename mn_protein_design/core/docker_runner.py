@@ -5,6 +5,7 @@ from pathlib import Path
 
 from mn_protein_design.core.gpu import docker_gpu_args
 from mn_protein_design.core.jobs import update_status, write_json
+from mn_protein_design.core.scheduler import apply_docker_cpu_limit
 from mn_protein_design.runtime import reference_root
 
 
@@ -24,7 +25,7 @@ def build_docker_command(
         command.extend(["-v", f"{reference_path}:/ref:ro"])
     command.append(str(manifest["image"]))
     command.extend(args)
-    return command
+    return apply_docker_cpu_limit(command, run_dir)
 
 
 def run_docker_job(run_dir: Path, manifest: dict, args: list[str], gpu_device: object = "all") -> int:

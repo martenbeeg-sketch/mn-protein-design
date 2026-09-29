@@ -18,7 +18,7 @@ Blackwell / RTX 5090 needs a recent driver and CUDA/JAX stack that can run
 ```bash
 docker build \
   -f containers/colabfold/Dockerfile \
-  -t mnprot-colabfold-cuda12:1.6.1 \
+  -t mn-colabfold:1.6.1-cu12 \
   .
 ```
 
@@ -28,7 +28,7 @@ To override the JAX CUDA wheel selection:
 docker build \
   -f containers/colabfold/Dockerfile \
   --build-arg 'JAX_CUDA_SPEC=jax[cuda12]<0.8' \
-  -t mnprot-colabfold-cuda12:1.6.1 \
+  -t mn-colabfold:1.6.1-cu12 \
   .
 ```
 
@@ -39,7 +39,7 @@ docker run --rm --gpus all \
   -v /mnt/db/reference_files/alphafold_models:/cache/params:rw \
   -v "$PWD":/work:rw \
   -w /work \
-  mnprot-colabfold-cuda12:1.6.1 \
+  mn-colabfold:1.6.1-cu12 \
   colabfold_batch --help --data /cache
 ```
 
@@ -50,7 +50,7 @@ Run this on both the local RTX 4090 and the future RTX 5090 host:
 ```bash
 docker run --rm --gpus all \
   -v /mnt/db/reference_files/alphafold_models:/cache/params:rw \
-  mnprot-colabfold-cuda12:1.6.1 \
+  mn-colabfold:1.6.1-cu12 \
   colabfold-gpu-smoke-test
 ```
 
@@ -67,7 +67,7 @@ contain the ColabFold/AlphaFold2 weights.
 ```bash
 docker run --rm --gpus all \
   -v /mnt/db/reference_files/alphafold_models:/cache/params:rw \
-  mnprot-colabfold-cuda12:1.6.1 \
+  mn-colabfold:1.6.1-cu12 \
   python -m colabfold.download /cache
 ```
 
@@ -83,7 +83,7 @@ docker run --rm --gpus all --shm-size=32G \
   -v /mnt/db/reference_files/alphafold_models:/cache/params:rw \
   -v "$PWD":/work:rw \
   -w /work \
-  mnprot-colabfold-cuda12:1.6.1 \
+  mn-colabfold:1.6.1-cu12 \
   colabfold_batch \
     /work/ColabFold/input_folder \
     /work/ColabFold/ptm_output \
@@ -102,7 +102,7 @@ docker run --rm --gpus all --shm-size=32G \
   -v /mnt/db/reference_files/alphafold_models:/cache/params:rw \
   -v "$PWD":/work:rw \
   -w /work \
-  mnprot-colabfold-cuda12:1.6.1 \
+  mn-colabfold:1.6.1-cu12 \
   colabfold_batch /work/unique_msa /work/unique_msa/msa --msa-only --data /cache
 ```
 

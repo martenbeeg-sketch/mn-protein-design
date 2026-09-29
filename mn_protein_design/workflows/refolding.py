@@ -23,7 +23,9 @@ from mn_protein_design.core.candidates import (
     read_candidates,
     write_candidates,
 )
+from mn_protein_design.core.portable_paths import resolve_stored_path
 from mn_protein_design.core.jobs import JobPaths, create_job, finish_job, mark_internal_job, read_json, update_status, utc_now, write_json
+from mn_protein_design.core.scheduler import apply_docker_cpu_limits_to_steps
 from mn_protein_design.workflows import esm_binder as esm_binder_workflow
 from mn_protein_design.workflows import chain_roles
 from mn_protein_design.workflows import target_msa as target_msa_workflow
@@ -34,17 +36,17 @@ BOLTZ_MODELS_DIR = Path("/mnt/db/reference_files/boltz_models")
 ALPHAFOLD_MODELS_DIR = Path("/mnt/db/reference_files/alphafold_models")
 AF2_BINDER_EVAL = Path(__file__).resolve().parents[1] / "tools" / "af2_initial_guess_binder_eval.py"
 BOLTZ_PREPARE_INPUTS = Path("/home/user/programs/ovo/original/src/ovo/pipelines/boltz-refolding/bin/prepare_inputs.py")
-RF3_IMAGE = "ovoex-foundry-cu128:latest"
+RF3_IMAGE = "mn-foundry:cu128"
 RF3_CHECKPOINT = Path("/mnt/db/reference_files/foundry/rf3_foundry_01_24_latest_remapped.ckpt")
-PROTENIX_IMAGE = "mnprot-pxdesign-cu128:latest"
+PROTENIX_IMAGE = "mn-pxdesign:cu128"
 PROTENIX_REFERENCE_DIR = Path("/mnt/db/reference_files/pxdesign")
-PROTENIX_CLI_IMAGE = "mnprot-protenix-cu128:latest"
+PROTENIX_CLI_IMAGE = "mn-protenix:cu128"
 PROTENIX_CLI_REFERENCE_DIR = Path("/mnt/db/reference_files/protenix")
 PROTENIX_V1_MODEL = "protenix_base_default_v1.0.0"
 PROTENIX_V1_20250630_MODEL = "protenix_base_20250630_v1.0.0"
 PROTENIX_V2_MODEL = "protenix-v2"
-BOLTZGEN_IMAGE = "boltzgen:latest"
-OPENFOLD3_IMAGE = "mnprot-openfold3-cu13:latest"
+BOLTZGEN_IMAGE = "mn-boltzgen:latest"
+OPENFOLD3_IMAGE = "mn-openfold3:cu13"
 OPENFOLD3_CHECKPOINT = Path("/mnt/db/reference_files/openfold3/of3-p2-155k.pt")
 OPENFOLD3_REFERENCE_MSA_PREFILL = Path("/mnt/db/reference_files/de_novo_binder_scoring_overath_2025/target_msa_prefill")
 SYNTHETIC_TEMPLATE_RELEASE_DATE = "1970-01-01"
@@ -989,8 +991,7 @@ def _complex_candidate_id(source: dict[str, Any], tool: str, template_mode: str 
 def _resolve_candidate_path(source_run_dir: Path, path_text: str | None) -> Path | None:
     if not path_text:
         return None
-    path = Path(path_text)
-    return path if path.is_absolute() else source_run_dir / path
+    return resolve_stored_path(path_text, run_dir=source_run_dir)
 
 
 def _sequence_from_pdb(path: Path, chains: list[str] | None = None) -> str:
@@ -3047,6 +3048,7 @@ def _monomer_refolding_rmsd(reference_path: Path | None, model_path: Path | None
 
 
 def _run_shell_steps(run_dir: Path, steps: list[dict[str, Any]], verify_step: Any | None = None) -> int:
+    steps = apply_docker_cpu_limits_to_steps(run_dir, steps)
     write_json(run_dir / "command.json", {"mode": "docker", "steps": steps})
     update_status(run_dir, "running")
     timing_path = run_dir / "artifacts" / "runtime_step_timings.json"
@@ -3660,7 +3662,7 @@ def run_boltz2_monomer_refolding(
         params={
             "min_plddt": min_plddt,
             "backend": "docker",
-            "image": "ovoex-boltz2:latest",
+            "image": "mn-boltz2:cu128",
             "models_dir": str(BOLTZ_MODELS_DIR),
             "gpu_device": normalize_gpu_device(gpu_device),
         },
@@ -3703,7 +3705,7 @@ def run_boltz2_monomer_refolding(
                 f"{BOLTZ_MODELS_DIR}:/models",
                 "-w",
                 "/work",
-                "ovoex-boltz2:latest",
+                "mn-boltz2:cu128",
                 "predict",
                 "/work/artifacts/raw/boltz2_monomer/inputs",
                 "--cache",
@@ -4232,7 +4234,7 @@ def run_af2_initial_guess_complex_refolding(
     use_initial_guess: bool = False,
     use_binder_template: bool = False,
     use_interface_template: bool = False,
-    docker_image: str = "ovo-colabdesign:latest",
+    docker_image: str = "mn-colabdesign:latest",
     internal_parent_run_dir: Path | None = None,
     gpu_device: object = "0",
 ) -> Path:
@@ -4544,7 +4546,7 @@ def run_boltz2_complex_refolding(
         params={
             "require_monomer_success": require_monomer_success,
             "backend": "docker",
-            "image": "ovoex-boltz2:latest",
+            "image": "mn-boltz2:cu128",
             "models_dir": str(BOLTZ_MODELS_DIR),
             "template_mode": "target_template" if use_target_template else "no_template",
             "recycling_steps": recycling_steps,
@@ -4612,7 +4614,7 @@ def run_boltz2_complex_refolding(
         "/work",
         "--entrypoint",
         "/bin/bash",
-        "ovoex-boltz2:latest",
+        "mn-boltz2:cu128",
         "-lc",
         (
             "source /opt/conda/etc/profile.d/conda.sh && conda activate boltz2 && "
@@ -4636,7 +4638,7 @@ def run_boltz2_complex_refolding(
         f"{BOLTZ_MODELS_DIR}:/models",
         "-w",
         "/work",
-        "ovoex-boltz2:latest",
+        "mn-boltz2:cu128",
         "predict",
         "/work/artifacts/raw/boltz2_initial_guess/yaml_inputs",
         "--cache",
@@ -4666,7 +4668,7 @@ def run_boltz2_complex_refolding(
             "/work",
             "--entrypoint",
             "/bin/bash",
-            "ovoex-boltz2:latest",
+            "mn-boltz2:cu128",
             "-lc",
             (
                 "cp /work/artifacts/raw/boltz2_initial_guess/yaml_inputs/target_template.cif "

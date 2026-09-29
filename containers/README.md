@@ -1,5 +1,14 @@
 # Docker Tool Integration Notes
 
+Dockerfile recipes are maintained in the sibling [mn-tool-containers
+repository](../../mn-tool-containers/README.md). The Dockerfile paths in this app
+are relative links to those canonical recipes. From the app root, build its
+images, including shared model runtimes, with:
+
+```bash
+../mn-tool-containers/build.sh mn-protein-design
+```
+
 This directory contains Docker wrappers for tools that should become tasks in
 the `mn-protein-design` Streamlit app. The current workflows are documented in
 [../APP_FEATURES.md](../APP_FEATURES.md). The app should treat each container
@@ -41,11 +50,11 @@ JAX CUDA wheel. This is intended to run on the local RTX 4090 and on RTX 5090
 hosts with a recent Blackwell-capable NVIDIA driver.
 
 ```bash
-docker build -f containers/colabfold/Dockerfile -t mnprot-colabfold-cuda12:1.6.1 .
+docker build -f containers/colabfold/Dockerfile -t mn-colabfold:1.6.1-cu12 .
 docker run --rm --gpus all \
   -v /mnt/db/reference_files/alphafold_models:/cache/params:rw \
   -v "$PWD":/work:rw \
-  mnprot-colabfold-cuda12:1.6.1 colabfold_batch --help --data /cache
+  mn-colabfold:1.6.1-cu12 colabfold_batch --help --data /cache
 ```
 
 GPU smoke test:
@@ -53,7 +62,7 @@ GPU smoke test:
 ```bash
 docker run --rm --gpus all \
   -v /mnt/db/reference_files/alphafold_models:/cache/params:rw \
-  mnprot-colabfold-cuda12:1.6.1 colabfold-gpu-smoke-test
+  mn-colabfold:1.6.1-cu12 colabfold-gpu-smoke-test
 ```
 
 Use `/mnt/db/reference_files/alphafold_models` as the persistent ColabFold
@@ -76,18 +85,20 @@ Then run normal jobs with references mounted read-only.
 
 | Tool | Image | GPU | Main App Task Group | Status |
 | --- | --- | --- | --- | --- |
-| ScanNet | `mnprot-scannet:latest` | No | PPI / binding-site detection | Real smoke test passed |
-| Genie3 | `mnprot-genie3-cu128:latest` | Yes, CUDA 12.8 | Backbone / binder design | Real generation smoke test passed |
-| Surf2Spot | `mnprot-surf2spot-cu128:latest` | Yes, CUDA 12.8 | Hotspot detection | Real HS pipeline smoke test passed |
-| PXDesign | `mnprot-pxdesign-cu128:latest` | Yes, CUDA 12.8 | Binder design / target preparation | Real target-parse and tiny inference smoke tests passed |
-| Protpardelle-1c | `mnprot-protpardelle-1c-cu128:latest` | Yes, CUDA 12.8 | Binder backbone design / motif scaffolding | PDL1 binder backbone smoke test |
-| Biohub ESM | `mnprot-biohub-esm-cu128:latest` | Yes, CUDA 12.8 | ESMFold2 complex folding / native binder design / screening | Native one-step binder-design smoke passed |
-| OpenFold-3 | `mnprot-openfold3-cu13:latest` | Yes, CUDA 13 | Complex refolding / validation | Docker image scaffolded for RTX 5090 |
+| ScanNet | `mn-scannet:cpu` | No | PPI / binding-site detection | Real smoke test passed |
+| Genie3 | `mn-genie3:cu128` | Yes, CUDA 12.8 | Backbone / binder design | Real generation smoke test passed |
+| Surf2Spot | `mn-surf2spot:cu128` | Yes, CUDA 12.8 | Hotspot detection | Real HS pipeline smoke test passed |
+| PXDesign | `mn-pxdesign:cu128` | Yes, CUDA 12.8 | Binder design / target preparation | Real target-parse and tiny inference smoke tests passed |
+| Protpardelle-1c | `mn-protpardelle-1c:cu128` | Yes, CUDA 12.8 | Binder backbone design / motif scaffolding | PDL1 binder backbone smoke test |
+| BindCraft 2 | `mn-bindcraft2:4a56313-cu13` | Yes, CUDA 13 | Full vanilla binder design | JAX GPU and AF2 checkpoint checks passed on RTX 4090; RTX 5090 host check pending |
+| Biohub ESM | `mn-biohub-esm:cu128` | Yes, CUDA 12.8 | ESMFold2 complex folding / native binder design / screening | Native one-step binder-design smoke passed |
+| OpenFold-3 | `mn-openfold3:cu13` | Yes, CUDA 13 | Complex refolding / validation | Docker image scaffolded for RTX 5090 |
 
-Build all images:
+Build all configured images, including shared AlphaFast, Boltz-2, PeSTo, and
+Biohub ESM images:
 
 ```bash
-docker compose build
+../mn-tool-containers/build.sh mn-protein-design
 ```
 
 Build one image:
@@ -103,6 +114,16 @@ docker compose build colabfold
 docker compose build openfold3
 ```
 
+BindCraft 2 is built separately from its pinned upstream revision:
+
+```bash
+bash containers/bindcraft2/build.sh
+```
+
+Its CUDA 13 JAX runtime probe and configured AlphaFold checkpoint mount were
+checked on the local RTX 4090. Run the documented probe on an RTX 5090 host
+before relying on that hardware.
+
 ## OpenFold-3
 
 Purpose in app:
@@ -114,7 +135,7 @@ Purpose in app:
 Image:
 
 ```text
-mnprot-openfold3-cu13:latest
+mn-openfold3:cu13
 ```
 
 Runtime:
@@ -137,7 +158,7 @@ One-time parameter setup:
 docker compose build openfold3
 docker run --rm \
   -v /mnt/db/reference_files/openfold3:/ref/openfold3:rw \
-  mnprot-openfold3-cu13:latest \
+  mn-openfold3:cu13 \
   python -c "from pathlib import Path; from openfold3.entry_points.parameters import download_model_parameters; download_model_parameters(Path('/ref/openfold3'), 'openfold3-p2-155k', skip_confirmation=True)"
 ```
 
@@ -147,7 +168,7 @@ Normal app runtime should mount the reference folder read-only:
 docker run --rm --gpus all \
   -v /mnt/db/reference_files/openfold3:/ref/openfold3:ro \
   -v /tmp/mn-protein-design-jobs/<job_id>:/work \
-  mnprot-openfold3-cu13:latest \
+  mn-openfold3:cu13 \
   run_openfold predict \
     --runner-yaml /work/artifacts/raw/openfold3/runner.yaml \
     --query-json /work/input/query.json \
@@ -166,7 +187,7 @@ Purpose in app:
 Image:
 
 ```text
-mnprot-scannet:latest
+mn-scannet:cpu
 ```
 
 Runtime:
@@ -181,7 +202,7 @@ Example app command:
 ```bash
 docker run --rm \
   -v /tmp/mn-protein-design-jobs/<job_id>/output:/opt/ScanNet/predictions \
-  mnprot-scannet:latest \
+  mn-scannet:cpu \
   python predict_bindingsites.py 1brs_A --noMSA
 ```
 
@@ -212,7 +233,7 @@ Purpose in app:
 Image:
 
 ```text
-mnprot-genie3-cu128:latest
+mn-genie3:cu128
 ```
 
 Runtime:
@@ -233,7 +254,7 @@ Download/setup command:
 ```bash
 docker run --rm \
   -v /mnt/db/reference_files/genie3:/ref/genie3 \
-  mnprot-genie3-cu128:latest \
+  mn-genie3:cu128 \
   hf download yeqinglin/genie3 --include 'pretrained/**' --local-dir /ref/genie3
 ```
 
@@ -243,7 +264,7 @@ Example app command:
 docker run --rm --gpus all \
   -v /mnt/db/reference_files/genie3/pretrained:/opt/genie3/pretrained:ro \
   -v /tmp/mn-protein-design-jobs/<job_id>:/work \
-  mnprot-genie3-cu128:latest \
+  mn-genie3:cu128 \
   genie3 generate -c /work/config/experiment.yaml --num-devices 1
 ```
 
@@ -272,7 +293,7 @@ Purpose in app:
 Image:
 
 ```text
-mnprot-protpardelle-1c-cu128:latest
+mn-protpardelle-1c:cu128
 ```
 
 Runtime:
@@ -304,7 +325,7 @@ Download/setup command:
 ```bash
 docker run --rm \
   -v /mnt/db/reference_files/protpardelle-1c:/ref/protpardelle-1c \
-  mnprot-protpardelle-1c-cu128:latest \
+  mn-protpardelle-1c:cu128 \
   bash -lc 'set -euo pipefail; cd /ref/protpardelle-1c; /opt/protpardelle-1c/download_model_params.sh'
 ```
 
@@ -320,7 +341,7 @@ Purpose in app:
 Image:
 
 ```text
-mnprot-biohub-esm-cu128:latest
+mn-biohub-esm:cu128
 ```
 
 Runtime:
@@ -349,7 +370,7 @@ Binder-design checkpoint setup:
 ```bash
 docker run --rm \
   -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm \
-  mnprot-biohub-esm-cu128:latest \
+  mn-biohub-esm:cu128 \
   hf download biohub/ESMFold2-Experimental-Fast \
   --local-dir /ref/biohub-esm/binder-design/ESMFold2-Experimental-Fast
 ```
@@ -366,7 +387,7 @@ Light smoke test:
 docker run --rm --gpus all \
   -v biohub-esm-hf-cache:/cache/huggingface \
   -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro \
-  mnprot-biohub-esm-cu128:latest
+  mn-biohub-esm:cu128
 ```
 
 Heavier ESMFold2 weight-load smoke test:
@@ -375,7 +396,7 @@ Heavier ESMFold2 weight-load smoke test:
 docker run --rm --gpus all \
   -v biohub-esm-hf-cache:/cache/huggingface \
   -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro \
-  mnprot-biohub-esm-cu128:latest \
+  mn-biohub-esm:cu128 \
   biohub-esm-smoke-test --load-esmfold2
 ```
 
@@ -386,7 +407,7 @@ docker run --rm --gpus all \
   -v biohub-esm-hf-cache:/cache/huggingface \
   -v /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro \
   -v /tmp/mn-protein-design-jobs/<job_id>:/work \
-  mnprot-biohub-esm-cu128:latest \
+  mn-biohub-esm:cu128 \
   python /work/config/run_esmfold2_job.py
 ```
 
@@ -417,7 +438,7 @@ Purpose in app:
 Image:
 
 ```text
-mnprot-surf2spot-cu128:latest
+mn-surf2spot:cu128
 ```
 
 Runtime:
@@ -439,12 +460,12 @@ Download/setup commands:
 ```bash
 docker run --rm \
   -v /mnt/db/reference_files/surf2spot:/ref/surf2spot \
-  mnprot-surf2spot-cu128:latest \
+  mn-surf2spot:cu128 \
   bash -lc 'set -e; tmp=$(mktemp -d); git clone --depth 1 https://github.com/JudeWells/Chainsaw "$tmp/Chainsaw"; cp -a "$tmp/Chainsaw/saved_models/." /ref/surf2spot/chainsaw/saved_models/'
 
 docker run --rm \
   -v /mnt/db/reference_files/surf2spot/model_emb/prot_t5_xl_half_uniref50-enc:/ref/prot_t5 \
-  mnprot-surf2spot-cu128:latest \
+  mn-surf2spot:cu128 \
   hf download Rostlab/prot_t5_xl_half_uniref50-enc --local-dir /ref/prot_t5
 ```
 
@@ -454,21 +475,21 @@ Example app commands:
 docker run --rm --gpus all \
   -v /tmp/mn-protein-design-jobs/<job_id>:/work \
   -v /mnt/db/reference_files/surf2spot/chainsaw/saved_models:/opt/Surf2Spot/Surf2Spot/data/chainsaw/saved_models:ro \
-  mnprot-surf2spot-cu128:latest \
+  mn-surf2spot:cu128 \
   Surf2Spot HS-preprocess -i /work/input -o /work/output/preprocess
 
 docker run --rm --gpus all \
   -v /tmp/mn-protein-design-jobs/<job_id>:/work \
   -v /mnt/db/reference_files/surf2spot/chainsaw/saved_models:/opt/Surf2Spot/Surf2Spot/data/chainsaw/saved_models:ro \
   -v /mnt/db/reference_files/surf2spot/model_emb/prot_t5_xl_half_uniref50-enc:/opt/Surf2Spot/Surf2Spot/data/model_emb/prot_t5_xl_half_uniref50-enc:ro \
-  mnprot-surf2spot-cu128:latest \
+  mn-surf2spot:cu128 \
   Surf2Spot HS-craft -i /work/output/preprocess
 
 docker run --rm --gpus all \
   -v /tmp/mn-protein-design-jobs/<job_id>:/work \
   -v /mnt/db/reference_files/surf2spot/chainsaw/saved_models:/opt/Surf2Spot/Surf2Spot/data/chainsaw/saved_models:ro \
   -v /mnt/db/reference_files/surf2spot/model_emb/prot_t5_xl_half_uniref50-enc:/opt/Surf2Spot/Surf2Spot/data/model_emb/prot_t5_xl_half_uniref50-enc:ro \
-  mnprot-surf2spot-cu128:latest \
+  mn-surf2spot:cu128 \
   Surf2Spot HS-predict -i /work/output/preprocess -o /work/output/predict --model /opt/Surf2Spot/model/HS/model.pt
 ```
 
@@ -501,7 +522,7 @@ Purpose in app:
 Image:
 
 ```text
-mnprot-pxdesign-cu128:latest
+mn-pxdesign:cu128
 ```
 
 Runtime:
@@ -535,7 +556,7 @@ CCD cache setup command:
 mkdir -p /mnt/db/reference_files/pxdesign/release_data/ccd_cache
 docker run --rm \
   -v /mnt/db/reference_files/pxdesign/release_data/ccd_cache:/ref/pxdesign/release_data/ccd_cache \
-  mnprot-pxdesign-cu128:latest \
+  mn-pxdesign:cu128 \
   bash -lc 'set -euo pipefail; cd /ref/pxdesign/release_data/ccd_cache; for url in https://pxdesign.tos-cn-beijing.volces.com/release_data/components.v20240608.cif https://pxdesign.tos-cn-beijing.volces.com/release_data/components.v20240608.cif.rdkit_mol.pkl https://pxdesign.tos-cn-beijing.volces.com/release_data/clusters-by-entity-40.txt; do file=$(basename "$url"); if [ ! -s "$file" ]; then curl -L -C - "$url" -o "$file"; fi; done'
 ```
 
@@ -545,7 +566,7 @@ Example target-parse command:
 docker run --rm \
   -v /tmp/mn-protein-design-jobs/<job_id>:/work \
   -v /mnt/db/reference_files/pxdesign:/ref/pxdesign:ro \
-  mnprot-pxdesign-cu128:latest \
+  mn-pxdesign:cu128 \
   pxdesign parse-target --yaml /work/config/task.yaml -o /work/output/parse-target
 ```
 
@@ -555,7 +576,7 @@ Example design command:
 docker run --rm --gpus all \
   -v /tmp/mn-protein-design-jobs/<job_id>:/work \
   -v /mnt/db/reference_files/pxdesign:/ref/pxdesign \
-  mnprot-pxdesign-cu128:latest \
+  mn-pxdesign:cu128 \
   pxdesign infer \
     -i /work/config/task.yaml \
     -o /work/output/infer \
@@ -593,13 +614,13 @@ Instead, keep a registry like:
 ```python
 TOOL_REGISTRY = {
     "scannet_ppi_prediction": {
-        "image": "mnprot-scannet:latest",
+        "image": "mn-scannet:cpu",
         "gpu": False,
         "group": "ppi_detection",
         "reference_mounts": [],
     },
     "genie3_generate": {
-        "image": "mnprot-genie3-cu128:latest",
+        "image": "mn-genie3:cu128",
         "gpu": True,
         "group": "design",
         "reference_mounts": [
@@ -607,7 +628,7 @@ TOOL_REGISTRY = {
         ],
     },
     "surf2spot_hotspots": {
-        "image": "mnprot-surf2spot-cu128:latest",
+        "image": "mn-surf2spot:cu128",
         "gpu": True,
         "group": "hotspot_detection",
         "reference_mounts": [
@@ -616,7 +637,7 @@ TOOL_REGISTRY = {
         ],
     },
     "pxdesign_parse_target": {
-        "image": "mnprot-pxdesign-cu128:latest",
+        "image": "mn-pxdesign:cu128",
         "gpu": False,
         "group": "target_input_structure_generation",
         "reference_mounts": [
@@ -624,7 +645,7 @@ TOOL_REGISTRY = {
         ],
     },
     "pxdesign_infer": {
-        "image": "mnprot-pxdesign-cu128:latest",
+        "image": "mn-pxdesign:cu128",
         "gpu": True,
         "group": "design",
         "reference_mounts": [
@@ -632,7 +653,7 @@ TOOL_REGISTRY = {
         ],
     },
     "protpardelle_sample": {
-        "image": "mnprot-protpardelle-1c-cu128:latest",
+        "image": "mn-protpardelle-1c:cu128",
         "gpu": True,
         "group": "design",
         "reference_mounts": [

@@ -1,5 +1,5 @@
 tool: proteina_complexa
 group: design
-image: ovoex-proteina-complexa:latest
+image: mn-proteina-complexa:latest
 gpu: true
 description: Proteina-Complexa bundled search_binder_local_pipeline contract.

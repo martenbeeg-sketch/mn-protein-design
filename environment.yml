@@ -15,4 +15,5 @@ dependencies:
   - typer
   - pip
   - pip:
+      - -e ../mn-compute-scheduler
       - -e .

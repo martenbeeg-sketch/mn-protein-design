@@ -1,0 +1,47 @@
+tool: bindcraft2
+group: design
+image: mn-bindcraft2:4a56313-cu13
+gpu: true
+description: BindCraft 2 full vanilla binder design workflow with AlphaFold validation.
+inputs:
+  target_pdb:
+    type: pdb
+    required: true
+params:
+  target_chains:
+    type: chain_list
+    required: true
+  hotspots:
+    type: residue_list
+    required: false
+  binder_length:
+    type: string
+    default: 55
+  modality:
+    type: string
+    default: binder
+  number_of_final_designs:
+    type: integer
+    default: 1
+  max_trajectories:
+    type: integer
+    default: 1
+  workers_per_gpu:
+    type: string
+    default: auto
+  cpu_cores:
+    type: integer
+    default: 4
+  campaign_seed:
+    type: integer
+    default: 0
+  gpu_device:
+    type: string
+    default: "0"
+outputs:
+  bindcraft2_output:
+    path: artifacts/raw/bindcraft2/output/
+    type: directory
+  candidates:
+    path: artifacts/normalized_candidates/candidates.jsonl
+    type: normalized_candidates

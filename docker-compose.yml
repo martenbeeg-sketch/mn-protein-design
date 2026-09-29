@@ -2,75 +2,75 @@ name: mn-protein-design
 
 services:
   scannet:
-    image: mnprot-scannet:latest
+    image: mn-scannet:cpu
     build:
       context: .
-      dockerfile: containers/scannet/Dockerfile
+      dockerfile: ../mn-tool-containers/protein-design/scannet/Dockerfile
       platforms: ["linux/x86_64"]
 
   surf2spot:
-    image: mnprot-surf2spot-cu128:latest
+    image: mn-surf2spot:cu128
     build:
       context: .
-      dockerfile: containers/surf2spot/Dockerfile
+      dockerfile: ../mn-tool-containers/protein-design/surf2spot/Dockerfile
       platforms: ["linux/x86_64"]
       args:
         INSTALL_ESMFOLD: "false"
 
   pesto:
-    image: mnprot-pesto-cu128:latest
+    image: mn-pesto:cu128
     build:
-      context: .
-      dockerfile: containers/pesto/Dockerfile
+      context: ../ovo-ligand
+      dockerfile: ../mn-tool-containers/shared/pesto/Dockerfile
       platforms: ["linux/x86_64"]
     gpus: all
 
   masif-seed:
-    image: masif_seed:latest
+    image: mn-masif-seed:cpu
     build:
       context: tools_to_implement/masif_seed
-      dockerfile: Dockerfile
+      dockerfile: ../../../mn-tool-containers/protein-design/masif-seed/Dockerfile
       platforms: ["linux/x86_64"]
 
   genie3:
-    image: mnprot-genie3-cu128:latest
+    image: mn-genie3:cu128
     build:
       context: .
-      dockerfile: containers/genie3/Dockerfile
+      dockerfile: ../mn-tool-containers/protein-design/genie3/Dockerfile
       platforms: ["linux/x86_64"]
       args:
         DOWNLOAD_WEIGHTS: "false"
         DOWNLOAD_TRAINING_DATA: "false"
 
   pxdesign:
-    image: mnprot-pxdesign-cu128:latest
+    image: mn-pxdesign:cu128
     build:
       context: .
-      dockerfile: containers/pxdesign/Dockerfile
+      dockerfile: ../mn-tool-containers/protein-design/pxdesign/Dockerfile
       platforms: ["linux/x86_64"]
 
   protenix:
-    image: mnprot-protenix-cu128:latest
+    image: mn-protenix:cu128
     build:
       context: .
-      dockerfile: containers/protenix/Dockerfile
+      dockerfile: ../mn-tool-containers/protein-design/protenix/Dockerfile
       platforms: ["linux/x86_64"]
     gpus: all
     volumes:
       - /mnt/db/reference_files/protenix:/ref/protenix:rw
 
   protpardelle-1c:
-    image: mnprot-protpardelle-1c-cu128:latest
+    image: mn-protpardelle-1c:cu128
     build:
       context: .
-      dockerfile: containers/protpardelle-1c/Dockerfile
+      dockerfile: ../mn-tool-containers/protein-design/protpardelle-1c/Dockerfile
       platforms: ["linux/x86_64"]
 
   biohub-esm:
-    image: mnprot-biohub-esm-cu128:latest
+    image: mn-biohub-esm:cu128
     build:
       context: .
-      dockerfile: containers/biohub-esm/Dockerfile
+      dockerfile: ../mn-tool-containers/shared/biohub-esm/Dockerfile
       platforms: ["linux/x86_64"]
     gpus: all
     volumes:
@@ -78,17 +78,17 @@ services:
       - /mnt/db/reference_files/biohub-esm:/ref/biohub-esm:ro
 
   colabfold:
-    image: mnprot-colabfold-cuda12:1.6.1
+    image: mn-colabfold:1.6.1-cu12
     build:
       context: .
-      dockerfile: containers/colabfold/Dockerfile
+      dockerfile: ../mn-tool-containers/protein-design/colabfold/Dockerfile
       platforms: ["linux/x86_64"]
 
   openfold3:
-    image: mnprot-openfold3-cu13:latest
+    image: mn-openfold3:cu13
     build:
       context: .
-      dockerfile: containers/openfold3/Dockerfile
+      dockerfile: ../mn-tool-containers/protein-design/openfold3/Dockerfile
       platforms: ["linux/x86_64"]
       args:
         PIXI_ENV: openfold3-cuda13
@@ -97,10 +97,10 @@ services:
       - /mnt/db/reference_files/openfold3:/ref/openfold3:rw
 
   ligandmpnn:
-    image: ovo-ligandmpnn:latest
+    image: mn-ligandmpnn:latest
 
   foundry-cu128:
-    image: ovoex-foundry-cu128:latest
+    image: mn-foundry:cu128
 
 volumes:
   biohub-esm-hf-cache:

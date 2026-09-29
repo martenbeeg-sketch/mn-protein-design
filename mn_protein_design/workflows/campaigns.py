@@ -15,6 +15,7 @@ from mn_protein_design.core.pipeline import (
 )
 from mn_protein_design.workflows.analysis import run_analysis_contract
 from mn_protein_design.workflows.refolding import (
+    REFOLDING_GROUP,
     run_complex_refolding_contract,
     run_monomer_refolding_contract,
 )
@@ -163,6 +164,52 @@ def run_lineage_steps(campaign_name: str, initial_source: dict[str, Any], steps:
             break
         source = _job_ref_from_run(child_run_dir)
     return child_runs
+
+
+def run_validation_sequence(
+    campaign_name: str,
+    initial_source: dict[str, Any],
+    steps: list[dict[str, Any]],
+    cpu_cores: int = 4,
+    gpu_device: object = "0",
+) -> Path:
+    """Run a multi-step validation lineage as one scheduled parent job."""
+    job = create_job(
+        REFOLDING_GROUP,
+        job_type="validation_sequence",
+        tool="full_validation_pipeline",
+        inputs={"initial_source": _source_snapshot(initial_source)},
+        params={
+            "campaign_name": campaign_name,
+            "steps": steps,
+            "cpu_cores": int(cpu_cores),
+            "gpu_device": gpu_device,
+        },
+    )
+    update_status(job.run_dir, "running")
+    child_runs = run_lineage_steps(campaign_name, initial_source, steps)
+    child_results = [read_json(child_run / "result.json") for child_run in child_runs]
+    success = bool(child_results) and all(result.get("success") is True for result in child_results)
+    finish_job(
+        job.run_dir,
+        success,
+        {
+            "outputs": {
+                "child_runs": [
+                    {
+                        "task_group": str(read_json(child_run / "metadata.json").get("task_group") or ""),
+                        "run_id": child_run.name,
+                    }
+                    for child_run in child_runs
+                ]
+            },
+            "metrics": {
+                "step_count": len(steps),
+                "completed_steps": sum(1 for result in child_results if result.get("success") is True),
+            },
+        },
+    )
+    return job.run_dir
 
 
 def _pipeline_result(payload: dict[str, Any]) -> dict[str, Any]:

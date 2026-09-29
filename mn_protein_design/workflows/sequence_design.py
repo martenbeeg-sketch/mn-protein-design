@@ -10,9 +10,11 @@ from typing import Any
 
 from mn_protein_design.core.artifacts import Artifact, artifact_path
 from mn_protein_design.core.candidates import STAGE_GENERATION_BACKBONE, STAGE_SEQUENCE_DESIGN, read_candidates, write_candidates
+from mn_protein_design.core.portable_paths import resolve_stored_path
 from mn_protein_design.core.gpu import docker_gpu_args, normalize_gpu_device
 from mn_protein_design.core.jobs import JobPaths, create_job, finish_job, update_status, write_json
 from mn_protein_design.core.manifests import load_manifest
+from mn_protein_design.core.scheduler import apply_docker_cpu_limits_to_steps
 from mn_protein_design.workflows import chain_roles
 from mn_protein_design.workflows import refolding as refolding_workflow
 
@@ -61,8 +63,7 @@ def _normalize_omit_aas(value: object, default: str = "CX") -> str:
 def _resolve_candidate_path(source_run_dir: Path, path_text: str | None) -> Path | None:
     if not path_text:
         return None
-    path = Path(path_text)
-    return path if path.is_absolute() else source_run_dir / path
+    return resolve_stored_path(path_text, run_dir=source_run_dir)
 
 
 def _is_cif_path(path: Path) -> bool:
@@ -491,6 +492,7 @@ def _ligandmpnn_design_index(header: str) -> int | None:
 
 
 def _run_shell_steps(run_dir: Path, steps: list[dict]) -> int:
+    steps = apply_docker_cpu_limits_to_steps(run_dir, steps)
     write_json(run_dir / "command.json", {"mode": "docker", "steps": steps})
     update_status(run_dir, "running")
     with (run_dir / "stdout.log").open("w") as stdout, (run_dir / "stderr.log").open("w") as stderr:

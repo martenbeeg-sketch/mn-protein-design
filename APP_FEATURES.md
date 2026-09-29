@@ -186,6 +186,7 @@ Available design tabs:
 
 * RFdiffusion classic
 * BindCraft
+* BindCraft 2
 * RFdiffusion3 / Foundry
 * BoltzGen
 * PXDesign
@@ -203,6 +204,17 @@ Available native/vanilla design integrations:
 
 * **BindCraft**: native end-to-end pipeline with BindCraft settings, filters,
   accepted designs, and native tables.
+* **BindCraft 2**: full vanilla workflow on the Design page and selectable in
+  Design Campaigns → Vanilla multi-engine. Campaign execution uses the native
+  BC2 trajectory/sequence design, AF2 validation, ranking, and normalized
+  mmCIF candidates. GPU and reserved CPU slots follow the persistent job
+  scheduler; AlphaFold weights resolve from the configured reference root.
+  The app exposes BC2's 10 binder-format presets, its `induced_fit` and
+  `fold_switch` objectives, and all 9 native design-property presets. Modality
+  length defaults are preserved unless a BC2-specific override is entered;
+  this keeps BC2's peptide, oligomer, large-binder, and multidomain ranges
+  independent of the shared length control used by other engines.
+  Generator-only integration remains a separate follow-up.
 * **BoltzGen**: native BoltzGen workflow with ranked native designs and metrics.
 * **PXDesign**: native PXDesign output and summary handling.
 * **Genie3**: native workflow with selectable ColabFold or Boltz2-style backend
@@ -321,6 +333,16 @@ tasks:
   and conservative fallback rates otherwise
 * GPU queue-resource visibility so independent jobs pinned to different GPUs
   can run concurrently while jobs sharing one GPU wait for the lock
+* a persistent local worker service for queued jobs; it is started when a UI
+  workflow queues work and remains independent of the Streamlit server
+* shared CPU-slot admission, exclusive device-specific GPU admission, Docker
+  CPU limits, worker health, and visible allocation/wait details
+
+Use `mn-protein-design worker` to run the queue service in a terminal,
+`mn-protein-design worker-status` to inspect it, and
+`mn-protein-design worker-stop` to stop new dispatch. Already running worker
+jobs continue after the service or Streamlit is stopped. Some older workflows
+still run synchronously in Streamlit and do not use this service.
 
 ## Refolding / Validation
 
@@ -397,14 +419,14 @@ Engine settings include:
   Pairformer cycles, diffusion steps, and samples
 
 OpenFold-3 uses the local CUDA 13 / Pixi container
-`mnprot-openfold3-cu13:latest`, intended for RTX 5090 / Blackwell-class hosts.
+`mn-openfold3:cu13`, intended for RTX 5090 / Blackwell-class hosts.
 Its default checkpoint is stored in the shared parameter store at
 `/mnt/db/reference_files/openfold3/of3-p2-155k.pt`. For benchmark targets, the
 app reuses the shared target MSA repository by sequence match and attaches only
 target-chain main MSAs; binder chains remain MSA-free.
 
 Standalone Protenix v1/v2 uses the local CUDA 12.8 / PyTorch container
-`mnprot-protenix-cu128:latest`, intended for RTX 5090 / Blackwell-class hosts.
+`mn-protenix:cu128`, intended for RTX 5090 / Blackwell-class hosts.
 The Protenix CLI cache, downloaded model files, and related parameters live
 under `/mnt/db/reference_files/protenix` and are mounted into the container as
 `/ref/protenix` through `PROTENIX_ROOT_DIR`. The current default v1 model is
@@ -822,7 +844,7 @@ particular:
   engine exposed by the full benchmark/refolding pages.
 * Some tool integrations depend on local images, checkpoints, and reference
   folders under `/mnt/db/reference_files`.
-* Standalone Protenix v1/v2 requires the `mnprot-protenix-cu128:latest` image
+* Standalone Protenix v1/v2 requires the `mn-protenix:cu128` image
   and keeps model/cache/parameter files under `/mnt/db/reference_files/protenix`.
 * External source folders such as `tools_to_implement/` may be intentionally
   untracked but required for Docker image builds.

@@ -6,12 +6,15 @@ import signal
 import shutil
 import subprocess
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from mn_protein_design.core.gpu import gpu_queue_resource
+from mn_protein_design.core.portable_paths import resolve_managed_paths, store_managed_paths
 from mn_protein_design.runtime import runs_root
 
 
@@ -59,14 +62,31 @@ def display_job_code(metadata_code: object, run_id: str) -> str:
 
 def read_json(path: Path) -> dict:
     try:
-        return json.loads(path.read_text())
+        payload = json.loads(path.read_text())
     except Exception:
         return {}
+    if Path(path).name == "command.json":
+        return payload
+    return resolve_managed_paths(payload, run_dir=_job_dir_for_path(Path(path)))
+
+
+def _job_dir_for_path(path: Path) -> Path | None:
+    try:
+        relative = Path(path).expanduser().resolve().relative_to(runs_root().expanduser().resolve())
+    except ValueError:
+        return None
+    if len(relative.parts) < 2:
+        return None
+    return runs_root() / relative.parts[0] / relative.parts[1]
 
 
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    if Path(path).name == "command.json":
+        stored_payload = payload
+    else:
+        stored_payload = store_managed_paths(payload, run_dir=_job_dir_for_path(Path(path)))
+    path.write_text(json.dumps(stored_payload, indent=2, sort_keys=True) + "\n")
 
 
 def _warning_metric_active(value: object) -> bool:
@@ -238,7 +258,16 @@ def _lock_is_stale(lock_dir: Path) -> bool:
     if not owner_run_dir.exists():
         return True
     owner_metadata = read_json(owner_run_dir / "metadata.json")
-    return str(owner_metadata.get("status") or "") not in ACTIVE_STATUSES
+    if str(owner_metadata.get("status") or "") not in ACTIVE_STATUSES:
+        return True
+    updated_at = str(owner_metadata.get("updated_at") or owner_metadata.get("created_at") or "")
+    if updated_at:
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(updated_at)).total_seconds()
+        except ValueError:
+            age = 0.0
+        return age > ACTIVE_OWNER_STALE_SECONDS
+    return False
 
 
 def _active_resource_owner(resource: str, requester_run_dir: Path) -> Path | None:
@@ -357,7 +386,59 @@ class JobPaths:
         return self.run_dir / "artifacts"
 
 
+@dataclass
+class _JobCreationAdoption:
+    job: JobPaths
+    consumed: bool = False
+
+
+_JOB_CREATION_ADOPTION: ContextVar[_JobCreationAdoption | None] = ContextVar(
+    "mn_protein_design_job_creation_adoption",
+    default=None,
+)
+
+
+@contextmanager
+def adopt_next_job_creation(job: JobPaths):
+    """Let one workflow-created job use an already queued run directory."""
+    token = _JOB_CREATION_ADOPTION.set(_JobCreationAdoption(job=job))
+    try:
+        yield
+    finally:
+        _JOB_CREATION_ADOPTION.reset(token)
+
+
+def _adopt_queued_job(task_group: str, job_type: str, tool: str, inputs: dict, params: dict) -> JobPaths | None:
+    adoption = _JOB_CREATION_ADOPTION.get()
+    if adoption is None or adoption.consumed:
+        return None
+    adoption.consumed = True
+    job = adoption.job
+    if task_group != job.task_group:
+        raise ValueError(
+            f"Queued workflow expected task group {job.task_group!r}, but {tool!r} creates {task_group!r}."
+        )
+    queue_resource = _queue_resource_for(tool, params)
+    write_json(
+        job.run_dir / "input.json",
+        {"job_type": job_type, "tool": tool, "inputs": inputs, "params": params},
+    )
+    metadata = read_json(job.run_dir / "metadata.json")
+    metadata.update({"task_group": task_group, "job_type": job_type, "tool": tool})
+    if queue_resource:
+        metadata["queue_resource"] = queue_resource
+    else:
+        metadata.pop("queue_resource", None)
+    metadata["updated_at"] = utc_now()
+    write_json(job.run_dir / "metadata.json", metadata)
+    return job
+
+
 def create_job(task_group: str, job_type: str, tool: str, inputs: dict, params: dict | None = None) -> JobPaths:
+    params = params or {}
+    adopted_job = _adopt_queued_job(task_group, job_type, tool, inputs, params)
+    if adopted_job is not None:
+        return adopted_job
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
     run_dir = runs_root() / task_group / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -366,7 +447,7 @@ def create_job(task_group: str, job_type: str, tool: str, inputs: dict, params: 
         (run_dir / name).write_text("")
     created_at = utc_now()
     queue_resource = _queue_resource_for(tool, params)
-    write_json(run_dir / "input.json", {"job_type": job_type, "tool": tool, "inputs": inputs, "params": params or {}})
+    write_json(run_dir / "input.json", {"job_type": job_type, "tool": tool, "inputs": inputs, "params": params})
     metadata = {
         "run_id": run_id,
         "job_code": short_job_code(run_id),
@@ -416,6 +497,9 @@ def update_status(run_dir: Path, status: str, **extra: object) -> None:
             metadata = read_json(run_dir / "metadata.json")
     metadata.update(extra)
     metadata["status"] = status
+    if status == "running":
+        metadata.pop("scheduler_dispatch_requested", None)
+        metadata.pop("scheduler_wait_reason", None)
     metadata["updated_at"] = utc_now()
     if status in {"completed", "failed", "cancelled"}:
         metadata.setdefault("completed_at", metadata["updated_at"])
@@ -718,6 +802,16 @@ def collect_jobs(task_group: str | None = None, *, include_hidden: bool = False)
                 _queue_resource_for(str(metadata.get("tool") or input_payload.get("tool", "")), input_params)
                 or metadata.get("queue_resource", "")
             )
+            allocation = metadata.get("resource_allocation") if isinstance(metadata.get("resource_allocation"), dict) else {}
+            resource_allocation = ""
+            if allocation:
+                try:
+                    cpu_cores = int(allocation.get("cpu_cores") or 0)
+                except (TypeError, ValueError):
+                    cpu_cores = 0
+                gpu_device = str(allocation.get("gpu_device") or "cpu")
+                cpu_text = f"{cpu_cores} CPU core{'s' if cpu_cores != 1 else ''}" if cpu_cores else "coordination"
+                resource_allocation = f"{cpu_text} · {gpu_device}"
             metadata_status = str(metadata.get("status") or "")
             status = metadata_status or ("completed" if result.get("success") else "unknown")
             if (
@@ -736,6 +830,8 @@ def collect_jobs(task_group: str | None = None, *, include_hidden: bool = False)
                     "tool": metadata.get("tool") or input_payload.get("tool", ""),
                     "status": status,
                     "queue_resource": queue_resource,
+                    "resource_allocation": resource_allocation,
+                    "scheduler_wait_reason": metadata.get("scheduler_wait_reason", ""),
                     "current_phase": metadata.get("current_phase", ""),
                     "current_engine": metadata.get("current_engine", ""),
                     "warning": warning,

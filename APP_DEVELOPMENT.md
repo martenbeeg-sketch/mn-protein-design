@@ -1,6 +1,6 @@
 # mn-protein-design Development Handoff
 
-Updated: 2026-09-28
+Updated: 2026-09-29
 
 This is the starting point for future development sessions. Read:
 
@@ -41,6 +41,13 @@ local-worker execution.
 
 Runtime resolution is owned by `mn_protein_design/runtime.py`.
 
+`mn-protein-design install-launchers` writes per-user terminal wrappers and an
+optional desktop shortcut through `mn_protein_design/launchers.py`. The app
+wrapper records the active Python executable and effective runtime paths so
+it can start without shell activation. These generated files belong to the
+machine user's home directory, not source control; reinstall them after moving
+the environment or changing runtime paths.
+
 - app home: `MN_PROTEIN_DESIGN_APP_HOME`, currently defaulting to
   `<checkout>/mn-protein-design-workdir`;
 - runs: `MN_PROTEIN_DESIGN_RUN_DIR`, otherwise `<app-home>/workdir/runs`;
@@ -49,8 +56,15 @@ Runtime resolution is owned by `mn_protein_design/runtime.py`.
 - temporary files: `TMPDIR`, otherwise `<checkout>/.tmp`.
 
 The current defaults remain checkout-coupled. Do not move historical run folders
-or rewrite their metadata merely to improve portability. Add compatibility
-resolution before changing stored path behavior.
+or rewrite their metadata merely to improve portability. `core/portable_paths.py`
+maps managed run, reference, and app-home files to stable URI prefixes when
+new job JSON and candidate structures are serialized, and resolves those URIs
+or run-relative paths against the active machine's runtime roots. It also
+remaps selected legacy absolute paths after their original location disappears.
+`mn-protein-design portability` audits, copies, verifies, and imports the full
+workdir plus configured runs without changing the source. Reference files and
+Docker images remain separate. Historical records are normalized only in the
+exported copy; arbitrary required paths outside managed roots still stop export.
 
 ## Job and candidate contracts
 
@@ -96,8 +110,10 @@ alphabetical order or restore the historical binder-`A` assumption globally.
   locks, pause/stop/resume, and deletion helpers.
 - `mn_protein_design/core/candidates.py`: normalized candidate contract,
   structure handling, and candidate metrics.
-- `mn_protein_design/core/local_worker.py`: worker-request dispatch and spawned
-  background execution.
+- `mn_protein_design/core/local_worker.py`: worker-request dispatch and queue
+  service startup.
+- `mn_protein_design/core/scheduler.py`: persistent local queue service, CPU
+  slot allocation, per-GPU admission, health snapshots, and Docker CPU limits.
 - `mn_protein_design/core/runtime_estimator.py`: history-based runtime estimates.
 - `mn_protein_design/workflows/chain_roles.py`: explicit chain-role schema.
 - `mn_protein_design/workflows/design.py`: individual design-engine adapters.
@@ -123,25 +139,30 @@ Use:
 /home/user/mambaforge/envs/mn-protein-design/bin/python
 ```
 
-The environment currently does **not** contain `pytest`, and no first-party
-top-level `tests/` suite or pytest configuration was found during the
-2026-07-24 audit. Running:
+The project provides `pytest` as an optional development dependency and keeps
+first-party tests under `tests/`. Install it with:
 
 ```bash
-/home/user/mambaforge/envs/mn-protein-design/bin/python -m pytest
+/home/user/mambaforge/envs/mn-protein-design/bin/python -m pip install -e '.[dev]'
 ```
 
-currently fails with `No module named pytest`.
+Run the CPU/local suite with:
 
-Tests found under `tools_to_implement/` and `ui_inspiration/` belong to vendored
-or reference projects and must not be treated as the mn-protein-design
-regression suite. Container and workflow smoke procedures are documented in
-`smoke_tests/README.md`, but they are not a replacement for local unit and
-Streamlit AppTest coverage.
+```bash
+/home/user/mambaforge/envs/mn-protein-design/bin/python -m pytest -q
+```
 
-The first testing improvement should create a first-party `tests/` directory,
-add a development dependency, and establish a CPU/local baseline that does not
-require Docker, a GPU, model weights, or network access.
+The suite currently collects 361 tests across file-backed jobs and scheduler
+behavior, workflow automation, portability and migration, target-fragment
+preparation, candidate imports, chain-role validation, design parameters,
+benchmark metrics, and runtime estimates. Streamlit AppTests cover startup for
+the main pages and selection of lazy result/setup panels. Tests use temporary
+run roots and small synthetic structures; they do not launch design or
+refolding engines. Native Docker/GPU checks remain in `smoke_tests/`.
+
+Tests under `tools_to_implement/` and `ui_inspiration/` belong to upstream or
+reference projects and are not the app regression suite. Container/GPU smoke
+tests remain separate from the local test baseline.
 
 ## Safe development procedure
 
@@ -151,21 +172,32 @@ require Docker, a GPU, model weights, or network access.
 3. Keep engine-native layouts inside adapters and normalize at boundaries.
 4. Preserve historical runs and legacy candidate compatibility.
 5. Add focused unit tests and Streamlit AppTests before expanding UI claims.
-6. Run the first-party suite once it exists.
+6. Run the first-party pytest suite.
 7. For scientific adapters, separately run the documented native Docker/GPU
    smoke and verify non-empty normalized candidates and downstream handoff.
 8. Update these four handoff files when architecture or validation status
    changes.
+
+Queued jobs with `worker_request.json` are dispatched by a separate worker
+service. Heavy design, refolding, sequence-design, analysis, detection, and
+benchmark launches use this queue. The service starts automatically when a UI
+path enqueues a worker job, or can run in a terminal with
+`mn-protein-design worker`. It keeps running when Streamlit exits. The default
+worker capacity is up to 32 CPU slots and can be changed with
+`MN_PROTEIN_DESIGN_WORKER_CPU_SLOTS`; CPU-only and GPU jobs reserve CPU slots,
+and GPU jobs also reserve their selected device. Docker receives the slot count
+as thread settings and uses a CPU quota when the host exposes cgroup quota
+controls. Child steps in a workflow share the parent allocation.
 
 ## Near-term engineering direction
 
 The app does not need a wholesale rewrite. Its scientific breadth and normalized
 candidate model are valuable. The most useful future work is consolidation:
 
-1. establish the missing first-party test suite;
+1. extend first-party tests across workflows, resource admission, and pages;
 2. strengthen run-relative typed artifacts and path portability;
-3. split oversized workflow/result modules along stable contracts;
-4. converge synchronous and spawned-worker execution on one durable worker
-   lifecycle;
-5. make engine manifests, references, resources, licenses, and validation status
+3. migrate remaining synchronous workflows into the background queue;
+4. add RAM/VRAM/scratch admission and cleaner worker crash recovery;
+5. split oversized workflow/result modules along stable contracts;
+6. make engine manifests, references, resources, licenses, and validation status
    authoritative rather than distributed across constants and documentation.

@@ -6046,43 +6046,49 @@ def _show_benchmark_plots(
         else:
             st.info("AP/AUROC columns are missing.")
 
-    preset_auto_tab, preset_manual_tab = st.tabs(["Save best AP preset", "Manual selection"])
-    with preset_auto_tab:
-        if not engine_summary.empty:
-            st.caption(
-                "Save the best feature per engine from the current ranking statistic, target filter, category, and engine selection."
-            )
-            _save_preset_controls(
+    preset_auto_tab, preset_manual_tab = st.tabs(
+        ["Save best AP preset", "Manual selection"],
+        key=f"{feature_chart_key}_ranking_preset_tabs",
+        on_change="rerun",
+    )
+    if preset_auto_tab.open:
+        with preset_auto_tab:
+            if not engine_summary.empty:
+                st.caption(
+                    "Save the best feature per engine from the current ranking statistic, target filter, category, and engine selection."
+                )
+                _save_preset_controls(
+                    run_key=run_key,
+                    key_suffix=f"{ranking_key}_{safe_category}_{safe_target}_{ranking_basis}_visible_auto",
+                    benchmark_dir=benchmark_dir,
+                    rows=engine_summary,
+                    default_name=f"{benchmark_dir.parents[1].name}_{safe_category}_{safe_target}_{ranking_basis.replace(' ', '_')}_best_ap",
+                    description=(
+                        f"Best feature per engine by {ranking_basis_label} AP from {selected_ranking_label}; "
+                        f"category={selected_category}; targets={target_label}."
+                    ),
+                    selection_rule=f"best_{ranking_basis.replace(' ', '_')}_ap_per_engine_filtered",
+                    extra={
+                        "source_table": selected_ranking_label,
+                        "target_filter": target_label,
+                        "selection_category": selected_category,
+                        "ranking_basis": ranking_basis,
+                    },
+                )
+            else:
+                st.info("No best-AP engine features are available for the current filters.")
+    if preset_manual_tab.open:
+        with preset_manual_tab:
+            _show_ranking_preset_builder(
                 run_key=run_key,
-                key_suffix=f"{ranking_key}_{safe_category}_{safe_target}_{ranking_basis}_visible_auto",
+                ranking_key=ranking_key,
                 benchmark_dir=benchmark_dir,
-                rows=engine_summary,
-                default_name=f"{benchmark_dir.parents[1].name}_{safe_category}_{safe_target}_{ranking_basis.replace(' ', '_')}_best_ap",
-                description=(
-                    f"Best feature per engine by {ranking_basis_label} AP from {selected_ranking_label}; "
-                    f"category={selected_category}; targets={target_label}."
-                ),
-                selection_rule=f"best_{ranking_basis.replace(' ', '_')}_ap_per_engine_filtered",
-                extra={
-                    "source_table": selected_ranking_label,
-                    "target_filter": target_label,
-                    "selection_category": selected_category,
-                    "ranking_basis": ranking_basis,
-                },
+                ranking=plot_ranking,
+                engine_summary=engine_summary,
+                selected_category=selected_category,
+                selected_targets=[str(target) for target in selected_targets] if selected_targets else None,
+                selected_ranking_label=selected_ranking_label,
             )
-        else:
-            st.info("No best-AP engine features are available for the current filters.")
-    with preset_manual_tab:
-        _show_ranking_preset_builder(
-            run_key=run_key,
-            ranking_key=ranking_key,
-            benchmark_dir=benchmark_dir,
-            ranking=plot_ranking,
-            engine_summary=engine_summary,
-            selected_category=selected_category,
-            selected_targets=[str(target) for target in selected_targets] if selected_targets else None,
-            selected_ranking_label=selected_ranking_label,
-        )
 
     if "best_average_precision" in plot_ranking.columns:
         st.subheader("Best Feature Per Engine")
@@ -6295,124 +6301,130 @@ def _show_benchmark_plots(
                         "recall_percent": st.column_config.NumberColumn("recall (%)", format="%.1f"),
                     },
                 )
-    threshold_tab, selection_tab = st.tabs(["Threshold summary", "Selection success"])
-    with threshold_tab:
-        st.caption("The F1-optimal threshold summary and its per-target table are shown above.")
-    with selection_tab:
-        selection_mode = st.segmented_control(
-            "Selection rule",
-            ["Top N", "Score threshold"],
-            default="Top N",
-            key=f"{feature_chart_key}_selection_success_mode_v1",
-        )
-        selection_mode = str(selection_mode or "Top N")
-        selected_rows = ranked_df.iloc[0:0].copy()
-        selection_description = ""
-        if selection_mode == "Top N":
-            top_count = int(
-                st.number_input(
-                    "Take the top designs",
-                    min_value=1,
-                    max_value=max(1, len(ranked_df)),
-                    value=min(20, max(1, len(ranked_df))),
-                    step=1,
-                    key=f"{feature_chart_key}_selection_success_top_n_v1",
-                )
+    threshold_tab, selection_tab = st.tabs(
+        ["Threshold summary", "Selection success"],
+        key=f"{feature_chart_key}_selection_success_tabs",
+        on_change="rerun",
+    )
+    if threshold_tab.open:
+        with threshold_tab:
+            st.caption("The F1-optimal threshold summary and its per-target table are shown above.")
+    if selection_tab.open:
+        with selection_tab:
+            selection_mode = st.segmented_control(
+                "Selection rule",
+                ["Top N", "Score threshold"],
+                default="Top N",
+                key=f"{feature_chart_key}_selection_success_mode_v1",
             )
-            selected_rows = ranked_df.head(top_count).copy()
-            selection_description = f"Top {top_count:,} designs ranked by `{selected_feature}`"
-        else:
-            feature_min = float(ranked_df[selected_feature].min())
-            feature_max = float(ranked_df[selected_feature].max())
-            default_threshold = float(threshold_summary["threshold"]) if threshold_summary else float(ranked_df[selected_feature].median())
-            threshold_step = max((feature_max - feature_min) / 200.0, 1e-6)
-            chosen_threshold = float(
-                st.number_input(
-                    f"Score threshold ({'below or equal' if direction == 'lower' else 'above or equal'} is selected)",
-                    min_value=feature_min,
-                    max_value=feature_max,
-                    value=min(max(default_threshold, feature_min), feature_max),
-                    step=threshold_step,
-                    format="%.5g",
-                    key=f"{feature_chart_key}_selection_success_threshold_v1",
+            selection_mode = str(selection_mode or "Top N")
+            selected_rows = ranked_df.iloc[0:0].copy()
+            selection_description = ""
+            if selection_mode == "Top N":
+                top_count = int(
+                    st.number_input(
+                        "Take the top designs",
+                        min_value=1,
+                        max_value=max(1, len(ranked_df)),
+                        value=min(20, max(1, len(ranked_df))),
+                        step=1,
+                        key=f"{feature_chart_key}_selection_success_top_n_v1",
+                    )
                 )
-            )
-            passes = ranked_df[selected_feature] <= chosen_threshold if direction == "lower" else ranked_df[selected_feature] >= chosen_threshold
-            selected_rows = ranked_df[passes].copy()
-            selection_description = (
-                f"`{selected_feature} {'<=' if direction == 'lower' else '>='} {chosen_threshold:.5g}`"
-            )
-        selected_count = int(len(selected_rows))
-        selected_binders = int(selected_rows["is_binder"].sum()) if selected_count else 0
-        false_positives = selected_count - selected_binders
-        success_rate = selected_binders / selected_count if selected_count else 0.0
-        recall = selected_binders / total_binders if total_binders else 0.0
-        f1_value = 2 * success_rate * recall / (success_rate + recall) if success_rate + recall else 0.0
-        selection_metrics = st.columns(5)
-        selection_metrics[0].metric("Selected", f"{selected_count:,}")
-        selection_metrics[1].metric("Success rate", f"{success_rate * 100:.1f}%")
-        selection_metrics[2].metric("Recall", f"{recall * 100:.1f}%")
-        selection_metrics[3].metric("True binders", f"{selected_binders:,}")
-        selection_metrics[4].metric("False positives", f"{false_positives:,}")
-        st.caption(f"{selection_description}; F1 = {f1_value:.3f}.")
-        if "target_id" in ranked_df.columns:
-            selected_index = set(selected_rows.index.tolist())
-            per_target_selection_rows: list[dict[str, Any]] = []
-            for target_id, target_group in ranked_df.groupby("target_id", dropna=False, sort=False):
-                target_selected = target_group[target_group.index.isin(selected_index)]
-                target_binders = int(target_group["is_binder"].sum())
-                target_selected_count = int(len(target_selected))
-                target_selected_binders = int(target_selected["is_binder"].sum()) if target_selected_count else 0
-                per_target_selection_rows.append(
-                    {
-                        "target": str(target_id) if pd.notna(target_id) else "unknown",
-                        "records": int(len(target_group)),
-                        "binders": target_binders,
-                        "selected": target_selected_count,
-                        "true_binders_selected": target_selected_binders,
-                        "false_positives": target_selected_count - target_selected_binders,
-                        "success_rate_percent": (
-                            target_selected_binders / target_selected_count * 100.0 if target_selected_count else None
-                        ),
-                        "recall_percent": target_selected_binders / target_binders * 100.0 if target_binders else None,
-                    }
+                selected_rows = ranked_df.head(top_count).copy()
+                selection_description = f"Top {top_count:,} designs ranked by `{selected_feature}`"
+            else:
+                feature_min = float(ranked_df[selected_feature].min())
+                feature_max = float(ranked_df[selected_feature].max())
+                default_threshold = float(threshold_summary["threshold"]) if threshold_summary else float(ranked_df[selected_feature].median())
+                threshold_step = max((feature_max - feature_min) / 200.0, 1e-6)
+                chosen_threshold = float(
+                    st.number_input(
+                        f"Score threshold ({'below or equal' if direction == 'lower' else 'above or equal'} is selected)",
+                        min_value=feature_min,
+                        max_value=feature_max,
+                        value=min(max(default_threshold, feature_min), feature_max),
+                        step=threshold_step,
+                        format="%.5g",
+                        key=f"{feature_chart_key}_selection_success_threshold_v1",
+                    )
                 )
-            per_target_selection = pd.DataFrame(per_target_selection_rows).sort_values(
-                ["success_rate_percent", "recall_percent", "target"],
-                ascending=[False, False, True],
-                na_position="last",
-            )
-            if not per_target_selection.empty:
-                targets_total = int(len(per_target_selection))
-                targets_with_any_selection = int((per_target_selection["selected"] > 0).sum())
-                targets_with_true_binder_selection = int((per_target_selection["true_binders_selected"] > 0).sum())
-                targets_without_selection = targets_total - targets_with_any_selection
-                targets_with_only_false_positive_selection = int(
-                    (
-                        (per_target_selection["selected"] > 0)
-                        & (per_target_selection["true_binders_selected"] == 0)
-                    ).sum()
+                passes = ranked_df[selected_feature] <= chosen_threshold if direction == "lower" else ranked_df[selected_feature] >= chosen_threshold
+                selected_rows = ranked_df[passes].copy()
+                selection_description = (
+                    f"`{selected_feature} {'<=' if direction == 'lower' else '>='} {chosen_threshold:.5g}`"
                 )
-                target_selection_cols = st.columns(4)
-                target_selection_cols[0].metric("Targets with selected designs", f"{targets_with_any_selection}/{targets_total}")
-                target_selection_cols[1].metric(
-                    "Targets with true binders selected",
-                    f"{targets_with_true_binder_selection}/{targets_total}",
+            selected_count = int(len(selected_rows))
+            selected_binders = int(selected_rows["is_binder"].sum()) if selected_count else 0
+            false_positives = selected_count - selected_binders
+            success_rate = selected_binders / selected_count if selected_count else 0.0
+            recall = selected_binders / total_binders if total_binders else 0.0
+            f1_value = 2 * success_rate * recall / (success_rate + recall) if success_rate + recall else 0.0
+            selection_metrics = st.columns(5)
+            selection_metrics[0].metric("Selected", f"{selected_count:,}")
+            selection_metrics[1].metric("Success rate", f"{success_rate * 100:.1f}%")
+            selection_metrics[2].metric("Recall", f"{recall * 100:.1f}%")
+            selection_metrics[3].metric("True binders", f"{selected_binders:,}")
+            selection_metrics[4].metric("False positives", f"{false_positives:,}")
+            st.caption(f"{selection_description}; F1 = {f1_value:.3f}.")
+            if "target_id" in ranked_df.columns:
+                selected_index = set(selected_rows.index.tolist())
+                per_target_selection_rows: list[dict[str, Any]] = []
+                for target_id, target_group in ranked_df.groupby("target_id", dropna=False, sort=False):
+                    target_selected = target_group[target_group.index.isin(selected_index)]
+                    target_binders = int(target_group["is_binder"].sum())
+                    target_selected_count = int(len(target_selected))
+                    target_selected_binders = int(target_selected["is_binder"].sum()) if target_selected_count else 0
+                    per_target_selection_rows.append(
+                        {
+                            "target": str(target_id) if pd.notna(target_id) else "unknown",
+                            "records": int(len(target_group)),
+                            "binders": target_binders,
+                            "selected": target_selected_count,
+                            "true_binders_selected": target_selected_binders,
+                            "false_positives": target_selected_count - target_selected_binders,
+                            "success_rate_percent": (
+                                target_selected_binders / target_selected_count * 100.0 if target_selected_count else None
+                            ),
+                            "recall_percent": target_selected_binders / target_binders * 100.0 if target_binders else None,
+                        }
+                    )
+                per_target_selection = pd.DataFrame(per_target_selection_rows).sort_values(
+                    ["success_rate_percent", "recall_percent", "target"],
+                    ascending=[False, False, True],
+                    na_position="last",
                 )
-                target_selection_cols[2].metric("Targets with no selected designs", f"{targets_without_selection}/{targets_total}")
-                target_selection_cols[3].metric(
-                    "Targets selected only false positives",
-                    f"{targets_with_only_false_positive_selection}/{targets_total}",
+                if not per_target_selection.empty:
+                    targets_total = int(len(per_target_selection))
+                    targets_with_any_selection = int((per_target_selection["selected"] > 0).sum())
+                    targets_with_true_binder_selection = int((per_target_selection["true_binders_selected"] > 0).sum())
+                    targets_without_selection = targets_total - targets_with_any_selection
+                    targets_with_only_false_positive_selection = int(
+                        (
+                            (per_target_selection["selected"] > 0)
+                            & (per_target_selection["true_binders_selected"] == 0)
+                        ).sum()
+                    )
+                    target_selection_cols = st.columns(4)
+                    target_selection_cols[0].metric("Targets with selected designs", f"{targets_with_any_selection}/{targets_total}")
+                    target_selection_cols[1].metric(
+                        "Targets with true binders selected",
+                        f"{targets_with_true_binder_selection}/{targets_total}",
+                    )
+                    target_selection_cols[2].metric("Targets with no selected designs", f"{targets_without_selection}/{targets_total}")
+                    target_selection_cols[3].metric(
+                        "Targets selected only false positives",
+                        f"{targets_with_only_false_positive_selection}/{targets_total}",
+                    )
+                st.dataframe(
+                    per_target_selection,
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "success_rate_percent": st.column_config.NumberColumn("success rate (%)", format="%.1f"),
+                        "recall_percent": st.column_config.NumberColumn("recall (%)", format="%.1f"),
+                    },
                 )
-            st.dataframe(
-                per_target_selection,
-                hide_index=True,
-                width="stretch",
-                column_config={
-                    "success_rate_percent": st.column_config.NumberColumn("success rate (%)", format="%.1f"),
-                    "recall_percent": st.column_config.NumberColumn("recall (%)", format="%.1f"),
-                },
-            )
     roc_df = pd.concat(
         [
             pd.DataFrame([{"rank": 0, "fpr": 0.0, "tpr": 0.0}]),
@@ -15669,512 +15681,519 @@ def _show_design_campaign_scout_statistics(
                 "readable %": st.column_config.NumberColumn("readable %", format="%.0%"),
             },
         )
-        plot_tabs = st.tabs(["Distributions", "Hotspot Matrix", "Candidate Stats"])
-        with plot_tabs[0]:
-            plot_df = stats_df.dropna(subset=["hotspot coverage"]).copy()
-            if not plot_df.empty:
-                st.altair_chart(
-                    alt.Chart(plot_df)
-                    .mark_bar(opacity=0.82)
-                    .encode(
-                        x=alt.X(
-                            "hotspot coverage:Q",
-                            bin=alt.Bin(step=0.1, extent=[0, 1]),
-                            title="hotspot coverage fraction",
-                            scale=alt.Scale(domain=[0, 1]),
-                        ),
-                        y=alt.Y("count():Q", title="designs"),
-                        color=alt.Color("engine:N", legend=None),
-                        row=alt.Row("engine:N", title=None, header=alt.Header(labelAngle=0, labelAlign="left")),
-                        tooltip=["engine:N", alt.Tooltip("count():Q", title="designs")],
-                    )
-                    .resolve_scale(y="independent")
-                    .properties(height=90, width=900),
-                    width="content",
-                    key=f"{run_dir.name}_design_campaign_stats_hotspot_hist_by_engine",
-                )
-                st.altair_chart(
-                    alt.Chart(plot_df)
-                    .mark_boxplot(size=42)
-                    .encode(
-                        x=alt.X("engine:N", title="engine", sort="-y"),
-                        y=alt.Y("hotspot coverage:Q", title="hotspot coverage fraction", scale=alt.Scale(domain=[0, 1])),
-                        color=alt.Color("engine:N", legend=None),
-                        tooltip=["engine:N"],
-                    )
-                    .properties(height=320),
-                    width="stretch",
-                    key=f"{run_dir.name}_design_campaign_stats_hotspot_box",
-                )
-            ss_fraction_cols = ["binder helix fraction", "binder sheet fraction", "binder coil fraction"]
-            if all(column in stats_df.columns for column in ss_fraction_cols):
-                ss_plot_source = stats_df.dropna(subset=ss_fraction_cols, how="all").copy()
-                if not ss_plot_source.empty:
-                    ss_summary = (
-                        ss_plot_source.groupby("engine", dropna=False)
-                        .agg(
-                            helix=("binder helix fraction", "mean"),
-                            sheet=("binder sheet fraction", "mean"),
-                            coil=("binder coil fraction", "mean"),
-                            designs=("candidate", "count"),
-                            rebuilt_backbones=(
-                                "secondary structure rebuilt backbone",
-                                lambda values: int(sum(bool(value) for value in values)),
+        plot_tabs = st.tabs(
+            ["Distributions", "Hotspot Matrix", "Candidate Stats"],
+            key=f"{run_dir.name}_design_campaign_stats_tabs",
+            on_change="rerun",
+        )
+        if plot_tabs[0].open:
+            with plot_tabs[0]:
+                plot_df = stats_df.dropna(subset=["hotspot coverage"]).copy()
+                if not plot_df.empty:
+                    st.altair_chart(
+                        alt.Chart(plot_df)
+                        .mark_bar(opacity=0.82)
+                        .encode(
+                            x=alt.X(
+                                "hotspot coverage:Q",
+                                bin=alt.Bin(step=0.1, extent=[0, 1]),
+                                title="hotspot coverage fraction",
+                                scale=alt.Scale(domain=[0, 1]),
                             ),
+                            y=alt.Y("count():Q", title="designs"),
+                            color=alt.Color("engine:N", legend=None),
+                            row=alt.Row("engine:N", title=None, header=alt.Header(labelAngle=0, labelAlign="left")),
+                            tooltip=["engine:N", alt.Tooltip("count():Q", title="designs")],
+                        )
+                        .resolve_scale(y="independent")
+                        .properties(height=90, width=900),
+                        width="content",
+                        key=f"{run_dir.name}_design_campaign_stats_hotspot_hist_by_engine",
+                    )
+                    st.altair_chart(
+                        alt.Chart(plot_df)
+                        .mark_boxplot(size=42)
+                        .encode(
+                            x=alt.X("engine:N", title="engine", sort="-y"),
+                            y=alt.Y("hotspot coverage:Q", title="hotspot coverage fraction", scale=alt.Scale(domain=[0, 1])),
+                            color=alt.Color("engine:N", legend=None),
+                            tooltip=["engine:N"],
+                        )
+                        .properties(height=320),
+                        width="stretch",
+                        key=f"{run_dir.name}_design_campaign_stats_hotspot_box",
+                    )
+                ss_fraction_cols = ["binder helix fraction", "binder sheet fraction", "binder coil fraction"]
+                if all(column in stats_df.columns for column in ss_fraction_cols):
+                    ss_plot_source = stats_df.dropna(subset=ss_fraction_cols, how="all").copy()
+                    if not ss_plot_source.empty:
+                        ss_summary = (
+                            ss_plot_source.groupby("engine", dropna=False)
+                            .agg(
+                                helix=("binder helix fraction", "mean"),
+                                sheet=("binder sheet fraction", "mean"),
+                                coil=("binder coil fraction", "mean"),
+                                designs=("candidate", "count"),
+                                rebuilt_backbones=(
+                                    "secondary structure rebuilt backbone",
+                                    lambda values: int(sum(bool(value) for value in values)),
+                                ),
+                            )
+                            .reset_index()
+                        )
+                        ss_long = ss_summary.melt(
+                            id_vars=["engine", "designs", "rebuilt_backbones"],
+                            value_vars=["helix", "sheet", "coil"],
+                            var_name="secondary structure",
+                            value_name="fraction",
+                        ).dropna(subset=["fraction"])
+                        if not ss_long.empty:
+                            st.altair_chart(
+                                alt.Chart(ss_long)
+                                .mark_bar(opacity=0.86)
+                                .encode(
+                                    x=alt.X("engine:N", title="engine", sort="-y"),
+                                    y=alt.Y(
+                                        "fraction:Q",
+                                        title="mean binder secondary-structure fraction",
+                                        stack="normalize",
+                                        axis=alt.Axis(format="%"),
+                                    ),
+                                    color=alt.Color(
+                                        "secondary structure:N",
+                                        scale=alt.Scale(
+                                            domain=["helix", "sheet", "coil"],
+                                            range=["#2563eb", "#f59e0b", "#9ca3af"],
+                                        ),
+                                    ),
+                                    tooltip=[
+                                        "engine:N",
+                                        "secondary structure:N",
+                                        alt.Tooltip("fraction:Q", title="mean fraction", format=".1%"),
+                                        "designs:Q",
+                                        alt.Tooltip(
+                                            "rebuilt_backbones:Q",
+                                            title="CA-rebuilt backbones",
+                                            format="d",
+                                        ),
+                                    ],
+                                )
+                                .properties(height=280, width=900, title="Binder secondary-structure composition"),
+                                width="content",
+                                key=f"{run_dir.name}_design_campaign_stats_secondary_structure_bar",
+                            )
+                ss_element_cols = [
+                    "binder helix elements",
+                    "binder sheet elements",
+                    "binder secondary structure elements",
+                ]
+                if all(column in stats_df.columns for column in ss_element_cols):
+                    element_source = stats_df.copy()
+                    if "binder secondary structure elements" in element_source:
+                        element_source["binder secondary structure elements"] = element_source[
+                            "binder secondary structure elements"
+                        ].fillna(
+                            pd.to_numeric(element_source.get("binder helix elements"), errors="coerce").fillna(0)
+                            + pd.to_numeric(element_source.get("binder sheet elements"), errors="coerce").fillna(0)
+                        )
+                    element_summary = (
+                        element_source.groupby("engine", dropna=False)
+                        .agg(
+                            helix=("binder helix elements", "mean"),
+                            sheet=("binder sheet elements", "mean"),
+                            total=("binder secondary structure elements", "mean"),
+                            designs=("candidate", "count"),
                         )
                         .reset_index()
                     )
-                    ss_long = ss_summary.melt(
-                        id_vars=["engine", "designs", "rebuilt_backbones"],
-                        value_vars=["helix", "sheet", "coil"],
-                        var_name="secondary structure",
-                        value_name="fraction",
-                    ).dropna(subset=["fraction"])
-                    if not ss_long.empty:
+                    element_long = element_summary.melt(
+                        id_vars=["engine", "designs"],
+                        value_vars=["helix", "sheet", "total"],
+                        var_name="element type",
+                        value_name="mean count",
+                    ).dropna(subset=["mean count"])
+                    if not element_long.empty:
                         st.altair_chart(
-                            alt.Chart(ss_long)
+                            alt.Chart(element_long)
                             .mark_bar(opacity=0.86)
                             .encode(
                                 x=alt.X("engine:N", title="engine", sort="-y"),
-                                y=alt.Y(
-                                    "fraction:Q",
-                                    title="mean binder secondary-structure fraction",
-                                    stack="normalize",
-                                    axis=alt.Axis(format="%"),
-                                ),
+                                xOffset=alt.XOffset("element type:N"),
+                                y=alt.Y("mean count:Q", title="mean secondary-structure elements per binder"),
                                 color=alt.Color(
-                                    "secondary structure:N",
+                                    "element type:N",
                                     scale=alt.Scale(
-                                        domain=["helix", "sheet", "coil"],
-                                        range=["#2563eb", "#f59e0b", "#9ca3af"],
+                                        domain=["helix", "sheet", "total"],
+                                        range=["#2563eb", "#f59e0b", "#111827"],
                                     ),
                                 ),
                                 tooltip=[
                                     "engine:N",
-                                    "secondary structure:N",
-                                    alt.Tooltip("fraction:Q", title="mean fraction", format=".1%"),
+                                    "element type:N",
+                                    alt.Tooltip("mean count:Q", format=".2f"),
                                     "designs:Q",
+                                ],
+                            )
+                            .properties(height=280, width=900, title="Binder secondary-structure element counts"),
+                            width="content",
+                            key=f"{run_dir.name}_design_campaign_stats_secondary_structure_elements_bar",
+                        )
+                ca_trace_element_cols = [
+                    "CA-trace helix-like elements",
+                    "CA-trace extended elements",
+                    "CA-trace structured elements",
+                ]
+                if all(column in stats_df.columns for column in ca_trace_element_cols):
+                    ca_trace_summary = (
+                        stats_df.groupby("engine", dropna=False)
+                        .agg(
+                            helix_like=("CA-trace helix-like elements", "mean"),
+                            extended=("CA-trace extended elements", "mean"),
+                            total=("CA-trace structured elements", "mean"),
+                            designs=("candidate", "count"),
+                        )
+                        .reset_index()
+                    )
+                    ca_trace_long = ca_trace_summary.melt(
+                        id_vars=["engine", "designs"],
+                        value_vars=["helix_like", "extended", "total"],
+                        var_name="CA-trace element type",
+                        value_name="mean count",
+                    ).dropna(subset=["mean count"])
+                    if not ca_trace_long.empty:
+                        st.altair_chart(
+                            alt.Chart(ca_trace_long)
+                            .mark_bar(opacity=0.86)
+                            .encode(
+                                x=alt.X("engine:N", title="engine", sort="-y"),
+                                xOffset=alt.XOffset("CA-trace element type:N"),
+                                y=alt.Y("mean count:Q", title="mean CA-trace elements per binder"),
+                                color=alt.Color(
+                                    "CA-trace element type:N",
+                                    scale=alt.Scale(
+                                        domain=["helix_like", "extended", "total"],
+                                        range=["#06b6d4", "#84cc16", "#111827"],
+                                    ),
+                                ),
+                                tooltip=[
+                                    "engine:N",
+                                    "CA-trace element type:N",
+                                    alt.Tooltip("mean count:Q", format=".2f"),
+                                    "designs:Q",
+                                ],
+                            )
+                            .properties(height=280, width=900, title="Binder CA-trace geometry element counts"),
+                            width="content",
+                            key=f"{run_dir.name}_design_campaign_stats_ca_trace_elements_bar",
+                        )
+                rg_source_df = stats_df.dropna(subset=["hotspot coverage", "binder Rg"]).copy()
+                if not rg_source_df.empty:
+                    st.altair_chart(
+                        alt.Chart(rg_source_df)
+                        .mark_bar(opacity=0.82)
+                        .encode(
+                            x=alt.X("binder Rg:Q", bin=alt.Bin(maxbins=20), title="binder radius of gyration"),
+                            y=alt.Y("count():Q", title="designs"),
+                            color=alt.Color("engine:N", legend=None),
+                            row=alt.Row("engine:N", title=None, header=alt.Header(labelAngle=0, labelAlign="left")),
+                            tooltip=["engine:N", alt.Tooltip("count():Q", title="designs")],
+                        )
+                        .resolve_scale(x="independent", y="independent")
+                        .properties(height=90, width=900),
+                        width="content",
+                        key=f"{run_dir.name}_design_campaign_stats_rg_hist_by_engine",
+                    )
+                    rg_plot_mode = st.segmented_control(
+                        "Rg / hotspot plot",
+                        ["Scatter", "Median per engine", "Mean per engine"],
+                        default="Scatter",
+                        key=f"{run_dir.name}_design_campaign_stats_rg_plot_mode",
+                    ) or "Scatter"
+                    rg_axis_mode = st.segmented_control(
+                        "Rg axis",
+                        [
+                            "Raw Rg",
+                            "Rg normalized by length",
+                            "Rg normalized by structured residues",
+                            "Rg normalized by PyDSSP total elements",
+                            "Rg normalized by CA-trace total elements",
+                        ],
+                        default="Raw Rg",
+                        key=f"{run_dir.name}_design_campaign_stats_rg_axis_mode",
+                    ) or "Raw Rg"
+                    rg_axis_fields = {
+                        "Raw Rg": ("binder Rg", "binder radius of gyration"),
+                        "Rg normalized by length": (
+                            "binder Rg normalized by length",
+                            "binder radius of gyration / binder residues",
+                        ),
+                        "Rg normalized by structured residues": (
+                            "binder Rg normalized by structured residues",
+                            "binder radius of gyration / helix+sheet residues",
+                        ),
+                        "Rg normalized by PyDSSP total elements": (
+                            "binder Rg normalized by secondary structure elements",
+                            "binder radius of gyration / PyDSSP helix+sheet elements",
+                        ),
+                        "Rg normalized by CA-trace total elements": (
+                            "binder Rg normalized by CA-trace elements",
+                            "binder radius of gyration / CA-trace geometry elements",
+                        ),
+                    }
+                    rg_x_field, rg_x_title = rg_axis_fields.get(rg_axis_mode, rg_axis_fields["Raw Rg"])
+                    axis_state_suffix = re.sub(r"[^a-z0-9]+", "_", f"{rg_plot_mode}_{rg_x_field}".lower()).strip("_")
+                    scatter_df = rg_source_df.dropna(subset=[rg_x_field]).copy()
+                    if scatter_df.empty:
+                        st.info("No candidates have the selected Rg axis metric.")
+                    manual_axis_range = st.checkbox(
+                        "Manual axis range",
+                        value=True,
+                        key=f"{run_dir.name}_design_campaign_stats_rg_manual_axis_v2",
+                    )
+                    x_scale = alt.Undefined
+                    y_scale = alt.Scale(domain=[0, 1])
+                    if manual_axis_range:
+                        x_values = pd.to_numeric(scatter_df[rg_x_field], errors="coerce").dropna()
+                        y_values = pd.to_numeric(scatter_df["hotspot coverage"], errors="coerce").dropna()
+                        x_default_min = float(x_values.min()) if not x_values.empty else 0.0
+                        x_default_max = float(x_values.max()) if not x_values.empty else 1.0
+                        if x_default_min == x_default_max:
+                            x_default_max = x_default_min + 1.0
+                        y_default_min = max(0.0, float(y_values.min()) if not y_values.empty else 0.0)
+                        y_default_max = min(1.0, float(y_values.max()) if not y_values.empty else 1.0)
+                        if y_default_min == y_default_max:
+                            y_default_min = 0.0
+                            y_default_max = 1.0
+                        axis_cols = st.columns(4)
+                        x_min = axis_cols[0].number_input(
+                            "X min",
+                            value=x_default_min,
+                            step=0.5,
+                            format="%.3f",
+                            key=f"{run_dir.name}_design_campaign_stats_rg_x_min_{axis_state_suffix}",
+                        )
+                        x_max = axis_cols[1].number_input(
+                            "X max",
+                            value=x_default_max,
+                            step=0.5,
+                            format="%.3f",
+                            key=f"{run_dir.name}_design_campaign_stats_rg_x_max_{axis_state_suffix}",
+                        )
+                        y_min = axis_cols[2].number_input(
+                            "Y min",
+                            value=y_default_min,
+                            step=0.05,
+                            format="%.3f",
+                            key=f"{run_dir.name}_design_campaign_stats_rg_y_min_{axis_state_suffix}",
+                        )
+                        y_max = axis_cols[3].number_input(
+                            "Y max",
+                            value=y_default_max,
+                            step=0.05,
+                            format="%.3f",
+                            key=f"{run_dir.name}_design_campaign_stats_rg_y_max_{axis_state_suffix}",
+                        )
+                        if float(x_max) > float(x_min):
+                            x_scale = alt.Scale(domain=[float(x_min), float(x_max)])
+                        else:
+                            st.warning("X max must be greater than X min; using automatic X range.")
+                        if float(y_max) > float(y_min):
+                            y_scale = alt.Scale(domain=[float(y_min), float(y_max)])
+                        else:
+                            st.warning("Y max must be greater than Y min; using 0-1 Y range.")
+                    if rg_plot_mode == "Scatter":
+                        rg_chart = (
+                            alt.Chart(scatter_df)
+                            .mark_circle(size=70, opacity=0.75)
+                            .encode(
+                                x=alt.X(f"{rg_x_field}:Q", title=rg_x_title, scale=x_scale),
+                                y=alt.Y(
+                                    "hotspot coverage:Q",
+                                    title="hotspot coverage fraction",
+                                    scale=y_scale,
+                                ),
+                                color=alt.Color("engine:N", title="engine"),
+                                tooltip=[
+                                    "engine:N",
+                                    "candidate:N",
+                                    alt.Tooltip("hotspot coverage:Q", format=".2f"),
+                                    alt.Tooltip("binder Rg:Q", format=".2f"),
+                                    alt.Tooltip("binder Rg normalized by length:Q", title="Rg / length", format=".4f"),
                                     alt.Tooltip(
-                                        "rebuilt_backbones:Q",
-                                        title="CA-rebuilt backbones",
-                                        format="d",
+                                        "binder Rg normalized by structured residues:Q",
+                                        title="Rg / structured residues",
+                                        format=".4f",
+                                    ),
+                                    alt.Tooltip(
+                                        "binder Rg normalized by secondary structure elements:Q",
+                                        title="Rg / PyDSSP elements",
+                                        format=".4f",
+                                    ),
+                                    alt.Tooltip(
+                                        "binder Rg normalized by CA-trace elements:Q",
+                                        title="Rg / CA-trace elements",
+                                        format=".4f",
+                                    ),
+                                    "binder residues:Q",
+                                    "binder structured residues:Q",
+                                    alt.Tooltip(
+                                        "binder secondary structure elements:Q",
+                                        title="PyDSSP total elements",
+                                        format=".0f",
+                                    ),
+                                    alt.Tooltip(
+                                        "CA-trace structured elements:Q",
+                                        title="CA-trace total elements",
+                                        format=".0f",
                                     ),
                                 ],
                             )
-                            .properties(height=280, width=900, title="Binder secondary-structure composition"),
-                            width="content",
-                            key=f"{run_dir.name}_design_campaign_stats_secondary_structure_bar",
                         )
-            ss_element_cols = [
-                "binder helix elements",
-                "binder sheet elements",
-                "binder secondary structure elements",
-            ]
-            if all(column in stats_df.columns for column in ss_element_cols):
-                element_source = stats_df.copy()
-                if "binder secondary structure elements" in element_source:
-                    element_source["binder secondary structure elements"] = element_source[
-                        "binder secondary structure elements"
-                    ].fillna(
-                        pd.to_numeric(element_source.get("binder helix elements"), errors="coerce").fillna(0)
-                        + pd.to_numeric(element_source.get("binder sheet elements"), errors="coerce").fillna(0)
-                    )
-                element_summary = (
-                    element_source.groupby("engine", dropna=False)
-                    .agg(
-                        helix=("binder helix elements", "mean"),
-                        sheet=("binder sheet elements", "mean"),
-                        total=("binder secondary structure elements", "mean"),
-                        designs=("candidate", "count"),
-                    )
-                    .reset_index()
-                )
-                element_long = element_summary.melt(
-                    id_vars=["engine", "designs"],
-                    value_vars=["helix", "sheet", "total"],
-                    var_name="element type",
-                    value_name="mean count",
-                ).dropna(subset=["mean count"])
-                if not element_long.empty:
-                    st.altair_chart(
-                        alt.Chart(element_long)
-                        .mark_bar(opacity=0.86)
-                        .encode(
-                            x=alt.X("engine:N", title="engine", sort="-y"),
-                            xOffset=alt.XOffset("element type:N"),
-                            y=alt.Y("mean count:Q", title="mean secondary-structure elements per binder"),
-                            color=alt.Color(
-                                "element type:N",
-                                scale=alt.Scale(
-                                    domain=["helix", "sheet", "total"],
-                                    range=["#2563eb", "#f59e0b", "#111827"],
-                                ),
-                            ),
-                            tooltip=[
-                                "engine:N",
-                                "element type:N",
-                                alt.Tooltip("mean count:Q", format=".2f"),
-                                "designs:Q",
-                            ],
-                        )
-                        .properties(height=280, width=900, title="Binder secondary-structure element counts"),
-                        width="content",
-                        key=f"{run_dir.name}_design_campaign_stats_secondary_structure_elements_bar",
-                    )
-            ca_trace_element_cols = [
-                "CA-trace helix-like elements",
-                "CA-trace extended elements",
-                "CA-trace structured elements",
-            ]
-            if all(column in stats_df.columns for column in ca_trace_element_cols):
-                ca_trace_summary = (
-                    stats_df.groupby("engine", dropna=False)
-                    .agg(
-                        helix_like=("CA-trace helix-like elements", "mean"),
-                        extended=("CA-trace extended elements", "mean"),
-                        total=("CA-trace structured elements", "mean"),
-                        designs=("candidate", "count"),
-                    )
-                    .reset_index()
-                )
-                ca_trace_long = ca_trace_summary.melt(
-                    id_vars=["engine", "designs"],
-                    value_vars=["helix_like", "extended", "total"],
-                    var_name="CA-trace element type",
-                    value_name="mean count",
-                ).dropna(subset=["mean count"])
-                if not ca_trace_long.empty:
-                    st.altair_chart(
-                        alt.Chart(ca_trace_long)
-                        .mark_bar(opacity=0.86)
-                        .encode(
-                            x=alt.X("engine:N", title="engine", sort="-y"),
-                            xOffset=alt.XOffset("CA-trace element type:N"),
-                            y=alt.Y("mean count:Q", title="mean CA-trace elements per binder"),
-                            color=alt.Color(
-                                "CA-trace element type:N",
-                                scale=alt.Scale(
-                                    domain=["helix_like", "extended", "total"],
-                                    range=["#06b6d4", "#84cc16", "#111827"],
-                                ),
-                            ),
-                            tooltip=[
-                                "engine:N",
-                                "CA-trace element type:N",
-                                alt.Tooltip("mean count:Q", format=".2f"),
-                                "designs:Q",
-                            ],
-                        )
-                        .properties(height=280, width=900, title="Binder CA-trace geometry element counts"),
-                        width="content",
-                        key=f"{run_dir.name}_design_campaign_stats_ca_trace_elements_bar",
-                    )
-            rg_source_df = stats_df.dropna(subset=["hotspot coverage", "binder Rg"]).copy()
-            if not rg_source_df.empty:
-                st.altair_chart(
-                    alt.Chart(rg_source_df)
-                    .mark_bar(opacity=0.82)
-                    .encode(
-                        x=alt.X("binder Rg:Q", bin=alt.Bin(maxbins=20), title="binder radius of gyration"),
-                        y=alt.Y("count():Q", title="designs"),
-                        color=alt.Color("engine:N", legend=None),
-                        row=alt.Row("engine:N", title=None, header=alt.Header(labelAngle=0, labelAlign="left")),
-                        tooltip=["engine:N", alt.Tooltip("count():Q", title="designs")],
-                    )
-                    .resolve_scale(x="independent", y="independent")
-                    .properties(height=90, width=900),
-                    width="content",
-                    key=f"{run_dir.name}_design_campaign_stats_rg_hist_by_engine",
-                )
-                rg_plot_mode = st.segmented_control(
-                    "Rg / hotspot plot",
-                    ["Scatter", "Median per engine", "Mean per engine"],
-                    default="Scatter",
-                    key=f"{run_dir.name}_design_campaign_stats_rg_plot_mode",
-                ) or "Scatter"
-                rg_axis_mode = st.segmented_control(
-                    "Rg axis",
-                    [
-                        "Raw Rg",
-                        "Rg normalized by length",
-                        "Rg normalized by structured residues",
-                        "Rg normalized by PyDSSP total elements",
-                        "Rg normalized by CA-trace total elements",
-                    ],
-                    default="Raw Rg",
-                    key=f"{run_dir.name}_design_campaign_stats_rg_axis_mode",
-                ) or "Raw Rg"
-                rg_axis_fields = {
-                    "Raw Rg": ("binder Rg", "binder radius of gyration"),
-                    "Rg normalized by length": (
-                        "binder Rg normalized by length",
-                        "binder radius of gyration / binder residues",
-                    ),
-                    "Rg normalized by structured residues": (
-                        "binder Rg normalized by structured residues",
-                        "binder radius of gyration / helix+sheet residues",
-                    ),
-                    "Rg normalized by PyDSSP total elements": (
-                        "binder Rg normalized by secondary structure elements",
-                        "binder radius of gyration / PyDSSP helix+sheet elements",
-                    ),
-                    "Rg normalized by CA-trace total elements": (
-                        "binder Rg normalized by CA-trace elements",
-                        "binder radius of gyration / CA-trace geometry elements",
-                    ),
-                }
-                rg_x_field, rg_x_title = rg_axis_fields.get(rg_axis_mode, rg_axis_fields["Raw Rg"])
-                axis_state_suffix = re.sub(r"[^a-z0-9]+", "_", f"{rg_plot_mode}_{rg_x_field}".lower()).strip("_")
-                scatter_df = rg_source_df.dropna(subset=[rg_x_field]).copy()
-                if scatter_df.empty:
-                    st.info("No candidates have the selected Rg axis metric.")
-                manual_axis_range = st.checkbox(
-                    "Manual axis range",
-                    value=True,
-                    key=f"{run_dir.name}_design_campaign_stats_rg_manual_axis_v2",
-                )
-                x_scale = alt.Undefined
-                y_scale = alt.Scale(domain=[0, 1])
-                if manual_axis_range:
-                    x_values = pd.to_numeric(scatter_df[rg_x_field], errors="coerce").dropna()
-                    y_values = pd.to_numeric(scatter_df["hotspot coverage"], errors="coerce").dropna()
-                    x_default_min = float(x_values.min()) if not x_values.empty else 0.0
-                    x_default_max = float(x_values.max()) if not x_values.empty else 1.0
-                    if x_default_min == x_default_max:
-                        x_default_max = x_default_min + 1.0
-                    y_default_min = max(0.0, float(y_values.min()) if not y_values.empty else 0.0)
-                    y_default_max = min(1.0, float(y_values.max()) if not y_values.empty else 1.0)
-                    if y_default_min == y_default_max:
-                        y_default_min = 0.0
-                        y_default_max = 1.0
-                    axis_cols = st.columns(4)
-                    x_min = axis_cols[0].number_input(
-                        "X min",
-                        value=x_default_min,
-                        step=0.5,
-                        format="%.3f",
-                        key=f"{run_dir.name}_design_campaign_stats_rg_x_min_{axis_state_suffix}",
-                    )
-                    x_max = axis_cols[1].number_input(
-                        "X max",
-                        value=x_default_max,
-                        step=0.5,
-                        format="%.3f",
-                        key=f"{run_dir.name}_design_campaign_stats_rg_x_max_{axis_state_suffix}",
-                    )
-                    y_min = axis_cols[2].number_input(
-                        "Y min",
-                        value=y_default_min,
-                        step=0.05,
-                        format="%.3f",
-                        key=f"{run_dir.name}_design_campaign_stats_rg_y_min_{axis_state_suffix}",
-                    )
-                    y_max = axis_cols[3].number_input(
-                        "Y max",
-                        value=y_default_max,
-                        step=0.05,
-                        format="%.3f",
-                        key=f"{run_dir.name}_design_campaign_stats_rg_y_max_{axis_state_suffix}",
-                    )
-                    if float(x_max) > float(x_min):
-                        x_scale = alt.Scale(domain=[float(x_min), float(x_max)])
                     else:
-                        st.warning("X max must be greater than X min; using automatic X range.")
-                    if float(y_max) > float(y_min):
-                        y_scale = alt.Scale(domain=[float(y_min), float(y_max)])
-                    else:
-                        st.warning("Y max must be greater than Y min; using 0-1 Y range.")
-                if rg_plot_mode == "Scatter":
-                    rg_chart = (
-                        alt.Chart(scatter_df)
-                        .mark_circle(size=70, opacity=0.75)
-                        .encode(
-                            x=alt.X(f"{rg_x_field}:Q", title=rg_x_title, scale=x_scale),
-                            y=alt.Y(
-                                "hotspot coverage:Q",
-                                title="hotspot coverage fraction",
-                                scale=y_scale,
-                            ),
-                            color=alt.Color("engine:N", title="engine"),
+                        agg_name = "median" if rg_plot_mode == "Median per engine" else "mean"
+                        grouped = scatter_df.groupby("engine", dropna=False)
+                        if agg_name == "median":
+                            agg_df = grouped.agg(
+                                designs=("candidate", "count"),
+                                hotspot_coverage=("hotspot coverage", "median"),
+                                hotspot_low=("hotspot coverage", lambda values: values.quantile(0.25)),
+                                hotspot_high=("hotspot coverage", lambda values: values.quantile(0.75)),
+                                binder_rg=(rg_x_field, "median"),
+                                binder_rg_low=(rg_x_field, lambda values: values.quantile(0.25)),
+                                binder_rg_high=(rg_x_field, lambda values: values.quantile(0.75)),
+                                raw_binder_rg=("binder Rg", "median"),
+                                binder_residues=("binder residues", "median"),
+                                structured_residues=("binder structured residues", "median"),
+                                ss_elements=("binder secondary structure elements", "median"),
+                                ca_trace_elements=("CA-trace structured elements", "median"),
+                            ).reset_index()
+                            spread_label = "IQR"
+                        else:
+                            agg_df = grouped.agg(
+                                designs=("candidate", "count"),
+                                hotspot_coverage=("hotspot coverage", "mean"),
+                                hotspot_std=("hotspot coverage", "std"),
+                                binder_rg=(rg_x_field, "mean"),
+                                binder_rg_std=(rg_x_field, "std"),
+                                raw_binder_rg=("binder Rg", "mean"),
+                                binder_residues=("binder residues", "mean"),
+                                structured_residues=("binder structured residues", "mean"),
+                                ss_elements=("binder secondary structure elements", "mean"),
+                                ca_trace_elements=("CA-trace structured elements", "mean"),
+                            ).reset_index()
+                            agg_df["hotspot_low"] = agg_df["hotspot_coverage"] - agg_df["hotspot_std"].fillna(0)
+                            agg_df["hotspot_high"] = agg_df["hotspot_coverage"] + agg_df["hotspot_std"].fillna(0)
+                            agg_df["binder_rg_low"] = agg_df["binder_rg"] - agg_df["binder_rg_std"].fillna(0)
+                            agg_df["binder_rg_high"] = agg_df["binder_rg"] + agg_df["binder_rg_std"].fillna(0)
+                            spread_label = "SD"
+                        agg_df["hotspot_low"] = agg_df["hotspot_low"].clip(lower=0, upper=1)
+                        agg_df["hotspot_high"] = agg_df["hotspot_high"].clip(lower=0, upper=1)
+                        agg_df["binder_rg_low"] = agg_df["binder_rg_low"].clip(lower=0)
+                        base = alt.Chart(agg_df)
+                        x_axis = alt.X(
+                            "binder_rg:Q",
+                            title=f"{agg_name} {rg_x_title}",
+                            scale=x_scale,
+                        )
+                        y_axis = alt.Y(
+                            "hotspot_coverage:Q",
+                            title=f"{agg_name} hotspot coverage fraction",
+                            scale=y_scale,
+                        )
+                        error_color = alt.Color("engine:N", title="engine")
+                        vertical_error = base.mark_rule(opacity=0.65).encode(
+                            x=x_axis,
+                            y=alt.Y("hotspot_low:Q"),
+                            y2="hotspot_high:Q",
+                            color=error_color,
+                        )
+                        horizontal_error = base.mark_rule(opacity=0.65).encode(
+                            x=alt.X("binder_rg_low:Q"),
+                            x2="binder_rg_high:Q",
+                            y=y_axis,
+                            color=error_color,
+                        )
+                        points = base.mark_circle(size=95, opacity=0.9, stroke="#111827", strokeWidth=0.8).encode(
+                            x=x_axis,
+                            y=y_axis,
+                            color=error_color,
                             tooltip=[
                                 "engine:N",
-                                "candidate:N",
-                                alt.Tooltip("hotspot coverage:Q", format=".2f"),
-                                alt.Tooltip("binder Rg:Q", format=".2f"),
-                                alt.Tooltip("binder Rg normalized by length:Q", title="Rg / length", format=".4f"),
+                                "designs:Q",
+                                alt.Tooltip("hotspot_coverage:Q", title=f"{agg_name} hotspot coverage", format=".2f"),
+                                alt.Tooltip("binder_rg:Q", title=f"{agg_name} selected Rg axis", format=".4f"),
+                                alt.Tooltip("raw_binder_rg:Q", title=f"{agg_name} raw binder Rg", format=".2f"),
+                                alt.Tooltip("hotspot_low:Q", title=f"hotspot low ({spread_label})", format=".2f"),
+                                alt.Tooltip("hotspot_high:Q", title=f"hotspot high ({spread_label})", format=".2f"),
+                                alt.Tooltip("binder_rg_low:Q", title=f"binder Rg low ({spread_label})", format=".2f"),
+                                alt.Tooltip("binder_rg_high:Q", title=f"binder Rg high ({spread_label})", format=".2f"),
+                                alt.Tooltip("binder_residues:Q", title=f"{agg_name} binder residues", format=".1f"),
                                 alt.Tooltip(
-                                    "binder Rg normalized by structured residues:Q",
-                                    title="Rg / structured residues",
-                                    format=".4f",
+                                    "structured_residues:Q",
+                                    title=f"{agg_name} structured residues",
+                                    format=".1f",
                                 ),
+                                alt.Tooltip("ss_elements:Q", title=f"{agg_name} PyDSSP total elements", format=".1f"),
                                 alt.Tooltip(
-                                    "binder Rg normalized by secondary structure elements:Q",
-                                    title="Rg / PyDSSP elements",
-                                    format=".4f",
-                                ),
-                                alt.Tooltip(
-                                    "binder Rg normalized by CA-trace elements:Q",
-                                    title="Rg / CA-trace elements",
-                                    format=".4f",
-                                ),
-                                "binder residues:Q",
-                                "binder structured residues:Q",
-                                alt.Tooltip(
-                                    "binder secondary structure elements:Q",
-                                    title="PyDSSP total elements",
-                                    format=".0f",
-                                ),
-                                alt.Tooltip(
-                                    "CA-trace structured elements:Q",
-                                    title="CA-trace total elements",
-                                    format=".0f",
+                                    "ca_trace_elements:Q",
+                                    title=f"{agg_name} CA-trace total elements",
+                                    format=".1f",
                                 ),
                             ],
                         )
+                        rg_chart = vertical_error + horizontal_error + points
+                    st.altair_chart(
+                        rg_chart.properties(height=340),
+                        width="stretch",
+                        key=f"{run_dir.name}_design_campaign_stats_rg_{axis_state_suffix}",
+                    )
+        if plot_tabs[1].open:
+            with plot_tabs[1]:
+                if hotspot_rows:
+                    hotspot_df = pd.DataFrame(hotspot_rows)
+                    matrix_df = (
+                        hotspot_df.groupby(["engine", "hotspot"], dropna=False)["contacted"].mean().reset_index()
+                    )
+                    st.altair_chart(
+                        alt.Chart(matrix_df)
+                        .mark_rect()
+                        .encode(
+                            x=alt.X("hotspot:N", title="hotspot"),
+                            y=alt.Y("engine:N", title="engine"),
+                            color=alt.Color(
+                                "contacted:Q",
+                                title="contact frequency",
+                                scale=alt.Scale(domain=[0, 1], scheme="greens"),
+                            ),
+                            tooltip=["engine:N", "hotspot:N", alt.Tooltip("contacted:Q", format=".0%")],
+                        )
+                        .properties(height=max(220, 28 * max(1, matrix_df["engine"].nunique()))),
+                        width="stretch",
+                        key=f"{run_dir.name}_design_campaign_stats_hotspot_matrix",
                     )
                 else:
-                    agg_name = "median" if rg_plot_mode == "Median per engine" else "mean"
-                    grouped = scatter_df.groupby("engine", dropna=False)
-                    if agg_name == "median":
-                        agg_df = grouped.agg(
-                            designs=("candidate", "count"),
-                            hotspot_coverage=("hotspot coverage", "median"),
-                            hotspot_low=("hotspot coverage", lambda values: values.quantile(0.25)),
-                            hotspot_high=("hotspot coverage", lambda values: values.quantile(0.75)),
-                            binder_rg=(rg_x_field, "median"),
-                            binder_rg_low=(rg_x_field, lambda values: values.quantile(0.25)),
-                            binder_rg_high=(rg_x_field, lambda values: values.quantile(0.75)),
-                            raw_binder_rg=("binder Rg", "median"),
-                            binder_residues=("binder residues", "median"),
-                            structured_residues=("binder structured residues", "median"),
-                            ss_elements=("binder secondary structure elements", "median"),
-                            ca_trace_elements=("CA-trace structured elements", "median"),
-                        ).reset_index()
-                        spread_label = "IQR"
-                    else:
-                        agg_df = grouped.agg(
-                            designs=("candidate", "count"),
-                            hotspot_coverage=("hotspot coverage", "mean"),
-                            hotspot_std=("hotspot coverage", "std"),
-                            binder_rg=(rg_x_field, "mean"),
-                            binder_rg_std=(rg_x_field, "std"),
-                            raw_binder_rg=("binder Rg", "mean"),
-                            binder_residues=("binder residues", "mean"),
-                            structured_residues=("binder structured residues", "mean"),
-                            ss_elements=("binder secondary structure elements", "mean"),
-                            ca_trace_elements=("CA-trace structured elements", "mean"),
-                        ).reset_index()
-                        agg_df["hotspot_low"] = agg_df["hotspot_coverage"] - agg_df["hotspot_std"].fillna(0)
-                        agg_df["hotspot_high"] = agg_df["hotspot_coverage"] + agg_df["hotspot_std"].fillna(0)
-                        agg_df["binder_rg_low"] = agg_df["binder_rg"] - agg_df["binder_rg_std"].fillna(0)
-                        agg_df["binder_rg_high"] = agg_df["binder_rg"] + agg_df["binder_rg_std"].fillna(0)
-                        spread_label = "SD"
-                    agg_df["hotspot_low"] = agg_df["hotspot_low"].clip(lower=0, upper=1)
-                    agg_df["hotspot_high"] = agg_df["hotspot_high"].clip(lower=0, upper=1)
-                    agg_df["binder_rg_low"] = agg_df["binder_rg_low"].clip(lower=0)
-                    base = alt.Chart(agg_df)
-                    x_axis = alt.X(
-                        "binder_rg:Q",
-                        title=f"{agg_name} {rg_x_title}",
-                        scale=x_scale,
-                    )
-                    y_axis = alt.Y(
-                        "hotspot_coverage:Q",
-                        title=f"{agg_name} hotspot coverage fraction",
-                        scale=y_scale,
-                    )
-                    error_color = alt.Color("engine:N", title="engine")
-                    vertical_error = base.mark_rule(opacity=0.65).encode(
-                        x=x_axis,
-                        y=alt.Y("hotspot_low:Q"),
-                        y2="hotspot_high:Q",
-                        color=error_color,
-                    )
-                    horizontal_error = base.mark_rule(opacity=0.65).encode(
-                        x=alt.X("binder_rg_low:Q"),
-                        x2="binder_rg_high:Q",
-                        y=y_axis,
-                        color=error_color,
-                    )
-                    points = base.mark_circle(size=95, opacity=0.9, stroke="#111827", strokeWidth=0.8).encode(
-                        x=x_axis,
-                        y=y_axis,
-                        color=error_color,
-                        tooltip=[
-                            "engine:N",
-                            "designs:Q",
-                            alt.Tooltip("hotspot_coverage:Q", title=f"{agg_name} hotspot coverage", format=".2f"),
-                            alt.Tooltip("binder_rg:Q", title=f"{agg_name} selected Rg axis", format=".4f"),
-                            alt.Tooltip("raw_binder_rg:Q", title=f"{agg_name} raw binder Rg", format=".2f"),
-                            alt.Tooltip("hotspot_low:Q", title=f"hotspot low ({spread_label})", format=".2f"),
-                            alt.Tooltip("hotspot_high:Q", title=f"hotspot high ({spread_label})", format=".2f"),
-                            alt.Tooltip("binder_rg_low:Q", title=f"binder Rg low ({spread_label})", format=".2f"),
-                            alt.Tooltip("binder_rg_high:Q", title=f"binder Rg high ({spread_label})", format=".2f"),
-                            alt.Tooltip("binder_residues:Q", title=f"{agg_name} binder residues", format=".1f"),
-                            alt.Tooltip(
-                                "structured_residues:Q",
-                                title=f"{agg_name} structured residues",
-                                format=".1f",
-                            ),
-                            alt.Tooltip("ss_elements:Q", title=f"{agg_name} PyDSSP total elements", format=".1f"),
-                            alt.Tooltip(
-                                "ca_trace_elements:Q",
-                                title=f"{agg_name} CA-trace total elements",
-                                format=".1f",
-                            ),
-                        ],
-                    )
-                    rg_chart = vertical_error + horizontal_error + points
-                st.altair_chart(
-                    rg_chart.properties(height=340),
+                    st.info("No configured hotspots were available for a hotspot matrix.")
+        if plot_tabs[2].open:
+            with plot_tabs[2]:
+                st.dataframe(
+                    stats_df,
+                    hide_index=True,
                     width="stretch",
-                    key=f"{run_dir.name}_design_campaign_stats_rg_{axis_state_suffix}",
-                )
-        with plot_tabs[1]:
-            if hotspot_rows:
-                hotspot_df = pd.DataFrame(hotspot_rows)
-                matrix_df = (
-                    hotspot_df.groupby(["engine", "hotspot"], dropna=False)["contacted"].mean().reset_index()
-                )
-                st.altair_chart(
-                    alt.Chart(matrix_df)
-                    .mark_rect()
-                    .encode(
-                        x=alt.X("hotspot:N", title="hotspot"),
-                        y=alt.Y("engine:N", title="engine"),
-                        color=alt.Color(
-                            "contacted:Q",
-                            title="contact frequency",
-                            scale=alt.Scale(domain=[0, 1], scheme="greens"),
+                    column_config={
+                        "hotspot coverage": st.column_config.NumberColumn("hotspot coverage", format="%.2f"),
+                        "hotspot min distance": st.column_config.NumberColumn("hotspot min distance", format="%.2f"),
+                        "binder Rg": st.column_config.NumberColumn("binder Rg", format="%.2f"),
+                        "binder Rg normalized by length": st.column_config.NumberColumn("Rg / length", format="%.4f"),
+                        "binder Rg normalized by structured residues": st.column_config.NumberColumn(
+                            "Rg / structured residues",
+                            format="%.4f",
                         ),
-                        tooltip=["engine:N", "hotspot:N", alt.Tooltip("contacted:Q", format=".0%")],
-                    )
-                    .properties(height=max(220, 28 * max(1, matrix_df["engine"].nunique()))),
-                    width="stretch",
-                    key=f"{run_dir.name}_design_campaign_stats_hotspot_matrix",
+                        "binder Rg normalized by secondary structure elements": st.column_config.NumberColumn(
+                            "Rg / SS elements",
+                            format="%.4f",
+                        ),
+                    },
                 )
-            else:
-                st.info("No configured hotspots were available for a hotspot matrix.")
-        with plot_tabs[2]:
-            st.dataframe(
-                stats_df,
-                hide_index=True,
-                width="stretch",
-                column_config={
-                    "hotspot coverage": st.column_config.NumberColumn("hotspot coverage", format="%.2f"),
-                    "hotspot min distance": st.column_config.NumberColumn("hotspot min distance", format="%.2f"),
-                    "binder Rg": st.column_config.NumberColumn("binder Rg", format="%.2f"),
-                    "binder Rg normalized by length": st.column_config.NumberColumn("Rg / length", format="%.4f"),
-                    "binder Rg normalized by structured residues": st.column_config.NumberColumn(
-                        "Rg / structured residues",
-                        format="%.4f",
-                    ),
-                    "binder Rg normalized by secondary structure elements": st.column_config.NumberColumn(
-                        "Rg / SS elements",
-                        format="%.4f",
-                    ),
-                },
-            )
 
 
 def _design_campaign_structure_selector_data(

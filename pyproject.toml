@@ -17,6 +17,9 @@ dependencies = [
   "typer",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<10"]
+
 [project.scripts]
 mn-protein-design = "mn_protein_design.cli:main"
 
@@ -33,3 +36,7 @@ include = ["mn_protein_design*"]
   "pipelines/**/*.config",
   "app/components/molstar_viewer/frontend/build/*",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

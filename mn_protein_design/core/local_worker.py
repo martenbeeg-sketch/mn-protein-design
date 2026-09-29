@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import traceback
@@ -8,6 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from mn_protein_design.core.jobs import JobPaths, finish_job, read_json, update_status, utc_now, write_json
+from mn_protein_design.core.scheduler import (
+    run_worker_service,
+    service_owner_pid,
+    worker_service_dir,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +52,16 @@ def run_worker_job(run_dir: Path) -> int:
             from mn_protein_design.workflows.design_campaigns import run_design_campaign
 
             run_design_campaign(run_dir)
+            return 0
+        if kind == "workflow_call":
+            from mn_protein_design.core.workflow_queue import run_workflow_call
+
+            run_workflow_call(run_dir, request)
+            return 0
+        if kind == "bindcraft2_design":
+            from mn_protein_design.workflows.bindcraft2 import run_bindcraft2_job
+
+            run_bindcraft2_job(run_dir)
             return 0
         if kind == "target_preparation":
             from mn_protein_design.workflows.target_prep import run_queued_target_preparation
@@ -214,35 +230,58 @@ def run_worker_job(run_dir: Path) -> int:
         return 1
 
 
-def spawn_worker_for_run(run_dir: Path) -> subprocess.Popen:
+def ensure_worker_service() -> subprocess.Popen | None:
+    """Start the detached queue service if it is not already running."""
+    owner_pid = service_owner_pid()
+    if owner_pid:
+        try:
+            os.kill(owner_pid, 0)
+            return None
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return None
+    service_root = worker_service_dir()
+    service_root.mkdir(parents=True, exist_ok=True)
+    log_path = service_root / "worker.log"
+    with log_path.open("a") as log_handle:
+        return subprocess.Popen(
+            [sys.executable, "-m", "mn_protein_design.core.local_worker", "--service"],
+            cwd=str(REPO_ROOT),
+            stdout=log_handle,
+            stderr=log_handle,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+
+def spawn_worker_for_run(run_dir: Path) -> subprocess.Popen | None:
+    """Wake the persistent queue service for an already queued worker job.
+
+    The service scans the file-backed queue, so this call does not tie execution
+    to the Streamlit process or the browser session.
+    """
     run_dir = run_dir.expanduser().resolve()
-    stdout = (run_dir / "worker_stdout.log").open("a")
-    stderr = (run_dir / "worker_stderr.log").open("a")
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "mn_protein_design.core.local_worker",
-            "--run-dir",
-            str(run_dir),
-        ],
-        cwd=str(REPO_ROOT),
-        stdout=stdout,
-        stderr=stderr,
-        start_new_session=True,
-    )
+    if not (run_dir / "worker_request.json").is_file():
+        raise FileNotFoundError(f"Queued worker job has no worker_request.json: {run_dir}")
     metadata = read_json(run_dir / "metadata.json")
-    metadata["worker_pid"] = proc.pid
-    metadata["worker_started_at"] = utc_now()
-    metadata["updated_at"] = metadata["worker_started_at"]
+    metadata["scheduler_dispatch_requested"] = True
+    metadata["scheduler_dispatch_requested_at"] = utc_now()
+    metadata["updated_at"] = metadata["scheduler_dispatch_requested_at"]
     write_json(run_dir / "metadata.json", metadata)
-    return proc
+    return ensure_worker_service()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a queued mn-protein-design local worker job.")
-    parser.add_argument("--run-dir", required=True, type=Path)
+    parser = argparse.ArgumentParser(description="Run the mn-protein-design worker service or one queued job.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--run-dir", type=Path, help="Run one queued job directly.")
+    mode.add_argument("--service", action="store_true", help="Run the persistent local queue service.")
+    parser.add_argument("--cpu-slots", type=int, default=None, help="CPU slots available to the service.")
+    parser.add_argument("--poll-seconds", type=float, default=2.0, help="Queue polling interval.")
     args = parser.parse_args()
+    if args.service:
+        raise SystemExit(run_worker_service(cpu_slots=args.cpu_slots, poll_seconds=args.poll_seconds))
     raise SystemExit(run_worker_job(args.run_dir))
 
 

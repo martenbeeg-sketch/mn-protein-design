@@ -11,6 +11,7 @@ from mn_protein_design.core.artifacts import Artifact, artifact_path
 from mn_protein_design.core.gpu import docker_gpu_args, gpu_queue_resource, normalize_gpu_device
 from mn_protein_design.core.jobs import JobPaths, collect_jobs, create_job, finish_job, read_json, update_status, write_json
 from mn_protein_design.core.manifests import load_manifest
+from mn_protein_design.core.scheduler import apply_docker_cpu_limits_to_steps
 from mn_protein_design.core.structures import filter_pdb_text, pdb_summary, sanitize_pdb_for_surface_tools
 from mn_protein_design.runtime import PROJECT_DIR, app_home
 
@@ -325,6 +326,7 @@ def target_label(row: dict) -> str:
 
 
 def _run_shell_steps(run_dir: Path, steps: list[dict]) -> int:
+    steps = apply_docker_cpu_limits_to_steps(run_dir, steps)
     write_json(run_dir / "command.json", {"mode": "docker", "steps": steps})
     update_status(run_dir, "running")
     with (run_dir / "stdout.log").open("w") as stdout, (run_dir / "stderr.log").open("w") as stderr:

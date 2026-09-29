@@ -20,6 +20,8 @@ from mn_protein_design.core.jobs import (
     update_status,
     write_json,
 )
+from mn_protein_design.core.portable_paths import resolve_stored_path, store_managed_paths
+from mn_protein_design.core.scheduler import apply_docker_cpu_limit
 from mn_protein_design.core.local_worker import spawn_worker_for_run
 from mn_protein_design.runtime import runs_root
 from mn_protein_design.workflows.analysis import _run_ipsae
@@ -52,6 +54,7 @@ ENGINE_ORDER = (
     "template_redesign",
     "rfdiffusion_classic",
     "bindcraft",
+    "bindcraft2",
     "rfdiffusion3_foundry",
     "boltzgen",
     "pxdesign",
@@ -115,6 +118,7 @@ ENGINE_LABELS = {
     "template_redesign": "Template redesign",
     "rfdiffusion_classic": "RFdiffusion classic",
     "bindcraft": "BindCraft",
+    "bindcraft2": "BindCraft 2",
     "rfdiffusion3_foundry": "RFdiffusion3 / Foundry",
     "boltzgen": "BoltzGen",
     "pxdesign": "PXDesign",
@@ -157,8 +161,14 @@ def _refolder_default_use_target_msa(refolder: str) -> bool:
 
 
 GENERATOR_ONLY_RECIPES = {"staged", "engine_scout"}
+VANILLA_ONLY_ENGINES = {"bindcraft2"}
 NATIVE_SEQUENCE_GENERATOR_ENGINES = {"esmfold2_binder_design", "proteina_complexa"}
-LEVEL1_SEQUENCE_REQUIRED_ENGINES = set(ENGINE_ORDER) - NATIVE_SEQUENCE_GENERATOR_ENGINES - {"template_redesign"}
+LEVEL1_SEQUENCE_REQUIRED_ENGINES = (
+    set(ENGINE_ORDER)
+    - NATIVE_SEQUENCE_GENERATOR_ENGINES
+    - VANILLA_ONLY_ENGINES
+    - {"template_redesign"}
+)
 
 
 def _staged_native_outputs_per_attempt(refinement_config: dict[str, Any] | None) -> int:
@@ -320,7 +330,7 @@ def _restrict_fragmented_target_evaluation(config: dict[str, Any], *, target_pdb
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PYROSETTA_METRICS_SCRIPT = REPO_ROOT / "tools_to_implement" / "de_novo_binder_scoring" / "scripts" / "compute_rosetta_metrics.py"
 PYROSETTA_METRICS_WORKDIR = REPO_ROOT / "tools_to_implement" / "de_novo_binder_scoring"
-PYROSETTA_METRICS_IMAGE = "ovo-bindcraft:latest"
+PYROSETTA_METRICS_IMAGE = "mn-bindcraft:latest"
 COMMON_AF2_THRESHOLDS = {
     "model_1_binder_plddt": (80.0, "higher"),
     "model_2_binder_plddt": (80.0, "higher"),
@@ -462,16 +472,16 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[float, ...]:
 def _absolute_candidate_paths(candidate: dict[str, Any], child_run: Path) -> dict[str, Any]:
     normalized = dict(candidate)
     for key in ("target_pdb", "complex_pdb", "binder_pdb"):
-        value = str(normalized.get(key) or "").strip()
-        if value and not Path(value).is_absolute():
-            normalized[key] = str((child_run / value).resolve())
+        resolved = resolve_stored_path(normalized.get(key), run_dir=child_run, must_exist=True)
+        if resolved is not None:
+            normalized[key] = str(resolved)
     raw_metadata = dict(normalized.get("raw_metadata") or {})
     for key, value in list(raw_metadata.items()):
         if not key.endswith(("_path", "_pdb", "_json", "_npz")):
             continue
-        text = str(value or "").strip()
-        if text and not Path(text).is_absolute() and (child_run / text).exists():
-            raw_metadata[key] = str((child_run / text).resolve())
+        resolved = resolve_stored_path(value, run_dir=child_run, must_exist=True)
+        if resolved is not None:
+            raw_metadata[key] = str(resolved)
     normalized["raw_metadata"] = raw_metadata
     return normalized
 
@@ -589,7 +599,9 @@ def _all_child_candidates(child_runs: list[dict[str, Any]]) -> list[dict[str, An
 
 def _write_candidate_jsonl(path: Path, candidates: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(candidate, sort_keys=True) + "\n" for candidate in candidates))
+    path.write_text(
+        "".join(json.dumps(store_managed_paths(candidate), sort_keys=True) + "\n" for candidate in candidates)
+    )
 
 
 def _threshold_failures(
@@ -849,6 +861,7 @@ def _run_common_pyrosetta(
     with (run_dir / "stdout.log").open("a") as stdout, (run_dir / "stderr.log").open("a") as stderr:
         stdout.write(f"$ {' '.join(command)}\n")
         stdout.flush()
+        command = apply_docker_cpu_limit(command, run_dir)
         rc = subprocess.run(command, stdout=stdout, stderr=stderr, check=False).returncode
     rows: dict[str, dict[str, Any]] = {}
     if output_csv.exists():
@@ -1536,11 +1549,8 @@ def harmonize_validated_candidates(
 
 
 def _candidate_structure_path(run_dir: Path, candidate: dict[str, Any]) -> Path | None:
-    value = str(candidate.get("complex_pdb") or candidate.get("binder_pdb") or "").strip()
-    if not value:
-        return None
-    path = Path(value)
-    return path if path.is_absolute() else run_dir / path
+    value = candidate.get("complex_pdb") or candidate.get("binder_pdb")
+    return resolve_stored_path(value, run_dir=run_dir)
 
 
 def _candidate_refinement_pdb(
@@ -3365,6 +3375,7 @@ def _run_engine(
     random_seed: int,
     gpu_device: str,
     config: dict[str, Any],
+    parent_run_dir: Path | None = None,
 ) -> Path | list[Path]:
     runners: dict[str, Callable[..., Path]] = {
         "bindcraft": run_bindcraft,
@@ -3377,7 +3388,7 @@ def _run_engine(
         "protpardelle_1c": run_protpardelle_1c,
         "proteina_complexa": run_proteina_complexa,
     }
-    if engine not in runners:
+    if engine not in runners and engine != "bindcraft2":
         raise ValueError(f"Unsupported design campaign engine: {engine}")
     staged_design_only = str(config.get("campaign_workflow_recipe") or "") == "staged_backbone_sequence_refold"
 
@@ -3387,6 +3398,26 @@ def _run_engine(
         "campaign_name": campaign_name,
         "gpu_device": gpu_device,
     }
+    if engine == "bindcraft2":
+        from mn_protein_design.workflows.bindcraft2 import run_bindcraft2_campaign
+
+        if parent_run_dir is None:
+            raise ValueError("BindCraft 2 campaign workflows require their parent campaign run directory.")
+        return run_bindcraft2_campaign(
+            parent_run_dir=parent_run_dir,
+            target_pdb=target_pdb,
+            target_chains=target_chains,
+            binder_length=(config.get("binder_length") if "binder_length" in config else binder_length),
+            hotspots=str(config.get("hotspots") or hotspots),
+            modality=config.get("modality") or "binder",
+            design_properties=list(config.get("design_properties") or []),
+            number_of_final_designs=int(config.get("number_of_final_designs", design_attempts)),
+            max_trajectories=int(config.get("max_trajectories", design_attempts)),
+            campaign_seed=int(config.get("campaign_seed", random_seed)),
+            workers_per_gpu=config.get("workers_per_gpu", "auto"),
+            cpu_cores=int(config.get("cpu_cores", 1)),
+            gpu_device=gpu_device,
+        )
     if engine == "esmfold2_binder_design":
         requested_length = str(config.get("binder_length") or binder_length)
         sampled_lengths = _sample_fixed_binder_lengths(
@@ -3757,6 +3788,9 @@ def run_design_campaign(run_dir: Path) -> Path:
     engine_configs = params.get("engine_configs") if isinstance(params.get("engine_configs"), dict) else {}
     campaign_name = str(params.get("campaign_name") or "").strip()
     workflow_recipe = str(params.get("workflow_recipe") or "vanilla")
+    if workflow_recipe in GENERATOR_ONLY_RECIPES and set(engines).intersection(VANILLA_ONLY_ENGINES):
+        unavailable = ", ".join(ENGINE_LABELS[engine] for engine in sorted(set(engines).intersection(VANILLA_ONLY_ENGINES)))
+        raise ValueError(f"{unavailable} is currently available only in the vanilla campaign workflow.")
     continue_after_failure = bool(params.get("continue_after_failure", True))
     design_attempts = max(1, int(params.get("design_attempts", 1)))
     sequences_per_backbone = max(1, int(params.get("sequences_per_backbone", 1)))
@@ -3878,6 +3912,7 @@ def run_design_campaign(run_dir: Path) -> Path:
                 random_seed=random_seed,
                 gpu_device=str(params.get("gpu_device") or "0"),
                 config=engine_config,
+                parent_run_dir=run_dir,
             )
             engine_child_runs = child_run_result if isinstance(child_run_result, list) else [child_run_result]
             engine_success = True
@@ -4243,6 +4278,10 @@ def create_design_campaign(
     gpu_device: str = "0",
 ) -> Path:
     selected_engines = [engine for engine in ENGINE_ORDER if engine in engines and engine != "template_redesign"]
+    unsupported_generator_engines = set(selected_engines).intersection(VANILLA_ONLY_ENGINES)
+    if workflow_recipe in GENERATOR_ONLY_RECIPES and unsupported_generator_engines:
+        labels = ", ".join(ENGINE_LABELS[engine] for engine in sorted(unsupported_generator_engines))
+        raise ValueError(f"{labels} is currently available only in the vanilla campaign workflow.")
     normalized_engine_configs = {engine: dict(config) for engine, config in (engine_configs or {}).items()}
     if workflow_recipe in GENERATOR_ONLY_RECIPES:
         for engine in selected_engines:
@@ -4294,6 +4333,14 @@ def create_design_campaign(
         "evaluation": dict(evaluation or {"mode": "none"}),
         "gpu_device": str(gpu_device),
     }
+    if "bindcraft2" in selected_engines:
+        try:
+            cpu_cores = int(normalized_engine_configs.get("bindcraft2", {}).get("cpu_cores", 1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("BindCraft 2 campaign CPU core request must be a positive integer.") from exc
+        if cpu_cores < 1:
+            raise ValueError("BindCraft 2 campaign CPU core request must be a positive integer.")
+        params["cpu_cores"] = cpu_cores
     job = create_job(
         DESIGN_CAMPAIGN_GROUP,
         "multi_engine_design_campaign",

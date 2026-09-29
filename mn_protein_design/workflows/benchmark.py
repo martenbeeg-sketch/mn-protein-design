@@ -41,16 +41,16 @@ from mn_protein_design.workflows import target_msa as target_msa_workflow
 
 
 BENCHMARK_GROUP = "benchmark"
-ESMFOLD2_IMAGE = "mnprot-biohub-esm-cu128:latest"
-SCORING_SCRIPTS_IMAGE = "ovo-python-structure:latest"
-PYROSETTA_METRICS_IMAGE = "ovo-bindcraft:latest"
+ESMFOLD2_IMAGE = "mn-biohub-esm:cu128"
+SCORING_SCRIPTS_IMAGE = "mn-python-structure:latest"
+PYROSETTA_METRICS_IMAGE = "mn-bindcraft:latest"
 PYMOL_PYTHON = Path("/home/user/mambaforge/envs/mn-protein-design/bin/python")
-AF2_INITIAL_GUESS_IMAGE = "ovo-bindcraft:latest"
-COLABFOLD_IMAGE = "mnprot-colabfold-cuda12:1.6.1"
+AF2_INITIAL_GUESS_IMAGE = "mn-bindcraft:latest"
+COLABFOLD_IMAGE = "mn-colabfold:1.6.1-cu12"
 COLABFOLD_CACHE_DIR = Path("/mnt/db/reference_files/alphafold_models")
 MSA_REPOSITORY_DIR = target_msa_workflow.BOLTZ_MSA_REPOSITORY_DIR
-BOLTZ2_IMAGE = "ovoex-boltz2:latest"
-ALPHAFAST_IMAGE = "alphafast:latest"
+BOLTZ2_IMAGE = "mn-boltz2:cu128"
+ALPHAFAST_IMAGE = "mn-alphafast:cu128"
 ALPHAFAST_DB_DIR = Path("/mnt/db/reference_files/alignment")
 ALPHAFAST_WEIGHTS_DIR = Path("/mnt/db/reference_files/alphafold3")
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -3545,6 +3545,9 @@ def _apply_staged_csv_metadata_to_run_csv(run_csv: Path, staged_csv: Path | None
 
 
 def _run_docker_command(run_dir: Path, command: list[str]) -> int:
+    from mn_protein_design.core.scheduler import apply_docker_cpu_limit
+
+    command = apply_docker_cpu_limit(command, run_dir)
     with (run_dir / "stdout.log").open("a") as stdout, (run_dir / "stderr.log").open("a") as stderr:
         stdout.write(f"$ {' '.join(command)}\n")
         stdout.flush()
@@ -8055,7 +8058,7 @@ def run_de_novo_binder_scoring_dataset(
         "colabfold": f"Available after building containers/colabfold/Dockerfile as {COLABFOLD_IMAGE}; it runs generated ColabFold/input_folder A3M files directly and uses {COLABFOLD_CACHE_DIR} for weights.",
         "boltz2_initial_guess": f"Available through the app refolding adapter using {BOLTZ2_IMAGE}; benchmark wiring reuses run_boltz2_complex_refolding.",
         "af3": f"AlphaFast AF3 benchmark is wired through {ALPHAFAST_IMAGE}. It requires generated AF3/input_folder JSONs, an AlphaFast database directory, and AF3 weights.",
-        "pyrosetta_rosetta_metrics": "Available now via ovo-bindcraft:latest for compute_rosetta_metrics.py. RMSD should also be possible because PyRosetta imports, but still needs a workflow toggle/output merge.",
+        "pyrosetta_rosetta_metrics": "Available now via mn-bindcraft:latest for compute_rosetta_metrics.py. RMSD should also be possible because PyRosetta imports, but still needs a workflow toggle/output merge.",
         "pymol_metrics": "Available through pymol-open-source in the mn-protein-design conda environment; benchmark wiring stages input/predicted PDB folders and runs pymol_metrics.py.",
     }
     write_json(job.run_dir / "artifacts" / "benchmark" / "missing_external_tool_images.json", missing_images)

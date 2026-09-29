@@ -66,7 +66,7 @@ Example current Protenix CLI layout:
 host:       /mnt/db/reference_files/protenix
 container:  /ref/protenix
 env:        PROTENIX_ROOT_DIR=/ref/protenix
-image:      mnprot-protenix-cu128:latest
+image:      mn-protenix:cu128
 dockerfile: containers/protenix/Dockerfile
 ```
 
@@ -98,7 +98,7 @@ docker run --rm --gpus ... --shm-size=32G
   -w /work
   -e PROTENIX_ROOT_DIR=/ref/protenix
   -e CUTLASS_PATH=/opt/cutlass
-  mnprot-protenix-cu128:latest
+  mn-protenix:cu128
   protenix pred
     -i /work/<input_dir_or_batch_dir>
     -o /work/<output_dir>
@@ -656,7 +656,7 @@ Current standalone Protenix items to verify in code:
 At the time this guide was last updated, current code used:
 
 ```text
-PROTENIX_CLI_IMAGE = "mnprot-protenix-cu128:latest"
+PROTENIX_CLI_IMAGE = "mn-protenix:cu128"
 PROTENIX_CLI_REFERENCE_DIR = /mnt/db/reference_files/protenix
 PROTENIX_V1_MODEL = "protenix_base_default_v1.0.0"
 PROTENIX_V1_20250630_MODEL = "protenix_base_20250630_v1.0.0"

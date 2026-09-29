@@ -1,6 +1,6 @@
 tool: scannet
 group: detection
-image: mnprot-scannet:latest
+image: mn-scannet:cpu
 gpu: false
 description: ScanNet residue-level PPI/interface prediction.
 inputs:

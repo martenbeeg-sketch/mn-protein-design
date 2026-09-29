@@ -13,6 +13,7 @@ import numpy as np
 from mn_protein_design.core.candidates import STAGE_COMPLEX_REFOLDING, write_candidates
 from mn_protein_design.core.gpu import docker_gpu_args, normalize_gpu_device
 from mn_protein_design.core.jobs import create_job, finish_job, update_status, write_json
+from mn_protein_design.core.scheduler import apply_docker_cpu_limit
 from mn_protein_design.core.structures import filter_pdb_text
 
 
@@ -21,7 +22,7 @@ BIOHUB_ESM_ROOT = Path("/mnt/db/reference_files/biohub-esm")
 ESMFOLD2_MODEL_DIR = BIOHUB_ESM_ROOT / "ESMFold2"
 ESMC_MODEL_DIR = BIOHUB_ESM_ROOT / "ESMC-6B"
 ESMFOLD2_BINDER_MODEL_ROOT = BIOHUB_ESM_ROOT / "binder-design"
-ESMFOLD2_BINDER_IMAGE = "mnprot-biohub-esm-cu128:latest"
+ESMFOLD2_BINDER_IMAGE = "mn-biohub-esm:cu128"
 DEFAULT_BINDER_MODEL = "ESMFold2-Experimental-Fast"
 VENDORED_ESM_DIR = Path(__file__).resolve().parents[2] / "tools_to_implement" / "esm"
 AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
@@ -640,8 +641,9 @@ def run_esmfold2_native_binder_design(
         "--config",
         "/work/artifacts/raw/esmfold2_binder_design/config/binder_design.json",
     ]
-    write_json(job.run_dir / "command.json", {"mode": "docker", "steps": [{"name": "esmfold2_binder_design", "command": command}]})
     update_status(job.run_dir, "running")
+    command = apply_docker_cpu_limit(command, job.run_dir)
+    write_json(job.run_dir / "command.json", {"mode": "docker", "steps": [{"name": "esmfold2_binder_design", "command": command}]})
     with (job.run_dir / "stdout.log").open("a") as stdout, (job.run_dir / "stderr.log").open("a") as stderr:
         proc = subprocess.run(command, stdout=stdout, stderr=stderr, check=False)
     rc = int(proc.returncode)

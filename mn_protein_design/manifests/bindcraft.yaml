@@ -1,6 +1,6 @@
 tool: bindcraft
 group: design
-image: ovo-bindcraft:latest
+image: mn-bindcraft:latest
 gpu: true
 description: BindCraft binder design or reduced trajectory generation against a prepared target.
 inputs:

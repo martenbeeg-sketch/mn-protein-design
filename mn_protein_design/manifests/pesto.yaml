@@ -1,6 +1,6 @@
 tool: pesto
 group: detection
-image: mnprot-pesto-cu128:latest
+image: mn-pesto:cu128
 gpu: true
 description: PeSTo residue-level protein interaction interface prediction.
 inputs:

@@ -2,7 +2,7 @@ nextflow.enable.dsl = 2
 
 params.input_pdb = null
 params.publish_dir = "output"
-params.rfdiffusion_image = "ovo-rfdiffusion:latest"
+params.rfdiffusion_image = "mn-rfdiffusion:latest"
 params.rfdiffusion_num_designs = 1
 params.rfdiffusion_contig = null
 params.hotspot = ""

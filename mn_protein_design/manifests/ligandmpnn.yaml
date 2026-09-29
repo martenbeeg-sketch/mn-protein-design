@@ -1,6 +1,6 @@
 tool: ligandmpnn
 group: design
-image: ovo-ligandmpnn:latest
+image: mn-ligandmpnn:latest
 gpu: true
 description: LigandMPNN container used as shared sequence-design backend for RFdiffusion and compatible PDB candidates.
 inputs:

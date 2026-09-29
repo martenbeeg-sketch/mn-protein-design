@@ -22,6 +22,7 @@ from mn_protein_design.core.jobs import (
     stop_job,
 )
 from mn_protein_design.core.gpu import available_gpu_devices
+from mn_protein_design.core.scheduler import configured_cpu_slots
 from mn_protein_design.core.runtime_estimator import collect_runtime_observations, estimate_job_runtime_with_observations
 from mn_protein_design.runtime import runs_root
 from mn_protein_design.workflows.campaigns import run_lineage_steps
@@ -466,6 +467,8 @@ def render_job_table(task_group: str | list[str] | None = None, rows_override: l
             "tool_detail",
             "status",
             "queue_resource",
+            "resource_allocation",
+            "scheduler_wait_reason",
             "current_phase",
             "current_engine",
             "estimated_time",
@@ -675,6 +678,25 @@ def gpu_run_panel(*, key: str, default: str = "0") -> str:
         help="Pins Docker-backed GPU jobs to a host GPU. Inside a pinned container, the selected GPU appears as cuda:0.",
     )
     return str(selected_gpu)
+
+
+def cpu_run_panel(*, key: str, default: int = 4) -> int:
+    capacity = configured_cpu_slots()
+    options = [value for value in (1, 2, 4, 8, 16, 32, 64) if value <= capacity]
+    if capacity not in options:
+        options.append(capacity)
+    options = sorted(set(options))
+    selected_default = min(max(1, int(default)), capacity)
+    selected_default = min(options, key=lambda value: abs(value - selected_default))
+    return int(
+        st.selectbox(
+            "Reserved CPU slots",
+            options,
+            index=options.index(selected_default),
+            key=f"{key}_cpu_slots",
+            help="The worker reserves this many CPU slots for the job and passes the allocation to Docker and CPU thread libraries.",
+        )
+    )
 
 
 def source_from_run_dir(run_dir: Path) -> dict:

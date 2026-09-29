@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 from mn_protein_design.core.gpu import docker_gpu_args
+from mn_protein_design.core.scheduler import apply_docker_cpu_limit
 from mn_protein_design.runtime import runs_root
 
 
@@ -37,7 +38,7 @@ AA3_TO_1 = {
 _A3M_SEQUENCE_ALLOWED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-")
 BOLTZ_CACHE_DIR = Path("/mnt/db/reference_files/boltz_models")
 BOLTZ_MSA_REPOSITORY_DIR = BOLTZ_CACHE_DIR / "msa_repository"
-ALPHAFAST_IMAGE = "alphafast:latest"
+ALPHAFAST_IMAGE = "mn-alphafast:cu128"
 ALPHAFAST_DB_DIR = Path("/mnt/db/reference_files/alignment")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -395,6 +396,7 @@ def _ensure_alphafast_mmseqs_msa_for_sequence(
         stdout.write(f"$ {' '.join(command)}\n")
         stdout.write(f"Local AlphaFast/MMseqs MSA cache miss for {label}\n")
         stdout.flush()
+        command = apply_docker_cpu_limit(command, run_dir)
         completed = subprocess.run(command, stdout=stdout, stderr=stderr, check=False)
     if completed.returncode != 0:
         raise RuntimeError(f"AlphaFast/MMseqs MSA preparation failed for {label} with return code {completed.returncode}.")
@@ -464,7 +466,7 @@ def ensure_boltz_msa_for_sequence(
         "BOLTZ_CACHE=/cache",
         "--ipc=host",
         "--shm-size=48G",
-        "ovoex-boltz2",
+        "mn-boltz2:cu128",
         "predict",
         "/work/input.yaml",
         "--out_dir",
@@ -484,6 +486,7 @@ def ensure_boltz_msa_for_sequence(
         stdout.write(f"$ {' '.join(command)}\n")
         stdout.write(f"MSA cache miss for {label}: {host_path} ({reason})\n")
         stdout.flush()
+        command = apply_docker_cpu_limit(command, run_dir)
         completed = subprocess.run(command, stdout=stdout, stderr=stderr, check=False)
     if completed.returncode != 0:
         raise RuntimeError(f"Boltz2 MSA preflight failed for {label} with return code {completed.returncode}.")

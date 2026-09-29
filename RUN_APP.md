@@ -66,6 +66,6 @@ sudo install -m 0644 \
 Sequence-design uses existing images:
 
 ```text
-ovo-ligandmpnn:latest
-ovoex-foundry-cu128:latest
+mn-ligandmpnn:latest
+mn-foundry:cu128
 ```

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from mn_protein_design.core.portable_paths import portable_path
+
 
 @dataclass(frozen=True)
 class Artifact:
@@ -14,11 +16,12 @@ class Artifact:
     description: str = ""
 
     def to_json(self, run_dir: Path) -> dict:
-        try:
-            rel_path = self.path.relative_to(run_dir)
-        except ValueError:
-            rel_path = self.path
-        return {"name": self.name, "path": str(rel_path), "type": self.type, "description": self.description}
+        return {
+            "name": self.name,
+            "path": portable_path(self.path, run_dir=run_dir),
+            "type": self.type,
+            "description": self.description,
+        }
 
 
 def artifact_path(run_dir: Path, *parts: str) -> Path:

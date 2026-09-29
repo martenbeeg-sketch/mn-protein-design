@@ -1,6 +1,6 @@
 tool: foundry_mpnn
 group: design
-image: ovoex-foundry-cu128:latest
+image: mn-foundry:cu128
 gpu: true
 description: Foundry-native LigandMPNN sequence design for RFdiffusion3 / Foundry CIF candidates.
 inputs:

@@ -1,6 +1,6 @@
 tool: rfdiffusion_classic
 group: design
-image: ovo-rfdiffusion:latest
+image: mn-rfdiffusion:latest
 gpu: true
 description: RFdiffusion classic binder-backbone generation against a prepared target.
 inputs:

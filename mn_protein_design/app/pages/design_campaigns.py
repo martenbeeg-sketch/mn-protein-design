@@ -35,9 +35,11 @@ from mn_protein_design.workflows.design_campaigns import (
     DESIGN_CAMPAIGN_GROUP,
     ENGINE_LABELS,
     ENGINE_ORDER,
+    VANILLA_ONLY_ENGINES,
     create_design_campaign,
     create_design_campaign_collection,
 )
+from mn_protein_design.workflows import bindcraft2 as bindcraft2_workflow
 
 ResidueId = tuple[str, int]
 
@@ -1291,7 +1293,11 @@ with workflows_tab:
         else:
             staged_design_tab = st.container()
             staged_sequence_tab = None
-        staged_engine_order = [engine for engine in ENGINE_ORDER if engine != "template_redesign"]
+        staged_engine_order = [
+            engine
+            for engine in ENGINE_ORDER
+            if engine != "template_redesign" and engine not in VANILLA_ONLY_ENGINES
+        ]
         with staged_design_tab:
             staged_default_engines = list(staged_engine_order)
             selected_engines = st.multiselect(
@@ -1710,6 +1716,7 @@ with workflows_tab:
     continue_after_failure = True
 
     engine_configs: dict[str, dict] = {}
+    bindcraft2_campaign_ready = True
     show_engine_settings = not generator_only_recipe or bool(show_staged_engine_settings)
     if "rfdiffusion_classic" in selected_engines and show_engine_settings:
         with engine_settings_host.expander("RFdiffusion classic", expanded=True):
@@ -1881,6 +1888,112 @@ with workflows_tab:
                 "time_limit_seconds": int(bindcraft_minutes) * 60 if bindcraft_minutes else None,
                 "advanced_settings_file": bindcraft_preset_options[str(bindcraft_preset_label)],
                 "filter_settings": bindcraft_filter_settings,
+            }
+
+    if "bindcraft2" in selected_engines and show_engine_settings:
+        with engine_settings_host.expander("BindCraft 2", expanded=True):
+            st.caption(
+                "Runs the complete native campaign: trajectory generation, ProteinMPNN redesign, "
+                "AlphaFold validation, native filters, and ranking. This is currently a vanilla-only workflow."
+            )
+            image_ready = bindcraft2_workflow.bindcraft2_image_available()
+            if not image_ready:
+                st.warning(
+                    f"Container missing: {bindcraft2_workflow.BINDCRAFT2_IMAGE}. "
+                    "Build it with `bash containers/bindcraft2/build.sh`."
+                )
+            reference_path = bindcraft2_workflow.bindcraft2_reference_directory()
+            missing_parameters = bindcraft2_workflow.missing_bindcraft2_parameters()
+            if missing_parameters:
+                st.warning(
+                    f"Seven AlphaFold checkpoints are required under {reference_path}; missing or incomplete: "
+                    + ", ".join(missing_parameters)
+                )
+            elif image_ready:
+                st.success("BindCraft 2 image and AlphaFold checkpoints are ready.")
+            bindcraft2_campaign_ready = image_ready and not missing_parameters
+
+            bc2_cols = st.columns(3)
+            with bc2_cols[0]:
+                bc2_binder_format = st.selectbox(
+                    "BC2 binder format",
+                    bindcraft2_workflow.BC2_BINDER_FORMATS,
+                    key="dc_bindcraft2_modality",
+                    help="These are BindCraft 2's native binder-format presets; BC1 presets are separate.",
+                )
+            with bc2_cols[1]:
+                bc2_max_trajectories = st.number_input(
+                    "Maximum trajectories",
+                    min_value=1,
+                    max_value=1000,
+                    value=int(design_attempts),
+                    key="dc_bindcraft2_max_trajectories",
+                    help="BindCraft 2 stops after this many trajectories or after reaching the accepted-design target.",
+                )
+            with bc2_cols[2]:
+                bc2_final_designs = st.number_input(
+                    "Desired accepted designs",
+                    min_value=1,
+                    max_value=1000,
+                    value=min(5, int(design_attempts)),
+                    key="dc_bindcraft2_final_designs",
+                )
+            bc2_objective_options = [None, *bindcraft2_workflow.BC2_CONFORMATIONAL_OBJECTIVES] if bc2_binder_format == "binder" else [None]
+            bc2_objective = st.selectbox(
+                "BC2 conformational objective",
+                bc2_objective_options,
+                format_func=lambda value: "None" if value is None else value,
+                key="dc_bindcraft2_objective",
+                help="induced_fit and fold_switch are optional objectives for the de novo binder format.",
+            )
+            bc2_modality = [bc2_binder_format] + ([bc2_objective] if bc2_objective else [])
+            bc2_binder_length = st.text_input(
+                "BC2 binder-length override (optional)",
+                value="",
+                key=f"dc_bindcraft2_binder_length_{bc2_binder_format}",
+                help="Leave blank to use the selected BC2 modality preset's length choices. Enter one length or a min-max range to override.",
+            ).strip()
+            preset_lengths = bindcraft2_workflow.BC2_PRESET_LENGTHS.get(bc2_binder_format)
+            st.caption(
+                "BC2 preset lengths: "
+                + (f"{preset_lengths[0]}–{preset_lengths[1]} residues" if preset_lengths else "defined by the selected scaffold")
+                + ". The shared length setting for other engines does not override this BC2 preset."
+            )
+            bc2_properties = st.multiselect(
+                "BC2 design properties",
+                list(bindcraft2_workflow.BC2_PROPERTY_PRESETS),
+                format_func=lambda value: value.replace("_", " "),
+                key="dc_bindcraft2_properties",
+                help="Optional BindCraft 2 property presets. forced_targeting requires hotspots; some combinations are biologically incompatible.",
+            )
+            st.caption("BC2 loads its own modality and property preset defaults. The campaign hotspot selection above is applied to this workflow.")
+            resource_cols = st.columns(2)
+            with resource_cols[0]:
+                bc2_workers = st.selectbox(
+                    "Workers per GPU",
+                    bindcraft2_workflow.WORKERS_PER_GPU_OPTIONS,
+                    format_func=lambda value: "BC2 automatic" if value == "auto" else str(value),
+                    key="dc_bindcraft2_workers_per_gpu",
+                    help="Automatic uses BindCraft 2's memory-aware worker packing.",
+                )
+            with resource_cols[1]:
+                bc2_cpu_options, bc2_default_cpu = bindcraft2_workflow.bindcraft2_cpu_options()
+                bc2_cpu_cores = st.selectbox(
+                    "Reserved CPU cores",
+                    bc2_cpu_options,
+                    index=bc2_cpu_options.index(bc2_default_cpu),
+                    key="dc_bindcraft2_cpu_cores",
+                    help="Reserved by the campaign scheduler and applied to the BindCraft 2 Docker container.",
+                )
+            engine_configs["bindcraft2"] = {
+                "modality": bc2_modality,
+                "binder_length": bc2_binder_length or None,
+                "design_properties": bc2_properties,
+                "max_trajectories": int(bc2_max_trajectories),
+                "number_of_final_designs": int(bc2_final_designs),
+                "campaign_seed": int(random_seed),
+                "workers_per_gpu": bc2_workers,
+                "cpu_cores": int(bc2_cpu_cores),
             }
 
     if "rfdiffusion3_foundry" in selected_engines and show_engine_settings:
@@ -2453,6 +2566,16 @@ with run_tab:
                 ),
             }
         )
+    if "bindcraft2" in selected_engines:
+        bc2_config = engine_configs.get("bindcraft2", {})
+        execution_rows.append(
+            {
+                "workflow": "BindCraft 2",
+                "generation workload": f"up to {int(bc2_config.get('max_trajectories', design_attempts))} trajectories",
+                "sequence workload": "native ProteinMPNN redesign and AlphaFold validation",
+                "native final limit": f"up to {int(bc2_config.get('number_of_final_designs', 1))} accepted designs",
+            }
+        )
     if "rfdiffusion3_foundry" in selected_engines:
         execution_rows.append(
             {
@@ -2700,6 +2823,7 @@ with run_tab:
         or (not selected_engines and not template_ready)
         or not binder_length.strip()
         or (template_enabled and not template_ready)
+        or ("bindcraft2" in selected_engines and not bindcraft2_campaign_ready)
     )
     if st.button("Run design campaign", type="primary", disabled=launch_disabled, width="stretch"):
         run_dir = create_design_campaign(

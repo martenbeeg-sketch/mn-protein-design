@@ -1547,167 +1547,172 @@ def _render_target_refolding_result_browser(runs: list[dict[str, object]], *, ke
     )
 
 
-import_tab, analysis_tab, masking_tab, refolding_tab = st.tabs(["Import / Prepare", "Target Analysis", "Mutation / Masking", "Target Refolding"])
+import_tab, analysis_tab, masking_tab, refolding_tab = st.tabs(
+    ["Import / Prepare", "Target Analysis", "Mutation / Masking", "Target Refolding"],
+    key="target_preparation_tabs",
+    on_change="rerun",
+)
 
-with import_tab:
-    left, right = st.columns([0.9, 1.25], gap="large")
-    with left:
-        st.subheader("Import")
-        source_mode = st.radio(
-            "Source",
-            ["Download from PDB", "AlphaFold DB", "Upload PDB"],
-            horizontal=True,
-            label_visibility="collapsed",
-        )
-        if source_mode == "Download from PDB":
-            pdb_id = st.text_input("PDB ID", placeholder="1BRS").strip()
-            if st.button("Download structure", disabled=not pdb_id):
-                try:
-                    with st.spinner(f"Downloading {pdb_id.upper()} from RCSB PDB..."):
-                        _store_source(pdb_id.upper(), download_pdb(pdb_id))
-                    st.success(f"Imported {pdb_id.upper()}")
-                except Exception as exc:
-                    st.error(str(exc))
-        elif source_mode == "AlphaFold DB":
-            afdb_id = st.text_input(
-                "UniProt accession or AlphaFold DB PDB URL",
-                placeholder="P0DTC2 or https://alphafold.ebi.ac.uk/files/AF-P0DTC2-F1-model_v4.pdb",
-            ).strip()
-            if st.button("Download AlphaFold DB structure", disabled=not afdb_id):
-                try:
-                    label = Path(afdb_id.rstrip("/")).stem if afdb_id.startswith(("http://", "https://")) else afdb_id.upper()
-                    with st.spinner(f"Downloading {label} from AlphaFold DB..."):
-                        _store_source(label, download_alphafold_db_pdb(afdb_id))
-                    st.success(f"Imported {label}")
-                except Exception as exc:
-                    st.error(str(exc))
-        else:
-            uploaded = st.file_uploader("PDB file", type=["pdb", "ent"])
-            if uploaded is not None and st.button("Import uploaded structure"):
-                pdb_text = uploaded.getvalue().decode("utf-8", errors="replace")
-                _store_source(uploaded.name, pdb_text)
-                st.success(f"Imported {uploaded.name}")
-
-        if state["pdb_text"]:
-            summary = pdb_summary(state["pdb_text"])
-            st.subheader("Prepare")
-            chain_options = [chain["chain_id"] for chain in summary["chains"]]
-            state["selected_chains"] = st.multiselect(
-                "Chains to keep",
-                options=chain_options,
-                default=[chain for chain in state["selected_chains"] if chain in chain_options] or chain_options,
+if import_tab.open:
+    with import_tab:
+        left, right = st.columns([0.9, 1.25], gap="large")
+        with left:
+            st.subheader("Import")
+            source_mode = st.radio(
+                "Source",
+                ["Download from PDB", "AlphaFold DB", "Upload PDB"],
+                horizontal=True,
+                label_visibility="collapsed",
             )
-            state["remove_waters"] = st.checkbox("Remove waters", value=state["remove_waters"])
-            state["remove_hetero"] = st.checkbox("Remove hetero atoms", value=state["remove_hetero"])
-            state["prepare_msa"] = st.checkbox(
-                "Prepare shared target MSAs",
-                value=state.get("prepare_msa", True),
-                help="Caches one A3M per selected target chain in the shared sequence-hashed MSA repository.",
-            )
-            nonstandard = detect_nonstandard_residues(_selected_text_for_nonstandard_detection())
-            if nonstandard:
-                st.warning(f"Detected {len(nonstandard)} nonstandard residue(s) in the selected target.")
-                with st.expander("Nonstandard residues", expanded=True):
-                    st.dataframe(nonstandard, hide_index=True, width="stretch")
-                known_mappable = [residue for residue in nonstandard if residue.get("known_mapping")]
-                state["map_known_modified_residues"] = bool(known_mappable) and st.checkbox(
-                    "Repair known non-canonical residues",
-                    value=state["map_known_modified_residues"],
-                )
-                state["replace_nonstandard_residues"] = st.checkbox(
-                    "Replace nonstandard residues with PDBFixer",
-                    value=state["replace_nonstandard_residues"],
-                )
+            if source_mode == "Download from PDB":
+                pdb_id = st.text_input("PDB ID", placeholder="1BRS").strip()
+                if st.button("Download structure", disabled=not pdb_id):
+                    try:
+                        with st.spinner(f"Downloading {pdb_id.upper()} from RCSB PDB..."):
+                            _store_source(pdb_id.upper(), download_pdb(pdb_id))
+                        st.success(f"Imported {pdb_id.upper()}")
+                    except Exception as exc:
+                        st.error(str(exc))
+            elif source_mode == "AlphaFold DB":
+                afdb_id = st.text_input(
+                    "UniProt accession or AlphaFold DB PDB URL",
+                    placeholder="P0DTC2 or https://alphafold.ebi.ac.uk/files/AF-P0DTC2-F1-model_v4.pdb",
+                ).strip()
+                if st.button("Download AlphaFold DB structure", disabled=not afdb_id):
+                    try:
+                        label = Path(afdb_id.rstrip("/")).stem if afdb_id.startswith(("http://", "https://")) else afdb_id.upper()
+                        with st.spinner(f"Downloading {label} from AlphaFold DB..."):
+                            _store_source(label, download_alphafold_db_pdb(afdb_id))
+                        st.success(f"Imported {label}")
+                    except Exception as exc:
+                        st.error(str(exc))
             else:
-                state["map_known_modified_residues"] = False
-                state["replace_nonstandard_residues"] = False
-                st.caption("No nonstandard residues detected in the selected target.")
+                uploaded = st.file_uploader("PDB file", type=["pdb", "ent"])
+                if uploaded is not None and st.button("Import uploaded structure"):
+                    pdb_text = uploaded.getvalue().decode("utf-8", errors="replace")
+                    _store_source(uploaded.name, pdb_text)
+                    st.success(f"Imported {uploaded.name}")
 
-            st.subheader("Trim")
-            for chain in summary["chains"]:
-                chain_id = chain["chain_id"]
-                if chain_id not in state["selected_chains"]:
-                    continue
-                residues = chain["residues"]
-                if not residues:
-                    continue
-                current = state["trim_ranges"].get(chain_id, [residues[0], residues[-1]])
-                start_default = min(max(int(current[0]), residues[0]), residues[-1])
-                end_default = min(max(int(current[1]), residues[0]), residues[-1])
-                start_col, end_col = st.columns(2)
-                start = start_col.number_input(
-                    f"{chain_id} start",
-                    min_value=residues[0],
-                    max_value=residues[-1],
-                    value=start_default,
-                    step=1,
-                    key=f"target_prep_{chain_id}_start",
+            if state["pdb_text"]:
+                summary = pdb_summary(state["pdb_text"])
+                st.subheader("Prepare")
+                chain_options = [chain["chain_id"] for chain in summary["chains"]]
+                state["selected_chains"] = st.multiselect(
+                    "Chains to keep",
+                    options=chain_options,
+                    default=[chain for chain in state["selected_chains"] if chain in chain_options] or chain_options,
                 )
-                end = end_col.number_input(
-                    f"{chain_id} end",
-                    min_value=residues[0],
-                    max_value=residues[-1],
-                    value=max(end_default, start),
-                    step=1,
-                    key=f"target_prep_{chain_id}_end",
+                state["remove_waters"] = st.checkbox("Remove waters", value=state["remove_waters"])
+                state["remove_hetero"] = st.checkbox("Remove hetero atoms", value=state["remove_hetero"])
+                state["prepare_msa"] = st.checkbox(
+                    "Prepare shared target MSAs",
+                    value=state.get("prepare_msa", True),
+                    help="Caches one A3M per selected target chain in the shared sequence-hashed MSA repository.",
                 )
-                if end < start:
-                    st.error(f"Chain {chain_id}: end residue must be >= start residue.")
-                state["trim_ranges"][chain_id] = [int(start), int(end)]
-
-            target_name = st.text_input("Target name", value=state["source_name"] or "target")
-            can_submit = bool(state["source_path"] and state["selected_chains"] and _trimmed_preview_text().strip())
-            if st.button("Create target preparation job", type="primary", disabled=not can_submit):
-                ranges = [f"{selection.chain_id}:{selection.start}-{selection.end}" for selection in _residue_selections()]
-                run_dir = enqueue_target_preparation(
-                    Path(state["source_path"]),
-                    target_name=target_name.strip() or state["source_name"] or "target",
-                    keep_chains=state["selected_chains"],
-                    residue_range_text=", ".join(ranges),
-                    remove_waters=state["remove_waters"],
-                    remove_hetero=state["remove_hetero"],
-                    map_known_modified_residues=state["map_known_modified_residues"],
-                    replace_nonstandard_residues=state["replace_nonstandard_residues"],
-                    prepare_msa=state.get("prepare_msa", True),
-                )
-                spawn_worker_for_run(run_dir)
-                st.success(f"Target preparation queued: {run_dir.name}")
-                st.markdown(f"[Open result](/results?task_group=target-prep&run_id={run_dir.name})")
-
-    with right:
-        st.subheader("Preview")
-        if not state["pdb_text"]:
-            st.info("Import a target structure to show the Mol* viewer.")
-        else:
-            preview_mode = st.radio("Preview", ["Trimmed preview", "Original"], horizontal=True, label_visibility="collapsed")
-            pdb_text = _trimmed_preview_text() if preview_mode == "Trimmed preview" else state["pdb_text"]
-            summary = pdb_summary(pdb_text)
-            cols = st.columns(4)
-            cols[0].metric("Chains", len(summary["chains"]))
-            cols[1].metric("Residues", sum(chain["residue_count"] for chain in summary["chains"]))
-            cols[2].metric("Atoms", summary["atom_count"])
-            cols[3].metric("Waters", summary["water_count"])
-            molstar_custom_component(
-                structures=[
-                    StructureVisualization(
-                        pdb=pdb_text,
-                        color="chain-id",
-                        representation_type="cartoon+ball-and-stick",
+                nonstandard = detect_nonstandard_residues(_selected_text_for_nonstandard_detection())
+                if nonstandard:
+                    st.warning(f"Detected {len(nonstandard)} nonstandard residue(s) in the selected target.")
+                    with st.expander("Nonstandard residues", expanded=True):
+                        st.dataframe(nonstandard, hide_index=True, width="stretch")
+                    known_mappable = [residue for residue in nonstandard if residue.get("known_mapping")]
+                    state["map_known_modified_residues"] = bool(known_mappable) and st.checkbox(
+                        "Repair known non-canonical residues",
+                        value=state["map_known_modified_residues"],
                     )
-                ],
-                key=f"target_prep_viewer_{preview_mode}_{state['source_name']}",
-                height=680,
-                show_controls=True,
-                download_filename=f"{state['source_name'] or 'target'}_preview",
-            )
+                    state["replace_nonstandard_residues"] = st.checkbox(
+                        "Replace nonstandard residues with PDBFixer",
+                        value=state["replace_nonstandard_residues"],
+                    )
+                else:
+                    state["map_known_modified_residues"] = False
+                    state["replace_nonstandard_residues"] = False
+                    st.caption("No nonstandard residues detected in the selected target.")
 
-    st.divider()
-    st.subheader("Target Library")
-    st.caption(
-        "Select target rows to remove completed target-preparation jobs from the registry. "
-        "Rows generated from bundled benchmark/reference files are shown for context but are not deletable here."
-    )
-    _render_target_library_manager(key_prefix="target_import_library")
+                st.subheader("Trim")
+                for chain in summary["chains"]:
+                    chain_id = chain["chain_id"]
+                    if chain_id not in state["selected_chains"]:
+                        continue
+                    residues = chain["residues"]
+                    if not residues:
+                        continue
+                    current = state["trim_ranges"].get(chain_id, [residues[0], residues[-1]])
+                    start_default = min(max(int(current[0]), residues[0]), residues[-1])
+                    end_default = min(max(int(current[1]), residues[0]), residues[-1])
+                    start_col, end_col = st.columns(2)
+                    start = start_col.number_input(
+                        f"{chain_id} start",
+                        min_value=residues[0],
+                        max_value=residues[-1],
+                        value=start_default,
+                        step=1,
+                        key=f"target_prep_{chain_id}_start",
+                    )
+                    end = end_col.number_input(
+                        f"{chain_id} end",
+                        min_value=residues[0],
+                        max_value=residues[-1],
+                        value=max(end_default, start),
+                        step=1,
+                        key=f"target_prep_{chain_id}_end",
+                    )
+                    if end < start:
+                        st.error(f"Chain {chain_id}: end residue must be >= start residue.")
+                    state["trim_ranges"][chain_id] = [int(start), int(end)]
+
+                target_name = st.text_input("Target name", value=state["source_name"] or "target")
+                can_submit = bool(state["source_path"] and state["selected_chains"] and _trimmed_preview_text().strip())
+                if st.button("Create target preparation job", type="primary", disabled=not can_submit):
+                    ranges = [f"{selection.chain_id}:{selection.start}-{selection.end}" for selection in _residue_selections()]
+                    run_dir = enqueue_target_preparation(
+                        Path(state["source_path"]),
+                        target_name=target_name.strip() or state["source_name"] or "target",
+                        keep_chains=state["selected_chains"],
+                        residue_range_text=", ".join(ranges),
+                        remove_waters=state["remove_waters"],
+                        remove_hetero=state["remove_hetero"],
+                        map_known_modified_residues=state["map_known_modified_residues"],
+                        replace_nonstandard_residues=state["replace_nonstandard_residues"],
+                        prepare_msa=state.get("prepare_msa", True),
+                    )
+                    spawn_worker_for_run(run_dir)
+                    st.success(f"Target preparation queued: {run_dir.name}")
+                    st.markdown(f"[Open result](/results?task_group=target-prep&run_id={run_dir.name})")
+
+        with right:
+            st.subheader("Preview")
+            if not state["pdb_text"]:
+                st.info("Import a target structure to show the Mol* viewer.")
+            else:
+                preview_mode = st.radio("Preview", ["Trimmed preview", "Original"], horizontal=True, label_visibility="collapsed")
+                pdb_text = _trimmed_preview_text() if preview_mode == "Trimmed preview" else state["pdb_text"]
+                summary = pdb_summary(pdb_text)
+                cols = st.columns(4)
+                cols[0].metric("Chains", len(summary["chains"]))
+                cols[1].metric("Residues", sum(chain["residue_count"] for chain in summary["chains"]))
+                cols[2].metric("Atoms", summary["atom_count"])
+                cols[3].metric("Waters", summary["water_count"])
+                molstar_custom_component(
+                    structures=[
+                        StructureVisualization(
+                            pdb=pdb_text,
+                            color="chain-id",
+                            representation_type="cartoon+ball-and-stick",
+                        )
+                    ],
+                    key=f"target_prep_viewer_{preview_mode}_{state['source_name']}",
+                    height=680,
+                    show_controls=True,
+                    download_filename=f"{state['source_name'] or 'target'}_preview",
+                )
+
+        st.divider()
+        st.subheader("Target Library")
+        st.caption(
+            "Select target rows to remove completed target-preparation jobs from the registry. "
+            "Rows generated from bundled benchmark/reference files are shown for context but are not deletable here."
+        )
+        _render_target_library_manager(key_prefix="target_import_library")
 
 def _render_target_masking_tab() -> None:
     targets = ppi_target_jobs()
@@ -2289,927 +2294,930 @@ def _render_target_analysis_tab() -> None:
         )
 
 
-with analysis_tab:
-    _render_target_analysis_tab()
+if analysis_tab.open:
+    with analysis_tab:
+        _render_target_analysis_tab()
 
 
-with masking_tab:
-    _render_target_masking_tab()
+if masking_tab.open:
+    with masking_tab:
+        _render_target_masking_tab()
 
-with refolding_tab:
-    select_tab, engines_tab, run_tab, refold_results_tab = st.tabs(["Select Target", "Engines", "Run Refolding", "Results"])
-    targets = ppi_target_jobs()
-    target_rows = _target_structure_rows(targets) if targets else pd.DataFrame()
-    selected_entries: list[dict] = []
+if refolding_tab.open:
+    with refolding_tab:
+        select_tab, engines_tab, run_tab, refold_results_tab = st.tabs(["Select Target", "Engines", "Run Refolding", "Results"])
+        targets = ppi_target_jobs()
+        target_rows = _target_structure_rows(targets) if targets else pd.DataFrame()
+        selected_entries: list[dict] = []
 
-    with select_tab:
-        if target_rows.empty:
-            st.info("No prepared, imported, cropped, or benchmark targets are available yet.")
-        else:
-            filter_cols = st.columns([1, 4])
-            category_options = _target_category_options(str(value) for value in target_rows["category"].dropna().unique() if str(value))
-            selected_categories = filter_cols[0].multiselect("Category", category_options, default=category_options)
-            search_text = filter_cols[1].text_input("Search targets", value="", placeholder="Target name, chain, source, or job code")
-            filtered_rows = target_rows.copy()
-            if selected_categories:
-                filtered_rows = filtered_rows[filtered_rows["category"].astype(str).isin(selected_categories)]
-            if search_text.strip():
-                needle = search_text.strip().lower()
-                filtered_rows = filtered_rows[
-                    filtered_rows.apply(lambda row: needle in " ".join(str(value).lower() for value in row.values), axis=1)
-                ]
-            table_rows = filtered_rows.drop(columns=["_target_index", "delete_job"], errors="ignore").copy()
-            table_rows.insert(0, "select", False)
-            edited = st.data_editor(
-                table_rows,
-                hide_index=True,
-                width="stretch",
-                height=290,
-                disabled=["target", "chains", "chain_count", "aa_length", "fragments", "breaks", "source", "category", "job", "records", "path"],
-                column_config={
-                    "select": st.column_config.CheckboxColumn("Select"),
-                    "chain_count": st.column_config.NumberColumn("Chains", format="%d"),
-                    "aa_length": st.column_config.NumberColumn("AA", format="%d"),
-                    "fragments": st.column_config.NumberColumn("Fragments", format="%d"),
-                    "breaks": st.column_config.NumberColumn("Breaks", format="%d"),
-                    "path": st.column_config.TextColumn("PDB path", width="large"),
-                },
-                key="target_refolding_chain_table",
-            )
-            selected_entries = _selected_target_structure_entries(edited, filtered_rows, targets)
-            if len(selected_entries) > 1:
-                st.warning("Target refolding runs one target structure at a time. Keeping the first selected row.")
-                selected_entries = selected_entries[:1]
-            if selected_entries:
-                selected = selected_entries[0]
-                st.session_state["target_refolding_selected_entries"] = selected_entries
-                selected_with_breaks = [entry for entry in selected_entries if _target_break_count(entry) > 0]
-                st.session_state["target_refold_selected_break_count"] = len(selected_with_breaks)
-                if selected_with_breaks:
-                    st.warning(
-                        f"{len(selected_with_breaks)} selected target structure(s) contain residue-number breaks. "
-                        "Default engines are restricted to AF2-IG and Boltz-2 for structure-assisted refolding."
-                    )
-                preview_chains = [str(chain) for chain in selected.get("target_entity_chains") or [] if str(chain)] or [str(selected["chain"])]
-                st.markdown(f"**Preview:** {selected['target_name']} chain(s) {','.join(preview_chains)}")
-                target_text = filter_pdb_text(
-                    Path(str(selected["target_pdb"])).read_text(errors="ignore"),
-                    keep_chains=set(preview_chains),
-                    remove_waters=True,
-                    remove_hetero=True,
-                )
-                molstar_custom_component(
-                    structures=[
-                        StructureVisualization(
-                            pdb=target_text,
-                            color="chain-id",
-                            representation_type="cartoon+ball-and-stick",
-                        )
-                    ],
-                    key=f"target_refolding_selected_viewer_{selected['target_pdb']}_{'-'.join(preview_chains)}",
-                    height=560,
-                    show_controls=True,
-                    download_filename=f"{selected['target_name']}_{'_'.join(preview_chains)}",
-                )
+        with select_tab:
+            if target_rows.empty:
+                st.info("No prepared, imported, cropped, or benchmark targets are available yet.")
             else:
-                st.session_state["target_refolding_selected_entries"] = []
-                st.session_state["target_refold_selected_break_count"] = 0
-                st.info("Select one target structure to configure a refolding run.")
+                filter_cols = st.columns([1, 4])
+                category_options = _target_category_options(str(value) for value in target_rows["category"].dropna().unique() if str(value))
+                selected_categories = filter_cols[0].multiselect("Category", category_options, default=category_options)
+                search_text = filter_cols[1].text_input("Search targets", value="", placeholder="Target name, chain, source, or job code")
+                filtered_rows = target_rows.copy()
+                if selected_categories:
+                    filtered_rows = filtered_rows[filtered_rows["category"].astype(str).isin(selected_categories)]
+                if search_text.strip():
+                    needle = search_text.strip().lower()
+                    filtered_rows = filtered_rows[
+                        filtered_rows.apply(lambda row: needle in " ".join(str(value).lower() for value in row.values), axis=1)
+                    ]
+                table_rows = filtered_rows.drop(columns=["_target_index", "delete_job"], errors="ignore").copy()
+                table_rows.insert(0, "select", False)
+                edited = st.data_editor(
+                    table_rows,
+                    hide_index=True,
+                    width="stretch",
+                    height=290,
+                    disabled=["target", "chains", "chain_count", "aa_length", "fragments", "breaks", "source", "category", "job", "records", "path"],
+                    column_config={
+                        "select": st.column_config.CheckboxColumn("Select"),
+                        "chain_count": st.column_config.NumberColumn("Chains", format="%d"),
+                        "aa_length": st.column_config.NumberColumn("AA", format="%d"),
+                        "fragments": st.column_config.NumberColumn("Fragments", format="%d"),
+                        "breaks": st.column_config.NumberColumn("Breaks", format="%d"),
+                        "path": st.column_config.TextColumn("PDB path", width="large"),
+                    },
+                    key="target_refolding_chain_table",
+                )
+                selected_entries = _selected_target_structure_entries(edited, filtered_rows, targets)
+                if len(selected_entries) > 1:
+                    st.warning("Target refolding runs one target structure at a time. Keeping the first selected row.")
+                    selected_entries = selected_entries[:1]
+                if selected_entries:
+                    selected = selected_entries[0]
+                    st.session_state["target_refolding_selected_entries"] = selected_entries
+                    selected_with_breaks = [entry for entry in selected_entries if _target_break_count(entry) > 0]
+                    st.session_state["target_refold_selected_break_count"] = len(selected_with_breaks)
+                    if selected_with_breaks:
+                        st.warning(
+                            f"{len(selected_with_breaks)} selected target structure(s) contain residue-number breaks. "
+                            "Default engines are restricted to AF2-IG and Boltz-2 for structure-assisted refolding."
+                        )
+                    preview_chains = [str(chain) for chain in selected.get("target_entity_chains") or [] if str(chain)] or [str(selected["chain"])]
+                    st.markdown(f"**Preview:** {selected['target_name']} chain(s) {','.join(preview_chains)}")
+                    target_text = filter_pdb_text(
+                        Path(str(selected["target_pdb"])).read_text(errors="ignore"),
+                        keep_chains=set(preview_chains),
+                        remove_waters=True,
+                        remove_hetero=True,
+                    )
+                    molstar_custom_component(
+                        structures=[
+                            StructureVisualization(
+                                pdb=target_text,
+                                color="chain-id",
+                                representation_type="cartoon+ball-and-stick",
+                            )
+                        ],
+                        key=f"target_refolding_selected_viewer_{selected['target_pdb']}_{'-'.join(preview_chains)}",
+                        height=560,
+                        show_controls=True,
+                        download_filename=f"{selected['target_name']}_{'_'.join(preview_chains)}",
+                    )
+                else:
+                    st.session_state["target_refolding_selected_entries"] = []
+                    st.session_state["target_refold_selected_break_count"] = 0
+                    st.info("Select one target structure to configure a refolding run.")
 
-    with engines_tab:
-        st.subheader("Engines")
-        target_refold_engine_keys = [
-            "target_refold_run_af3",
-            "target_refold_run_colab",
-            "target_refold_run_af2",
-            "target_refold_run_esmfold2",
-            "target_refold_run_boltz2",
-            "target_refold_run_rf3",
-            "target_refold_run_openfold3",
-            "target_refold_run_protenix",
-            "target_refold_run_protenix_v1",
-            "target_refold_run_protenix_v2",
-            "target_refold_run_boltzgen",
-        ]
-        if "target_refold_engine_defaults_v1" not in st.session_state:
+        with engines_tab:
+            st.subheader("Engines")
+            target_refold_engine_keys = [
+                "target_refold_run_af3",
+                "target_refold_run_colab",
+                "target_refold_run_af2",
+                "target_refold_run_esmfold2",
+                "target_refold_run_boltz2",
+                "target_refold_run_rf3",
+                "target_refold_run_openfold3",
+                "target_refold_run_protenix",
+                "target_refold_run_protenix_v1",
+                "target_refold_run_protenix_v2",
+                "target_refold_run_boltzgen",
+            ]
+            if "target_refold_engine_defaults_v1" not in st.session_state:
+                for engine_key in target_refold_engine_keys:
+                    st.session_state[engine_key] = True
+                st.session_state["target_refold_run_boltzgen"] = False
+                st.session_state["target_refold_engine_defaults_v1"] = True
+            if "target_refold_template_defaults_v2" not in st.session_state:
+                st.session_state["target_refold_af2_multimer"] = True
+                st.session_state["target_refold_af2_initial_guess"] = True
+                st.session_state["target_refold_af2_fragment_template"] = True
+                st.session_state["target_refold_af2_layout_template"] = True
+                st.session_state["target_refold_boltz_template"] = True
+                st.session_state["target_refold_template_defaults_v2"] = True
             for engine_key in target_refold_engine_keys:
-                st.session_state[engine_key] = True
-            st.session_state["target_refold_run_boltzgen"] = False
-            st.session_state["target_refold_engine_defaults_v1"] = True
-        if "target_refold_template_defaults_v2" not in st.session_state:
-            st.session_state["target_refold_af2_multimer"] = True
-            st.session_state["target_refold_af2_initial_guess"] = True
-            st.session_state["target_refold_af2_fragment_template"] = True
-            st.session_state["target_refold_af2_layout_template"] = True
-            st.session_state["target_refold_boltz_template"] = True
-            st.session_state["target_refold_template_defaults_v2"] = True
-        for engine_key in target_refold_engine_keys:
-            st.session_state.setdefault(engine_key, engine_key != "target_refold_run_boltzgen")
-        selected_engine_entries = list(st.session_state.get("target_refolding_selected_entries") or [])
-        selected_break_count = sum(1 for entry in selected_engine_entries if _target_break_count(entry) > 0)
-        selected_split_fragment_count = sum(
-            1
-            for entry in selected_engine_entries
-            if str(entry.get("source_category") or "") == "split_fragments"
-            and len([chain for chain in entry.get("target_entity_chains") or [] if str(chain)]) > 1
-        )
-        selection_signature = _target_selection_signature(selected_engine_entries)
-        if (
-            (selected_break_count or selected_split_fragment_count)
-            and selection_signature
-            and st.session_state.get("target_refold_break_mode_signature") != selection_signature
-        ):
-            st.session_state["target_refold_chain_break_mode"] = "Fragment chains for broken targets (recommended)"
-            st.session_state["target_refold_break_mode_signature"] = selection_signature
+                st.session_state.setdefault(engine_key, engine_key != "target_refold_run_boltzgen")
+            selected_engine_entries = list(st.session_state.get("target_refolding_selected_entries") or [])
+            selected_break_count = sum(1 for entry in selected_engine_entries if _target_break_count(entry) > 0)
+            selected_split_fragment_count = sum(
+                1
+                for entry in selected_engine_entries
+                if str(entry.get("source_category") or "") == "split_fragments"
+                and len([chain for chain in entry.get("target_entity_chains") or [] if str(chain)]) > 1
+            )
+            selection_signature = _target_selection_signature(selected_engine_entries)
+            if (
+                (selected_break_count or selected_split_fragment_count)
+                and selection_signature
+                and st.session_state.get("target_refold_break_mode_signature") != selection_signature
+            ):
+                st.session_state["target_refold_chain_break_mode"] = "Fragment chains for broken targets (recommended)"
+                st.session_state["target_refold_break_mode_signature"] = selection_signature
 
-        target_template_msa_engine_keys = {
-            "target_refold_run_af3",
-            "target_refold_run_colab",
-            "target_refold_run_esmfold2",
-            "target_refold_run_boltz2",
-            "target_refold_run_rf3",
-            "target_refold_run_protenix_v1",
-            "target_refold_run_protenix_v2",
-        }
-        target_template_only_engine_keys = set(target_template_msa_engine_keys)
-        target_template_only_engine_keys.add("target_refold_run_af2")
-        target_msa_engine_keys = {
-            "target_refold_run_af3",
-            "target_refold_run_colab",
-            "target_refold_run_esmfold2",
-            "target_refold_run_boltz2",
-            "target_refold_run_rf3",
-            "target_refold_run_openfold3",
-            "target_refold_run_protenix",
-            "target_refold_run_protenix_v1",
-            "target_refold_run_protenix_v2",
-        }
-        bulk_cols = st.columns([1, 1, 1.5, 1.5, 1.35, 2.65])
-        if bulk_cols[0].button("Select all engines", key="target_refold_select_all_engines"):
-            for engine_key in target_refold_engine_keys:
-                st.session_state[engine_key] = True
-            st.rerun()
-        if bulk_cols[1].button("Deselect all engines", key="target_refold_deselect_all_engines"):
-            for engine_key in target_refold_engine_keys:
-                st.session_state[engine_key] = False
-            st.rerun()
-        if bulk_cols[2].button("Template + MSA engines", key="target_refold_select_template_msa_engines"):
-            for engine_key in target_refold_engine_keys:
-                st.session_state[engine_key] = engine_key in target_template_msa_engine_keys
-            st.session_state["target_refold_af3_templates"] = True
-            st.session_state["target_refold_af3_msa"] = True
-            st.session_state["target_refold_colab_templates"] = True
-            st.session_state["target_refold_colab_msa"] = True
-            st.session_state["target_refold_af2_initial_guess"] = True
-            st.session_state["target_refold_esm_modes"] = ["initial_guess"]
-            st.session_state["target_refold_esm_msa"] = True
-            st.session_state["target_refold_boltz_template"] = True
-            st.session_state["target_refold_boltz_msa"] = True
-            st.session_state["target_refold_rf3_template"] = True
-            st.session_state["target_refold_rf3_msa"] = True
-            st.session_state["target_refold_protenix_v1_template"] = True
-            st.session_state["target_refold_protenix_v1_msa"] = True
-            st.session_state["target_refold_protenix_v2_template"] = True
-            st.session_state["target_refold_protenix_v2_msa"] = True
-            st.session_state["target_refold_openfold3_msa"] = False
-            st.session_state["target_refold_protenix_msa"] = False
-            st.session_state["target_refold_require_real_msa"] = True
-            st.rerun()
-        if bulk_cols[3].button("Template-only engines", key="target_refold_select_template_only_engines"):
-            for engine_key in target_refold_engine_keys:
-                st.session_state[engine_key] = engine_key in target_template_only_engine_keys
-            st.session_state["target_refold_af3_templates"] = True
-            st.session_state["target_refold_af3_msa"] = False
-            st.session_state["target_refold_colab_templates"] = True
-            st.session_state["target_refold_colab_msa"] = False
-            st.session_state["target_refold_af2_initial_guess"] = True
-            st.session_state["target_refold_esm_modes"] = ["initial_guess"]
-            st.session_state["target_refold_esm_msa"] = False
-            st.session_state["target_refold_boltz_template"] = True
-            st.session_state["target_refold_boltz_msa"] = False
-            st.session_state["target_refold_rf3_template"] = True
-            st.session_state["target_refold_rf3_msa"] = False
-            st.session_state["target_refold_protenix_v1_template"] = True
-            st.session_state["target_refold_protenix_v1_msa"] = False
-            st.session_state["target_refold_protenix_v2_template"] = True
-            st.session_state["target_refold_protenix_v2_msa"] = False
-            st.session_state["target_refold_openfold3_msa"] = False
-            st.session_state["target_refold_protenix_msa"] = False
-            st.session_state["target_refold_require_real_msa"] = False
-            st.rerun()
-        if bulk_cols[4].button("MSA-only engines", key="target_refold_select_msa_only_engines"):
-            for engine_key in target_refold_engine_keys:
-                st.session_state[engine_key] = engine_key in target_msa_engine_keys
-            st.session_state["target_refold_af3_templates"] = False
-            st.session_state["target_refold_af3_msa"] = True
-            st.session_state["target_refold_colab_templates"] = False
-            st.session_state["target_refold_colab_msa"] = True
-            st.session_state["target_refold_boltz_template"] = False
-            st.session_state["target_refold_boltz_msa"] = True
-            st.session_state["target_refold_rf3_template"] = False
-            st.session_state["target_refold_rf3_msa"] = True
-            st.session_state["target_refold_protenix_v1_template"] = False
-            st.session_state["target_refold_protenix_v1_msa"] = True
-            st.session_state["target_refold_protenix_v2_template"] = False
-            st.session_state["target_refold_protenix_v2_msa"] = True
-            st.session_state["target_refold_esm_modes"] = ["sequence"]
-            st.session_state["target_refold_esm_msa"] = True
-            st.session_state["target_refold_openfold3_msa"] = True
-            st.session_state["target_refold_protenix_msa"] = True
-            st.session_state["target_refold_require_real_msa"] = True
-            st.rerun()
-        if bulk_cols[5].button("No MSA + no template", key="target_refold_disable_msa_template"):
-            st.session_state["target_refold_run_af2"] = False
-            st.session_state["target_refold_af3_templates"] = False
-            st.session_state["target_refold_af3_msa"] = False
-            st.session_state["target_refold_colab_templates"] = False
-            st.session_state["target_refold_colab_msa"] = False
-            st.session_state["target_refold_esm_modes"] = ["sequence"]
-            st.session_state["target_refold_esm_msa"] = False
-            st.session_state["target_refold_af2_initial_guess"] = True
-            st.session_state["target_refold_af2_fragment_template"] = False
-            st.session_state["target_refold_af2_layout_template"] = False
-            st.session_state["target_refold_boltz_template"] = False
-            st.session_state["target_refold_boltz_msa"] = False
-            st.session_state["target_refold_rf3_template"] = False
-            st.session_state["target_refold_rf3_msa"] = False
-            st.session_state["target_refold_openfold3_msa"] = False
-            st.session_state["target_refold_protenix_msa"] = False
-            st.session_state["target_refold_protenix_v1_template"] = False
-            st.session_state["target_refold_protenix_v1_msa"] = False
-            st.session_state["target_refold_protenix_v2_template"] = False
-            st.session_state["target_refold_protenix_v2_msa"] = False
-            st.session_state["target_refold_require_real_msa"] = False
-            st.rerun()
-        if selected_break_count:
-            st.warning(
-                f"{selected_break_count} selected target structure(s) contain residue-number breaks. "
-                "Fragment-chain mode is selected by default; all compatible refolding engines remain available."
-            )
-        if selected_split_fragment_count:
-            st.warning(
-                f"{selected_split_fragment_count} selected target structure(s) were created by splitting one broken chain into fragments. "
-                "They are forced to run as fragment chains so the staged target stays multi-chain. "
-                "All compatible refolding engines remain available."
-            )
-            st.session_state["target_refold_chain_break_mode"] = "Fragment chains for broken targets (recommended)"
-        if st.session_state.get("target_refold_run_boltzgen", False):
-            st.session_state["target_refold_run_boltzgen"] = False
-            st.warning(
-                "BoltzGen Fold is disabled for target-only refolding because its fold entrypoint requires "
-                "at least one designed residue; launching it here would fail without producing a structure."
-            )
-        legacy_chain_break_mode = st.session_state.get("target_refold_chain_break_mode")
-        if legacy_chain_break_mode == "Preserve original chain":
-            st.session_state["target_refold_chain_break_mode"] = "Legacy single-chain gaps (diagnostic)"
-        elif legacy_chain_break_mode == "Split into fragment chains":
-            st.session_state["target_refold_chain_break_mode"] = "Fragment chains for broken targets (recommended)"
-        elif legacy_chain_break_mode == "Residue-gap single chain":
-            st.session_state["target_refold_chain_break_mode"] = "Legacy single-chain gaps (diagnostic)"
-        elif legacy_chain_break_mode == "Separate fragment chains":
-            st.session_state["target_refold_chain_break_mode"] = "Fragment chains for broken targets (recommended)"
-        st.radio(
-            "Chain-break mode",
-            ["Fragment chains for broken targets (recommended)", "Legacy single-chain gaps (diagnostic)"],
-            horizontal=True,
-            key="target_refold_chain_break_mode",
-            disabled=not selected_engine_entries or bool(selected_split_fragment_count),
-            help=(
-                "Fragment chains rewrites each discontinuous crop fragment as its own chain and is the default for fragmented targets. "
-                "Legacy single-chain gaps keeps the original chain with missing residue numbers for explicit diagnostic comparisons only."
-            ),
-        )
-
-        engine_cols = st.columns(11)
-        target_run_af3 = engine_cols[0].checkbox("AlphaFast AF3", value=True, key="target_refold_run_af3")
-        target_run_colab = engine_cols[1].checkbox("ColabFold", value=True, key="target_refold_run_colab")
-        target_run_af2 = engine_cols[2].checkbox("AF2 template", value=True, key="target_refold_run_af2")
-        if target_run_af2:
-            st.session_state["target_refold_af2_initial_guess"] = True
-        target_run_esmfold2 = engine_cols[3].checkbox("ESMFold2", value=True, key="target_refold_run_esmfold2")
-        target_run_boltz2 = engine_cols[4].checkbox("Boltz-2", value=True, key="target_refold_run_boltz2")
-        target_run_rf3 = engine_cols[5].checkbox("RF3", value=True, key="target_refold_run_rf3")
-        target_run_openfold3 = engine_cols[6].checkbox("OpenFold-3", value=True, key="target_refold_run_openfold3")
-        target_run_protenix = engine_cols[7].checkbox("Protenix v0.5", value=True, key="target_refold_run_protenix")
-        target_run_protenix_v1 = engine_cols[8].checkbox("Protenix v1", value=True, key="target_refold_run_protenix_v1")
-        target_run_protenix_v2 = engine_cols[9].checkbox("Protenix v2", value=True, key="target_refold_run_protenix_v2")
-        target_run_boltzgen = engine_cols[10].checkbox(
-            "BoltzGen Fold",
-            value=False,
-            key="target_refold_run_boltzgen",
-            disabled=True,
-            help="Not available for target-only refolding: BoltzGen Fold requires at least one designed residue in the input mask.",
-        )
-
-        msa_enabled = bool(
-            (target_run_af3 and bool(st.session_state.get("target_refold_af3_msa", True)))
-            or (target_run_colab and bool(st.session_state.get("target_refold_colab_msa", True)))
-            or (target_run_boltz2 and bool(st.session_state.get("target_refold_boltz_msa", True)))
-            or (target_run_esmfold2 and bool(st.session_state.get("target_refold_esm_msa", True)))
-            or (target_run_rf3 and bool(st.session_state.get("target_refold_rf3_msa", True)))
-            or (target_run_openfold3 and bool(st.session_state.get("target_refold_openfold3_msa", True)))
-            or (target_run_protenix and bool(st.session_state.get("target_refold_protenix_msa", True)))
-            or (target_run_protenix_v1 and bool(st.session_state.get("target_refold_protenix_v1_msa", True)))
-            or (target_run_protenix_v2 and bool(st.session_state.get("target_refold_protenix_v2_msa", True)))
-        )
-        with st.expander("MSA Reference Data", expanded=True):
-            msa_cols = st.columns(3)
-            msa_cols[0].text_input(
-                "MSA repository",
-                value=str(MSA_REPOSITORY_DIR),
-                key="target_refold_msa_repository",
-                disabled=not msa_enabled,
-            )
-            msa_cols[1].text_input(
-                "Alignment/MMseqs DB dir",
-                value=str(ALPHAFAST_DB_DIR),
-                key="target_refold_alphafast_db",
-                disabled=not msa_enabled,
-            )
-            msa_cols[2].checkbox(
-                "Require real MSAs",
-                value=True,
-                key="target_refold_require_real_msa",
-                disabled=not msa_enabled,
-            )
-
-        with st.expander("AlphaFast AF3 Settings", expanded=target_run_af3):
-            af3_cols = st.columns(4)
-            af3_cols[0].text_input(
-                "AF3 weights dir",
-                value=str(ALPHAFAST_WEIGHTS_DIR),
-                disabled=not target_run_af3,
-                key="target_refold_af3_weights",
-            )
-            af3_cols[1].number_input(
-                "AF3 recycles",
-                min_value=1,
-                max_value=48,
-                value=10,
-                step=1,
-                disabled=not target_run_af3,
-                key="target_refold_af3_recycles",
-            )
-            af3_cols[2].checkbox(
-                "Use templates",
-                value=True,
-                disabled=not target_run_af3,
-                key="target_refold_af3_templates",
-                help="Embeds the staged input target chains as AF3 templates.",
-            )
-            af3_cols[3].checkbox(
-                "Use target MSAs",
-                value=True,
-                disabled=not target_run_af3,
-                key="target_refold_af3_msa",
-                help="When off, AlphaFast AF3 runs with query-only/no target MSA input.",
-            )
-
-        with st.expander("ColabFold Settings", expanded=target_run_colab):
-            colab_cols = st.columns(5)
-            colab_cols[0].text_input(
-                "ColabFold / AF2 model cache",
-                value=str(COLABFOLD_CACHE_DIR),
-                disabled=not target_run_colab,
-                key="target_refold_colab_cache",
-            )
-            colab_cols[1].number_input("ColabFold recycles", 1, 48, 3, disabled=not target_run_colab, key="target_refold_colab_recycles")
-            colab_cols[2].number_input("ColabFold models", 1, 5, 3, disabled=not target_run_colab, key="target_refold_colab_models")
-            colab_templates = colab_cols[3].checkbox(
-                "Use templates",
-                value=True,
-                disabled=not target_run_colab,
-                key="target_refold_colab_templates",
-                help="Uses the staged input target as the template.",
-            )
-            colab_msa = colab_cols[4].checkbox(
-                "Use target MSAs",
-                value=True,
-                disabled=not target_run_colab,
-                key="target_refold_colab_msa",
-                help="When off, ColabFold does not request or inject real target MSAs.",
-            )
-
-        with st.expander("AF2 Template Settings", expanded=target_run_af2):
-            af2_cols = st.columns(5)
-            af2_cols[0].number_input("AF2 recycles", 1, 24, 3, disabled=not target_run_af2, key="target_refold_af2_recycles")
-            af2_cols[1].checkbox("AF2 multimer", value=True, disabled=not target_run_af2, key="target_refold_af2_multimer")
-            af2_cols[2].checkbox(
-                "Whole input initial guess",
-                value=True,
-                disabled=True,
-                key="target_refold_af2_initial_guess",
-                help="AF2 target refolding always uses initial-guess conditioning. Deselect AF2 to omit it from no-template/no-MSA runs.",
-            )
-            af2_cols[3].checkbox(
-                "Template fragments",
-                value=True,
-                disabled=not target_run_af2,
-                key="target_refold_af2_fragment_template",
-            )
-            af2_cols[4].checkbox(
-                "Template fragment layout",
-                value=True,
-                disabled=not target_run_af2,
-                key="target_refold_af2_layout_template",
-            )
-
-        with st.expander("ESMFold2 Settings", expanded=target_run_esmfold2):
-            target_esm_modes = st.multiselect(
-                "Modes",
-                ["sequence", "initial_guess"],
-                default=["initial_guess"],
-                disabled=not target_run_esmfold2,
-                format_func={"sequence": "Sequence only", "initial_guess": "Selected-target distogram"}.get,
-                key="target_refold_esm_modes",
-                help="Selected-target distogram is ESMFold2's template-like mode: it conditions on the selected target structure, without binder/interface geometry.",
-            )
-            esm_cols = st.columns(4)
-            esm_cols[0].checkbox(
-                "Use ESMFold2 target MSAs",
-                value=True,
-                disabled=not target_run_esmfold2,
-                key="target_refold_esm_msa",
+            target_template_msa_engine_keys = {
+                "target_refold_run_af3",
+                "target_refold_run_colab",
+                "target_refold_run_esmfold2",
+                "target_refold_run_boltz2",
+                "target_refold_run_rf3",
+                "target_refold_run_protenix_v1",
+                "target_refold_run_protenix_v2",
+            }
+            target_template_only_engine_keys = set(target_template_msa_engine_keys)
+            target_template_only_engine_keys.add("target_refold_run_af2")
+            target_msa_engine_keys = {
+                "target_refold_run_af3",
+                "target_refold_run_colab",
+                "target_refold_run_esmfold2",
+                "target_refold_run_boltz2",
+                "target_refold_run_rf3",
+                "target_refold_run_openfold3",
+                "target_refold_run_protenix",
+                "target_refold_run_protenix_v1",
+                "target_refold_run_protenix_v2",
+            }
+            bulk_cols = st.columns([1, 1, 1.5, 1.5, 1.35, 2.65])
+            if bulk_cols[0].button("Select all engines", key="target_refold_select_all_engines"):
+                for engine_key in target_refold_engine_keys:
+                    st.session_state[engine_key] = True
+                st.rerun()
+            if bulk_cols[1].button("Deselect all engines", key="target_refold_deselect_all_engines"):
+                for engine_key in target_refold_engine_keys:
+                    st.session_state[engine_key] = False
+                st.rerun()
+            if bulk_cols[2].button("Template + MSA engines", key="target_refold_select_template_msa_engines"):
+                for engine_key in target_refold_engine_keys:
+                    st.session_state[engine_key] = engine_key in target_template_msa_engine_keys
+                st.session_state["target_refold_af3_templates"] = True
+                st.session_state["target_refold_af3_msa"] = True
+                st.session_state["target_refold_colab_templates"] = True
+                st.session_state["target_refold_colab_msa"] = True
+                st.session_state["target_refold_af2_initial_guess"] = True
+                st.session_state["target_refold_esm_modes"] = ["initial_guess"]
+                st.session_state["target_refold_esm_msa"] = True
+                st.session_state["target_refold_boltz_template"] = True
+                st.session_state["target_refold_boltz_msa"] = True
+                st.session_state["target_refold_rf3_template"] = True
+                st.session_state["target_refold_rf3_msa"] = True
+                st.session_state["target_refold_protenix_v1_template"] = True
+                st.session_state["target_refold_protenix_v1_msa"] = True
+                st.session_state["target_refold_protenix_v2_template"] = True
+                st.session_state["target_refold_protenix_v2_msa"] = True
+                st.session_state["target_refold_openfold3_msa"] = False
+                st.session_state["target_refold_protenix_msa"] = False
+                st.session_state["target_refold_require_real_msa"] = True
+                st.rerun()
+            if bulk_cols[3].button("Template-only engines", key="target_refold_select_template_only_engines"):
+                for engine_key in target_refold_engine_keys:
+                    st.session_state[engine_key] = engine_key in target_template_only_engine_keys
+                st.session_state["target_refold_af3_templates"] = True
+                st.session_state["target_refold_af3_msa"] = False
+                st.session_state["target_refold_colab_templates"] = True
+                st.session_state["target_refold_colab_msa"] = False
+                st.session_state["target_refold_af2_initial_guess"] = True
+                st.session_state["target_refold_esm_modes"] = ["initial_guess"]
+                st.session_state["target_refold_esm_msa"] = False
+                st.session_state["target_refold_boltz_template"] = True
+                st.session_state["target_refold_boltz_msa"] = False
+                st.session_state["target_refold_rf3_template"] = True
+                st.session_state["target_refold_rf3_msa"] = False
+                st.session_state["target_refold_protenix_v1_template"] = True
+                st.session_state["target_refold_protenix_v1_msa"] = False
+                st.session_state["target_refold_protenix_v2_template"] = True
+                st.session_state["target_refold_protenix_v2_msa"] = False
+                st.session_state["target_refold_openfold3_msa"] = False
+                st.session_state["target_refold_protenix_msa"] = False
+                st.session_state["target_refold_require_real_msa"] = False
+                st.rerun()
+            if bulk_cols[4].button("MSA-only engines", key="target_refold_select_msa_only_engines"):
+                for engine_key in target_refold_engine_keys:
+                    st.session_state[engine_key] = engine_key in target_msa_engine_keys
+                st.session_state["target_refold_af3_templates"] = False
+                st.session_state["target_refold_af3_msa"] = True
+                st.session_state["target_refold_colab_templates"] = False
+                st.session_state["target_refold_colab_msa"] = True
+                st.session_state["target_refold_boltz_template"] = False
+                st.session_state["target_refold_boltz_msa"] = True
+                st.session_state["target_refold_rf3_template"] = False
+                st.session_state["target_refold_rf3_msa"] = True
+                st.session_state["target_refold_protenix_v1_template"] = False
+                st.session_state["target_refold_protenix_v1_msa"] = True
+                st.session_state["target_refold_protenix_v2_template"] = False
+                st.session_state["target_refold_protenix_v2_msa"] = True
+                st.session_state["target_refold_esm_modes"] = ["sequence"]
+                st.session_state["target_refold_esm_msa"] = True
+                st.session_state["target_refold_openfold3_msa"] = True
+                st.session_state["target_refold_protenix_msa"] = True
+                st.session_state["target_refold_require_real_msa"] = True
+                st.rerun()
+            if bulk_cols[5].button("No MSA + no template", key="target_refold_disable_msa_template"):
+                st.session_state["target_refold_run_af2"] = False
+                st.session_state["target_refold_af3_templates"] = False
+                st.session_state["target_refold_af3_msa"] = False
+                st.session_state["target_refold_colab_templates"] = False
+                st.session_state["target_refold_colab_msa"] = False
+                st.session_state["target_refold_esm_modes"] = ["sequence"]
+                st.session_state["target_refold_esm_msa"] = False
+                st.session_state["target_refold_af2_initial_guess"] = True
+                st.session_state["target_refold_af2_fragment_template"] = False
+                st.session_state["target_refold_af2_layout_template"] = False
+                st.session_state["target_refold_boltz_template"] = False
+                st.session_state["target_refold_boltz_msa"] = False
+                st.session_state["target_refold_rf3_template"] = False
+                st.session_state["target_refold_rf3_msa"] = False
+                st.session_state["target_refold_openfold3_msa"] = False
+                st.session_state["target_refold_protenix_msa"] = False
+                st.session_state["target_refold_protenix_v1_template"] = False
+                st.session_state["target_refold_protenix_v1_msa"] = False
+                st.session_state["target_refold_protenix_v2_template"] = False
+                st.session_state["target_refold_protenix_v2_msa"] = False
+                st.session_state["target_refold_require_real_msa"] = False
+                st.rerun()
+            if selected_break_count:
+                st.warning(
+                    f"{selected_break_count} selected target structure(s) contain residue-number breaks. "
+                    "Fragment-chain mode is selected by default; all compatible refolding engines remain available."
+                )
+            if selected_split_fragment_count:
+                st.warning(
+                    f"{selected_split_fragment_count} selected target structure(s) were created by splitting one broken chain into fragments. "
+                    "They are forced to run as fragment chains so the staged target stays multi-chain. "
+                    "All compatible refolding engines remain available."
+                )
+                st.session_state["target_refold_chain_break_mode"] = "Fragment chains for broken targets (recommended)"
+            if st.session_state.get("target_refold_run_boltzgen", False):
+                st.session_state["target_refold_run_boltzgen"] = False
+                st.warning(
+                    "BoltzGen Fold is disabled for target-only refolding because its fold entrypoint requires "
+                    "at least one designed residue; launching it here would fail without producing a structure."
+                )
+            legacy_chain_break_mode = st.session_state.get("target_refold_chain_break_mode")
+            if legacy_chain_break_mode == "Preserve original chain":
+                st.session_state["target_refold_chain_break_mode"] = "Legacy single-chain gaps (diagnostic)"
+            elif legacy_chain_break_mode == "Split into fragment chains":
+                st.session_state["target_refold_chain_break_mode"] = "Fragment chains for broken targets (recommended)"
+            elif legacy_chain_break_mode == "Residue-gap single chain":
+                st.session_state["target_refold_chain_break_mode"] = "Legacy single-chain gaps (diagnostic)"
+            elif legacy_chain_break_mode == "Separate fragment chains":
+                st.session_state["target_refold_chain_break_mode"] = "Fragment chains for broken targets (recommended)"
+            st.radio(
+                "Chain-break mode",
+                ["Fragment chains for broken targets (recommended)", "Legacy single-chain gaps (diagnostic)"],
+                horizontal=True,
+                key="target_refold_chain_break_mode",
+                disabled=not selected_engine_entries or bool(selected_split_fragment_count),
                 help=(
-                    "Pass prepared per-target-chain A3M files into ESMFold2 ProteinInput.msa. "
-                    "This is per-chain target MSA conditioning, not a ColabFold-style paired multimer A3M; "
-                    "missing, query-only, or mismatched MSAs are skipped and noted in the ESMFold2 metrics."
+                    "Fragment chains rewrites each discontinuous crop fragment as its own chain and is the default for fragmented targets. "
+                    "Legacy single-chain gaps keeps the original chain with missing residue numbers for explicit diagnostic comparisons only."
                 ),
             )
-            esm_cols[1].number_input("ESMFold2 sampling steps", 1, 256, 68, disabled=not target_run_esmfold2, key="target_refold_esm_steps")
-            esm_cols[2].number_input("ESMFold2 recycling loops", 1, 64, 10, disabled=not target_run_esmfold2, key="target_refold_esm_loops")
-            esm_cols[3].number_input("ESMFold2 seed", 0, 999999, 0, disabled=not target_run_esmfold2, key="target_refold_esm_seed")
 
-        with st.expander("Boltz-2 Settings", expanded=target_run_boltz2):
-            boltz_cols = st.columns(6)
-            boltz_cols[0].checkbox("Use templates", value=True, disabled=not target_run_boltz2, key="target_refold_boltz_template", help="Uses the staged input target as the template.")
-            boltz_cols[1].checkbox("Use target MSAs", value=True, disabled=not target_run_boltz2, key="target_refold_boltz_msa")
-            boltz_cols[2].number_input("Recycling steps", 1, 48, 10, disabled=not target_run_boltz2, key="target_refold_boltz_recycles")
-            boltz_cols[3].number_input("Sampling steps", 1, 1000, 100, disabled=not target_run_boltz2, key="target_refold_boltz_steps")
-            boltz_cols[4].number_input("Diffusion samples", 1, 20, 3, disabled=not target_run_boltz2, key="target_refold_boltz_samples")
-            boltz_cols[5].checkbox("Write full PAE", value=True, disabled=not target_run_boltz2, key="target_refold_boltz_full_pae")
-
-        with st.expander("RF3 Settings", expanded=target_run_rf3):
-            rf3_cols = st.columns(6)
-            rf3_cols[0].text_input("RF3 checkpoint", value=str(RF3_CHECKPOINT), disabled=not target_run_rf3, key="target_refold_rf3_checkpoint")
-            rf3_cols[1].checkbox("Use templates", value=True, disabled=not target_run_rf3, key="target_refold_rf3_template", help="Uses the staged input target chains as RF3 template coordinates.")
-            rf3_cols[2].checkbox("Use target MSAs", value=True, disabled=not target_run_rf3, key="target_refold_rf3_msa")
-            rf3_cols[3].number_input("RF3 recycles", 1, 48, 10, disabled=not target_run_rf3, key="target_refold_rf3_recycles")
-            rf3_cols[4].number_input("RF3 diffusion steps", 1, 1000, 50, disabled=not target_run_rf3, key="target_refold_rf3_steps")
-            rf3_cols[5].number_input("RF3 samples", 1, 20, 5, disabled=not target_run_rf3, key="target_refold_rf3_samples")
-            st.number_input("RF3 seed", 0, 999999, 0, disabled=not target_run_rf3, key="target_refold_rf3_seed")
-
-        with st.expander("OpenFold-3 Settings", expanded=target_run_openfold3):
-            of3_cols = st.columns(5)
-            of3_cols[0].text_input("OpenFold-3 checkpoint", value=str(OPENFOLD3_CHECKPOINT), disabled=not target_run_openfold3, key="target_refold_openfold3_checkpoint")
-            of3_cols[1].checkbox("Use target MSAs", value=True, disabled=not target_run_openfold3, key="target_refold_openfold3_msa")
-            of3_cols[2].number_input("Diffusion samples", 1, 20, 5, disabled=not target_run_openfold3, key="target_refold_openfold3_samples")
-            of3_cols[3].number_input("Model seeds", 1, 20, 1, disabled=not target_run_openfold3, key="target_refold_openfold3_seeds")
-            of3_cols[4].number_input("Recycles", 1, 48, 3, disabled=not target_run_openfold3, key="target_refold_openfold3_recycles")
-            st.checkbox("Use MSA server", value=False, disabled=not target_run_openfold3, key="target_refold_openfold3_msa_server")
-
-        with st.expander("Protenix v0.5 Settings", expanded=target_run_protenix):
-            protenix_cols = st.columns(4)
-            protenix_cols[0].checkbox("Use target MSAs", value=True, disabled=not target_run_protenix, key="target_refold_protenix_msa")
-            protenix_cols[1].number_input("Pairformer cycles", 1, 48, 3, disabled=not target_run_protenix, key="target_refold_protenix_cycle")
-            protenix_cols[2].number_input("Diffusion steps", 1, 1000, 50, disabled=not target_run_protenix, key="target_refold_protenix_steps")
-            protenix_cols[3].number_input("Samples", 1, 20, 5, disabled=not target_run_protenix, key="target_refold_protenix_samples")
-
-        with st.expander("Protenix v1 Settings", expanded=target_run_protenix_v1):
-            protenix_v1_cols = st.columns(6)
-            protenix_v1_cols[0].text_input("Model", value=PROTENIX_V1_MODEL, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_model")
-            protenix_v1_cols[1].checkbox("Use target MSAs", value=True, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_msa")
-            protenix_v1_cols[2].checkbox("Use templates", value=True, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_template")
-            protenix_v1_cols[3].number_input("Pairformer cycles", 1, 48, 10, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_cycle")
-            protenix_v1_cols[4].number_input("Diffusion steps", 1, 1000, 200, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_steps")
-            protenix_v1_cols[5].number_input("Samples", 1, 20, 5, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_samples")
-
-        with st.expander("Protenix v2 Settings", expanded=target_run_protenix_v2):
-            protenix_v2_cols = st.columns(6)
-            protenix_v2_cols[0].text_input("Model", value=PROTENIX_V2_MODEL, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_model")
-            protenix_v2_cols[1].checkbox("Use target MSAs", value=True, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_msa")
-            protenix_v2_cols[2].checkbox("Use templates", value=True, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_template")
-            protenix_v2_cols[3].number_input("Pairformer cycles", 1, 48, 10, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_cycle")
-            protenix_v2_cols[4].number_input("Diffusion steps", 1, 1000, 200, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_steps")
-            protenix_v2_cols[5].number_input("Samples", 1, 20, 5, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_samples")
-
-        with st.expander("BoltzGen Fold Settings", expanded=target_run_boltzgen):
-            boltzgen_cols = st.columns(4)
-            boltzgen_cols[0].checkbox(
-                "Use templates",
-                value=True,
+            engine_cols = st.columns(11)
+            target_run_af3 = engine_cols[0].checkbox("AlphaFast AF3", value=True, key="target_refold_run_af3")
+            target_run_colab = engine_cols[1].checkbox("ColabFold", value=True, key="target_refold_run_colab")
+            target_run_af2 = engine_cols[2].checkbox("AF2 template", value=True, key="target_refold_run_af2")
+            if target_run_af2:
+                st.session_state["target_refold_af2_initial_guess"] = True
+            target_run_esmfold2 = engine_cols[3].checkbox("ESMFold2", value=True, key="target_refold_run_esmfold2")
+            target_run_boltz2 = engine_cols[4].checkbox("Boltz-2", value=True, key="target_refold_run_boltz2")
+            target_run_rf3 = engine_cols[5].checkbox("RF3", value=True, key="target_refold_run_rf3")
+            target_run_openfold3 = engine_cols[6].checkbox("OpenFold-3", value=True, key="target_refold_run_openfold3")
+            target_run_protenix = engine_cols[7].checkbox("Protenix v0.5", value=True, key="target_refold_run_protenix")
+            target_run_protenix_v1 = engine_cols[8].checkbox("Protenix v1", value=True, key="target_refold_run_protenix_v1")
+            target_run_protenix_v2 = engine_cols[9].checkbox("Protenix v2", value=True, key="target_refold_run_protenix_v2")
+            target_run_boltzgen = engine_cols[10].checkbox(
+                "BoltzGen Fold",
+                value=False,
+                key="target_refold_run_boltzgen",
                 disabled=True,
-                key="target_refold_boltzgen_template",
-                help="BoltzGen Fold runs in template mode; the staged input target is always used as the template.",
+                help="Not available for target-only refolding: BoltzGen Fold requires at least one designed residue in the input mask.",
             )
-            boltzgen_cols[1].number_input("Recycling steps", 1, 48, 3, disabled=not target_run_boltzgen, key="target_refold_boltzgen_recycles")
-            boltzgen_cols[2].number_input("Sampling steps", 1, 1000, 100, disabled=not target_run_boltzgen, key="target_refold_boltzgen_steps")
-            boltzgen_cols[3].number_input("Diffusion samples", 1, 20, 3, disabled=not target_run_boltzgen, key="target_refold_boltzgen_samples")
 
-        with st.expander("Metrics", expanded=True):
-            st.checkbox("Predicted Rosetta metrics", value=False, key="target_refold_rosetta")
-
-    with run_tab:
-        selected_entries = list(st.session_state.get("target_refolding_selected_entries") or [])
-        selected_break_count = sum(1 for entry in selected_entries if _target_break_count(entry) > 0)
-        selected_split_fragment_count = sum(
-            1
-            for entry in selected_entries
-            if str(entry.get("source_category") or "") == "split_fragments"
-            and len([chain for chain in entry.get("target_entity_chains") or [] if str(chain)]) > 1
-        )
-        selected_engines = [
-            label
-            for label, enabled in [
-                ("AF3", st.session_state.get("target_refold_run_af3", True)),
-                ("ColabFold", st.session_state.get("target_refold_run_colab", True)),
-                ("AF2 template", st.session_state.get("target_refold_run_af2", True)),
-                ("ESMFold2", st.session_state.get("target_refold_run_esmfold2", True)),
-                ("Boltz-2", st.session_state.get("target_refold_run_boltz2", True)),
-                ("RF3", st.session_state.get("target_refold_run_rf3", True)),
-                ("OpenFold-3", st.session_state.get("target_refold_run_openfold3", True)),
-                ("Protenix v0.5", st.session_state.get("target_refold_run_protenix", True)),
-                ("Protenix v1", st.session_state.get("target_refold_run_protenix_v1", True)),
-                ("Protenix v2", st.session_state.get("target_refold_run_protenix_v2", True)),
-                ("BoltzGen Fold", st.session_state.get("target_refold_run_boltzgen", False)),
-            ]
-            if enabled
-        ]
-        eval_name = st.text_input("Evaluation name", value="Target refolding evaluation", key="target_refold_eval_name")
-        chain_break_mode = str(
-            st.session_state.get("target_refold_chain_break_mode")
-            or "Fragment chains for broken targets (recommended)"
-        )
-        split_chain_breaks = bool(
-            selected_split_fragment_count
-            or chain_break_mode
-            in {
-                "Fragment chains for broken targets (recommended)",
-                "Separate fragment chains",
-                "Split into fragment chains",
-            }
-        )
-        target_gpu = gpu_run_panel(key="target_refold_queue", default="0")
-        st.info(
-            f"{len(selected_entries):,} target structure(s) selected. "
-            f"Selected engines: {', '.join(selected_engines) or 'none'}. "
-            f"Chain breaks: {'separate fragment chains' if split_chain_breaks else 'residue-gap single chain'}."
-        )
-        if (
-            split_chain_breaks
-            and st.session_state.get("target_refold_run_af2", True)
-            and (
-                not st.session_state.get("target_refold_af2_multimer", True)
-                or not st.session_state.get("target_refold_af2_initial_guess", True)
+            msa_enabled = bool(
+                (target_run_af3 and bool(st.session_state.get("target_refold_af3_msa", True)))
+                or (target_run_colab and bool(st.session_state.get("target_refold_colab_msa", True)))
+                or (target_run_boltz2 and bool(st.session_state.get("target_refold_boltz_msa", True)))
+                or (target_run_esmfold2 and bool(st.session_state.get("target_refold_esm_msa", True)))
+                or (target_run_rf3 and bool(st.session_state.get("target_refold_rf3_msa", True)))
+                or (target_run_openfold3 and bool(st.session_state.get("target_refold_openfold3_msa", True)))
+                or (target_run_protenix and bool(st.session_state.get("target_refold_protenix_msa", True)))
+                or (target_run_protenix_v1 and bool(st.session_state.get("target_refold_protenix_v1_msa", True)))
+                or (target_run_protenix_v2 and bool(st.session_state.get("target_refold_protenix_v2_msa", True)))
             )
-        ):
-            st.warning(
-                "AF2-IG will not preserve the split crop layout unless AF2 multimer "
-                "and whole-input initial guess are enabled."
-            )
-        non_assisted_engines = [
-            label
-            for label, key in [
-                ("AF3", "target_refold_run_af3"),
-                ("ColabFold", "target_refold_run_colab"),
-                ("ESMFold2", "target_refold_run_esmfold2"),
-                ("RF3", "target_refold_run_rf3"),
-                ("OpenFold-3", "target_refold_run_openfold3"),
-                ("Protenix v0.5", "target_refold_run_protenix"),
-                ("Protenix v1", "target_refold_run_protenix_v1"),
-                ("Protenix v2", "target_refold_run_protenix_v2"),
-            ]
-            if st.session_state.get(key, True)
-        ]
-        if split_chain_breaks and selected_break_count and non_assisted_engines:
-            st.warning(
-                "This selection has residue-number breaks. "
-                f"Non-template-assisted engines selected: {', '.join(non_assisted_engines)}."
-            )
-        unsafe_single_chain_template_engines = [
-            label
-            for label, key in [
-                ("AF2 template", "target_refold_run_af2"),
-                ("Boltz-2", "target_refold_run_boltz2"),
-            ]
-            if st.session_state.get(key, True)
-        ]
-        block_single_chain_template_run = bool(
-            selected_break_count and not split_chain_breaks and unsafe_single_chain_template_engines
-        )
-        if selected_break_count and not split_chain_breaks:
-            message = (
-                "Legacy single-chain gaps keeps discontinuous coordinates on one chain. "
-                "For fragmented targets this is diagnostic only; template engines can collapse to the first fragment or fail."
-            )
-            if block_single_chain_template_run:
-                st.error(
-                    message
-                    + " Switch to fragment-chain mode before running "
-                    + ", ".join(unsafe_single_chain_template_engines)
-                    + "."
+            with st.expander("MSA Reference Data", expanded=True):
+                msa_cols = st.columns(3)
+                msa_cols[0].text_input(
+                    "MSA repository",
+                    value=str(MSA_REPOSITORY_DIR),
+                    key="target_refold_msa_repository",
+                    disabled=not msa_enabled,
                 )
+                msa_cols[1].text_input(
+                    "Alignment/MMseqs DB dir",
+                    value=str(ALPHAFAST_DB_DIR),
+                    key="target_refold_alphafast_db",
+                    disabled=not msa_enabled,
+                )
+                msa_cols[2].checkbox(
+                    "Require real MSAs",
+                    value=True,
+                    key="target_refold_require_real_msa",
+                    disabled=not msa_enabled,
+                )
+
+            with st.expander("AlphaFast AF3 Settings", expanded=target_run_af3):
+                af3_cols = st.columns(4)
+                af3_cols[0].text_input(
+                    "AF3 weights dir",
+                    value=str(ALPHAFAST_WEIGHTS_DIR),
+                    disabled=not target_run_af3,
+                    key="target_refold_af3_weights",
+                )
+                af3_cols[1].number_input(
+                    "AF3 recycles",
+                    min_value=1,
+                    max_value=48,
+                    value=10,
+                    step=1,
+                    disabled=not target_run_af3,
+                    key="target_refold_af3_recycles",
+                )
+                af3_cols[2].checkbox(
+                    "Use templates",
+                    value=True,
+                    disabled=not target_run_af3,
+                    key="target_refold_af3_templates",
+                    help="Embeds the staged input target chains as AF3 templates.",
+                )
+                af3_cols[3].checkbox(
+                    "Use target MSAs",
+                    value=True,
+                    disabled=not target_run_af3,
+                    key="target_refold_af3_msa",
+                    help="When off, AlphaFast AF3 runs with query-only/no target MSA input.",
+                )
+
+            with st.expander("ColabFold Settings", expanded=target_run_colab):
+                colab_cols = st.columns(5)
+                colab_cols[0].text_input(
+                    "ColabFold / AF2 model cache",
+                    value=str(COLABFOLD_CACHE_DIR),
+                    disabled=not target_run_colab,
+                    key="target_refold_colab_cache",
+                )
+                colab_cols[1].number_input("ColabFold recycles", 1, 48, 3, disabled=not target_run_colab, key="target_refold_colab_recycles")
+                colab_cols[2].number_input("ColabFold models", 1, 5, 3, disabled=not target_run_colab, key="target_refold_colab_models")
+                colab_templates = colab_cols[3].checkbox(
+                    "Use templates",
+                    value=True,
+                    disabled=not target_run_colab,
+                    key="target_refold_colab_templates",
+                    help="Uses the staged input target as the template.",
+                )
+                colab_msa = colab_cols[4].checkbox(
+                    "Use target MSAs",
+                    value=True,
+                    disabled=not target_run_colab,
+                    key="target_refold_colab_msa",
+                    help="When off, ColabFold does not request or inject real target MSAs.",
+                )
+
+            with st.expander("AF2 Template Settings", expanded=target_run_af2):
+                af2_cols = st.columns(5)
+                af2_cols[0].number_input("AF2 recycles", 1, 24, 3, disabled=not target_run_af2, key="target_refold_af2_recycles")
+                af2_cols[1].checkbox("AF2 multimer", value=True, disabled=not target_run_af2, key="target_refold_af2_multimer")
+                af2_cols[2].checkbox(
+                    "Whole input initial guess",
+                    value=True,
+                    disabled=True,
+                    key="target_refold_af2_initial_guess",
+                    help="AF2 target refolding always uses initial-guess conditioning. Deselect AF2 to omit it from no-template/no-MSA runs.",
+                )
+                af2_cols[3].checkbox(
+                    "Template fragments",
+                    value=True,
+                    disabled=not target_run_af2,
+                    key="target_refold_af2_fragment_template",
+                )
+                af2_cols[4].checkbox(
+                    "Template fragment layout",
+                    value=True,
+                    disabled=not target_run_af2,
+                    key="target_refold_af2_layout_template",
+                )
+
+            with st.expander("ESMFold2 Settings", expanded=target_run_esmfold2):
+                target_esm_modes = st.multiselect(
+                    "Modes",
+                    ["sequence", "initial_guess"],
+                    default=["initial_guess"],
+                    disabled=not target_run_esmfold2,
+                    format_func={"sequence": "Sequence only", "initial_guess": "Selected-target distogram"}.get,
+                    key="target_refold_esm_modes",
+                    help="Selected-target distogram is ESMFold2's template-like mode: it conditions on the selected target structure, without binder/interface geometry.",
+                )
+                esm_cols = st.columns(4)
+                esm_cols[0].checkbox(
+                    "Use ESMFold2 target MSAs",
+                    value=True,
+                    disabled=not target_run_esmfold2,
+                    key="target_refold_esm_msa",
+                    help=(
+                        "Pass prepared per-target-chain A3M files into ESMFold2 ProteinInput.msa. "
+                        "This is per-chain target MSA conditioning, not a ColabFold-style paired multimer A3M; "
+                        "missing, query-only, or mismatched MSAs are skipped and noted in the ESMFold2 metrics."
+                    ),
+                )
+                esm_cols[1].number_input("ESMFold2 sampling steps", 1, 256, 68, disabled=not target_run_esmfold2, key="target_refold_esm_steps")
+                esm_cols[2].number_input("ESMFold2 recycling loops", 1, 64, 10, disabled=not target_run_esmfold2, key="target_refold_esm_loops")
+                esm_cols[3].number_input("ESMFold2 seed", 0, 999999, 0, disabled=not target_run_esmfold2, key="target_refold_esm_seed")
+
+            with st.expander("Boltz-2 Settings", expanded=target_run_boltz2):
+                boltz_cols = st.columns(6)
+                boltz_cols[0].checkbox("Use templates", value=True, disabled=not target_run_boltz2, key="target_refold_boltz_template", help="Uses the staged input target as the template.")
+                boltz_cols[1].checkbox("Use target MSAs", value=True, disabled=not target_run_boltz2, key="target_refold_boltz_msa")
+                boltz_cols[2].number_input("Recycling steps", 1, 48, 10, disabled=not target_run_boltz2, key="target_refold_boltz_recycles")
+                boltz_cols[3].number_input("Sampling steps", 1, 1000, 100, disabled=not target_run_boltz2, key="target_refold_boltz_steps")
+                boltz_cols[4].number_input("Diffusion samples", 1, 20, 3, disabled=not target_run_boltz2, key="target_refold_boltz_samples")
+                boltz_cols[5].checkbox("Write full PAE", value=True, disabled=not target_run_boltz2, key="target_refold_boltz_full_pae")
+
+            with st.expander("RF3 Settings", expanded=target_run_rf3):
+                rf3_cols = st.columns(6)
+                rf3_cols[0].text_input("RF3 checkpoint", value=str(RF3_CHECKPOINT), disabled=not target_run_rf3, key="target_refold_rf3_checkpoint")
+                rf3_cols[1].checkbox("Use templates", value=True, disabled=not target_run_rf3, key="target_refold_rf3_template", help="Uses the staged input target chains as RF3 template coordinates.")
+                rf3_cols[2].checkbox("Use target MSAs", value=True, disabled=not target_run_rf3, key="target_refold_rf3_msa")
+                rf3_cols[3].number_input("RF3 recycles", 1, 48, 10, disabled=not target_run_rf3, key="target_refold_rf3_recycles")
+                rf3_cols[4].number_input("RF3 diffusion steps", 1, 1000, 50, disabled=not target_run_rf3, key="target_refold_rf3_steps")
+                rf3_cols[5].number_input("RF3 samples", 1, 20, 5, disabled=not target_run_rf3, key="target_refold_rf3_samples")
+                st.number_input("RF3 seed", 0, 999999, 0, disabled=not target_run_rf3, key="target_refold_rf3_seed")
+
+            with st.expander("OpenFold-3 Settings", expanded=target_run_openfold3):
+                of3_cols = st.columns(5)
+                of3_cols[0].text_input("OpenFold-3 checkpoint", value=str(OPENFOLD3_CHECKPOINT), disabled=not target_run_openfold3, key="target_refold_openfold3_checkpoint")
+                of3_cols[1].checkbox("Use target MSAs", value=True, disabled=not target_run_openfold3, key="target_refold_openfold3_msa")
+                of3_cols[2].number_input("Diffusion samples", 1, 20, 5, disabled=not target_run_openfold3, key="target_refold_openfold3_samples")
+                of3_cols[3].number_input("Model seeds", 1, 20, 1, disabled=not target_run_openfold3, key="target_refold_openfold3_seeds")
+                of3_cols[4].number_input("Recycles", 1, 48, 3, disabled=not target_run_openfold3, key="target_refold_openfold3_recycles")
+                st.checkbox("Use MSA server", value=False, disabled=not target_run_openfold3, key="target_refold_openfold3_msa_server")
+
+            with st.expander("Protenix v0.5 Settings", expanded=target_run_protenix):
+                protenix_cols = st.columns(4)
+                protenix_cols[0].checkbox("Use target MSAs", value=True, disabled=not target_run_protenix, key="target_refold_protenix_msa")
+                protenix_cols[1].number_input("Pairformer cycles", 1, 48, 3, disabled=not target_run_protenix, key="target_refold_protenix_cycle")
+                protenix_cols[2].number_input("Diffusion steps", 1, 1000, 50, disabled=not target_run_protenix, key="target_refold_protenix_steps")
+                protenix_cols[3].number_input("Samples", 1, 20, 5, disabled=not target_run_protenix, key="target_refold_protenix_samples")
+
+            with st.expander("Protenix v1 Settings", expanded=target_run_protenix_v1):
+                protenix_v1_cols = st.columns(6)
+                protenix_v1_cols[0].text_input("Model", value=PROTENIX_V1_MODEL, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_model")
+                protenix_v1_cols[1].checkbox("Use target MSAs", value=True, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_msa")
+                protenix_v1_cols[2].checkbox("Use templates", value=True, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_template")
+                protenix_v1_cols[3].number_input("Pairformer cycles", 1, 48, 10, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_cycle")
+                protenix_v1_cols[4].number_input("Diffusion steps", 1, 1000, 200, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_steps")
+                protenix_v1_cols[5].number_input("Samples", 1, 20, 5, disabled=not target_run_protenix_v1, key="target_refold_protenix_v1_samples")
+
+            with st.expander("Protenix v2 Settings", expanded=target_run_protenix_v2):
+                protenix_v2_cols = st.columns(6)
+                protenix_v2_cols[0].text_input("Model", value=PROTENIX_V2_MODEL, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_model")
+                protenix_v2_cols[1].checkbox("Use target MSAs", value=True, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_msa")
+                protenix_v2_cols[2].checkbox("Use templates", value=True, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_template")
+                protenix_v2_cols[3].number_input("Pairformer cycles", 1, 48, 10, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_cycle")
+                protenix_v2_cols[4].number_input("Diffusion steps", 1, 1000, 200, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_steps")
+                protenix_v2_cols[5].number_input("Samples", 1, 20, 5, disabled=not target_run_protenix_v2, key="target_refold_protenix_v2_samples")
+
+            with st.expander("BoltzGen Fold Settings", expanded=target_run_boltzgen):
+                boltzgen_cols = st.columns(4)
+                boltzgen_cols[0].checkbox(
+                    "Use templates",
+                    value=True,
+                    disabled=True,
+                    key="target_refold_boltzgen_template",
+                    help="BoltzGen Fold runs in template mode; the staged input target is always used as the template.",
+                )
+                boltzgen_cols[1].number_input("Recycling steps", 1, 48, 3, disabled=not target_run_boltzgen, key="target_refold_boltzgen_recycles")
+                boltzgen_cols[2].number_input("Sampling steps", 1, 1000, 100, disabled=not target_run_boltzgen, key="target_refold_boltzgen_steps")
+                boltzgen_cols[3].number_input("Diffusion samples", 1, 20, 3, disabled=not target_run_boltzgen, key="target_refold_boltzgen_samples")
+
+            with st.expander("Metrics", expanded=True):
+                st.checkbox("Predicted Rosetta metrics", value=False, key="target_refold_rosetta")
+
+        with run_tab:
+            selected_entries = list(st.session_state.get("target_refolding_selected_entries") or [])
+            selected_break_count = sum(1 for entry in selected_entries if _target_break_count(entry) > 0)
+            selected_split_fragment_count = sum(
+                1
+                for entry in selected_entries
+                if str(entry.get("source_category") or "") == "split_fragments"
+                and len([chain for chain in entry.get("target_entity_chains") or [] if str(chain)]) > 1
+            )
+            selected_engines = [
+                label
+                for label, enabled in [
+                    ("AF3", st.session_state.get("target_refold_run_af3", True)),
+                    ("ColabFold", st.session_state.get("target_refold_run_colab", True)),
+                    ("AF2 template", st.session_state.get("target_refold_run_af2", True)),
+                    ("ESMFold2", st.session_state.get("target_refold_run_esmfold2", True)),
+                    ("Boltz-2", st.session_state.get("target_refold_run_boltz2", True)),
+                    ("RF3", st.session_state.get("target_refold_run_rf3", True)),
+                    ("OpenFold-3", st.session_state.get("target_refold_run_openfold3", True)),
+                    ("Protenix v0.5", st.session_state.get("target_refold_run_protenix", True)),
+                    ("Protenix v1", st.session_state.get("target_refold_run_protenix_v1", True)),
+                    ("Protenix v2", st.session_state.get("target_refold_run_protenix_v2", True)),
+                    ("BoltzGen Fold", st.session_state.get("target_refold_run_boltzgen", False)),
+                ]
+                if enabled
+            ]
+            eval_name = st.text_input("Evaluation name", value="Target refolding evaluation", key="target_refold_eval_name")
+            chain_break_mode = str(
+                st.session_state.get("target_refold_chain_break_mode")
+                or "Fragment chains for broken targets (recommended)"
+            )
+            split_chain_breaks = bool(
+                selected_split_fragment_count
+                or chain_break_mode
+                in {
+                    "Fragment chains for broken targets (recommended)",
+                    "Separate fragment chains",
+                    "Split into fragment chains",
+                }
+            )
+            target_gpu = gpu_run_panel(key="target_refold_queue", default="0")
+            st.info(
+                f"{len(selected_entries):,} target structure(s) selected. "
+                f"Selected engines: {', '.join(selected_engines) or 'none'}. "
+                f"Chain breaks: {'separate fragment chains' if split_chain_breaks else 'residue-gap single chain'}."
+            )
+            if (
+                split_chain_breaks
+                and st.session_state.get("target_refold_run_af2", True)
+                and (
+                    not st.session_state.get("target_refold_af2_multimer", True)
+                    or not st.session_state.get("target_refold_af2_initial_guess", True)
+                )
+            ):
+                st.warning(
+                    "AF2-IG will not preserve the split crop layout unless AF2 multimer "
+                    "and whole-input initial guess are enabled."
+                )
+            non_assisted_engines = [
+                label
+                for label, key in [
+                    ("AF3", "target_refold_run_af3"),
+                    ("ColabFold", "target_refold_run_colab"),
+                    ("ESMFold2", "target_refold_run_esmfold2"),
+                    ("RF3", "target_refold_run_rf3"),
+                    ("OpenFold-3", "target_refold_run_openfold3"),
+                    ("Protenix v0.5", "target_refold_run_protenix"),
+                    ("Protenix v1", "target_refold_run_protenix_v1"),
+                    ("Protenix v2", "target_refold_run_protenix_v2"),
+                ]
+                if st.session_state.get(key, True)
+            ]
+            if split_chain_breaks and selected_break_count and non_assisted_engines:
+                st.warning(
+                    "This selection has residue-number breaks. "
+                    f"Non-template-assisted engines selected: {', '.join(non_assisted_engines)}."
+                )
+            unsafe_single_chain_template_engines = [
+                label
+                for label, key in [
+                    ("AF2 template", "target_refold_run_af2"),
+                    ("Boltz-2", "target_refold_run_boltz2"),
+                ]
+                if st.session_state.get(key, True)
+            ]
+            block_single_chain_template_run = bool(
+                selected_break_count and not split_chain_breaks and unsafe_single_chain_template_engines
+            )
+            if selected_break_count and not split_chain_breaks:
+                message = (
+                    "Legacy single-chain gaps keeps discontinuous coordinates on one chain. "
+                    "For fragmented targets this is diagnostic only; template engines can collapse to the first fragment or fail."
+                )
+                if block_single_chain_template_run:
+                    st.error(
+                        message
+                        + " Switch to fragment-chain mode before running "
+                        + ", ".join(unsafe_single_chain_template_engines)
+                        + "."
+                    )
+                else:
+                    st.warning(message)
+            if selected_split_fragment_count:
+                st.info("Split-fragment targets will be staged as one multi-chain target structure, regardless of the legacy residue-gap mode.")
+            estimate_engine_keys: list[str] = []
+            if st.session_state.get("target_refold_run_af3", True):
+                estimate_engine_keys.append("alphafast_af3")
+            if st.session_state.get("target_refold_run_colab", True):
+                estimate_engine_keys.append("colabfold")
+            if st.session_state.get("target_refold_run_af2", True):
+                estimate_engine_keys.append("af2_initial_guess")
+            if st.session_state.get("target_refold_run_boltz2", True):
+                estimate_engine_keys.append("boltz2_initial_guess")
+            if st.session_state.get("target_refold_run_esmfold2", True):
+                estimate_engine_keys.append("esmfold2")
+            if st.session_state.get("target_refold_run_rf3", True):
+                estimate_engine_keys.append("rf3")
+            if st.session_state.get("target_refold_run_openfold3", True):
+                estimate_engine_keys.append("openfold3")
+            if st.session_state.get("target_refold_run_protenix", True):
+                estimate_engine_keys.append("protenix")
+            if st.session_state.get("target_refold_run_protenix_v1", True):
+                estimate_engine_keys.append("protenix_v1")
+            if st.session_state.get("target_refold_run_protenix_v2", True):
+                estimate_engine_keys.append("protenix_v2")
+            if st.session_state.get("target_refold_run_boltzgen", False):
+                estimate_engine_keys.append("boltzgen_fold")
+            msa_needed = bool(
+                (
+                    st.session_state.get("target_refold_run_af3", True)
+                    and st.session_state.get("target_refold_af3_msa", True)
+                )
+                or (
+                    st.session_state.get("target_refold_run_colab", True)
+                    and st.session_state.get("target_refold_colab_msa", True)
+                )
+                or (st.session_state.get("target_refold_run_boltz2", True) and st.session_state.get("target_refold_boltz_msa", True))
+                or (st.session_state.get("target_refold_run_esmfold2", True) and st.session_state.get("target_refold_esm_msa", True))
+                or (st.session_state.get("target_refold_run_rf3", True) and st.session_state.get("target_refold_rf3_msa", True))
+                or (st.session_state.get("target_refold_run_openfold3", True) and st.session_state.get("target_refold_openfold3_msa", True))
+                or (st.session_state.get("target_refold_run_protenix", True) and st.session_state.get("target_refold_protenix_msa", True))
+                or (st.session_state.get("target_refold_run_protenix_v1", True) and st.session_state.get("target_refold_protenix_v1_msa", True))
+                or (st.session_state.get("target_refold_run_protenix_v2", True) and st.session_state.get("target_refold_protenix_v2_msa", True))
+            )
+            msa_repository_dir = Path(str(st.session_state.get("target_refold_msa_repository") or MSA_REPOSITORY_DIR))
+            missing_msa_chain_count = _selected_missing_cached_msa_count(selected_entries, msa_repository_dir) if msa_needed else 0
+            if msa_needed and missing_msa_chain_count:
+                estimate_engine_keys.insert(0, "alphafast_msa")
+            if st.session_state.get("target_refold_rosetta", False):
+                estimate_engine_keys.append("postprocessing")
+            estimate_count = len(selected_entries)
+            estimate_total_residues = sum(_target_entry_sequence_length(entry) for entry in selected_entries) or None
+            estimate_chain_count = sum(_target_entry_chain_count(entry) for entry in selected_entries)
+            estimate_engine_params: dict[str, dict[str, int]] = {}
+            if "esmfold2" in estimate_engine_keys:
+                estimate_engine_params["esmfold2"] = {
+                    "num_loops": int(st.session_state.get("target_refold_esm_loops", 10)),
+                    "num_sampling_steps": int(st.session_state.get("target_refold_esm_steps", 68)),
+                }
+            if estimate_engine_keys and estimate_count:
+                estimate = estimate_engines(
+                    engines=estimate_engine_keys,
+                    candidate_count=estimate_count,
+                    total_residues=int(estimate_total_residues) if estimate_total_residues else None,
+                    engine_params=estimate_engine_params,
+                )
+                if "alphafast_msa" in estimate_engine_keys and estimate_count:
+                    msa_estimate = estimate_engines(
+                        engines=["alphafast_msa"],
+                        candidate_count=int(missing_msa_chain_count),
+                        observations=[],
+                    )
+                    msa_seconds = float((msa_estimate.get("rows") or [{}])[0].get("estimated_seconds") or 0.0)
+                    for row in estimate.get("rows") or []:
+                        if row.get("engine") == "alphafast_msa":
+                            previous_seconds = float(row.get("estimated_seconds") or 0.0)
+                            row["estimated_seconds"] = msa_seconds
+                            row["estimated_time"] = msa_estimate.get("total_time")
+                            row["seconds_per_candidate"] = msa_seconds / float(missing_msa_chain_count) if missing_msa_chain_count else None
+                            row["seconds_per_residue"] = None
+                            row["basis"] = f"missing cached MSA chains ({missing_msa_chain_count})"
+                            estimate["total_seconds"] = max(0.0, float(estimate.get("total_seconds") or 0.0) - previous_seconds + msa_seconds)
+                            break
+                    estimate["total_time"] = format_duration(float(estimate.get("total_seconds") or 0.0))
+                with st.expander("Runtime estimate", expanded=True):
+                    runtime_cols = st.columns(5)
+                    runtime_cols[0].metric("Estimated total", estimate["total_time"])
+                    runtime_cols[1].metric("Target structures", f"{estimate_count:,}")
+                    runtime_cols[2].metric("Target chains", f"{estimate_chain_count:,}" if estimate_chain_count else "n/a")
+                    runtime_cols[3].metric("Residues", f"{int(estimate_total_residues):,}" if estimate_total_residues else "n/a")
+                    runtime_cols[4].metric("Engines/steps", len(estimate_engine_keys))
+                    estimate_df = _estimate_rows_dataframe(estimate)
+                    if not estimate_df.empty:
+                        st.dataframe(
+                            estimate_df,
+                            width="stretch",
+                            hide_index=True,
+                            column_config={
+                            "seconds_per_candidate": st.column_config.NumberColumn("sec / target", format="%.1f"),
+                            "seconds_per_residue": st.column_config.NumberColumn("sec / residue", format="%.3f"),
+                        },
+                    )
+                    st.caption(
+                        "Estimates use previous completed jobs when available and fallback rates otherwise. "
+                        "The MSA row is included when selected engines need shared target MSAs."
+                    )
+            elif estimate_engine_keys:
+                st.caption("Runtime estimate needs at least one selected target chain.")
+            run_disabled = not selected_entries or not selected_engines or block_single_chain_template_run
+            if st.button("Run target refolding", type="primary", disabled=run_disabled, key="target_hub_run_refolding"):
+                try:
+                    source_run_dir, run_dir = enqueue_target_refolding_evaluation(
+                        selected_entries,
+                        evaluation_name=str(eval_name or "Target refolding evaluation"),
+                        models=["af3", "boltz", "colabfold"],
+                        split_chain_breaks=bool(split_chain_breaks),
+                        chain_break_mode="split_fragments" if split_chain_breaks else "preserve_original_chain",
+                        run_common_interface_metrics=False,
+                        run_pyrosetta_input_metrics=False,
+                        run_predicted_rosetta_metrics=bool(st.session_state.get("target_refold_rosetta", False)),
+                        run_pymol_metrics=False,
+                        pyrosetta_nprocs=16,
+                        run_alphafast_af3=bool(st.session_state.get("target_refold_run_af3", True)),
+                        run_colabfold=bool(st.session_state.get("target_refold_run_colab", True)),
+                        run_af2_initial_guess=bool(st.session_state.get("target_refold_run_af2", True)),
+                        run_boltz2_initial_guess=bool(st.session_state.get("target_refold_run_boltz2", True)),
+                        run_esmfold2=bool(st.session_state.get("target_refold_run_esmfold2", True)),
+                        run_rf3=bool(st.session_state.get("target_refold_run_rf3", True)),
+                        run_openfold3=bool(st.session_state.get("target_refold_run_openfold3", True)),
+                        run_protenix=bool(st.session_state.get("target_refold_run_protenix", True)),
+                        run_protenix_v1=bool(st.session_state.get("target_refold_run_protenix_v1", True)),
+                        run_protenix_v2=bool(st.session_state.get("target_refold_run_protenix_v2", True)),
+                        run_boltzgen_fold=bool(st.session_state.get("target_refold_run_boltzgen", False)),
+                        colabfold_msa_source=(
+                            "msa_repository_then_alphafast_mmseqs_gpu"
+                            if bool(st.session_state.get("target_refold_colab_msa", True))
+                            else "repo_run_csv"
+                        ),
+                        msa_repository_dir=Path(str(st.session_state.get("target_refold_msa_repository") or MSA_REPOSITORY_DIR)),
+                        require_real_target_msa=bool(st.session_state.get("target_refold_require_real_msa", True)),
+                        alphafast_db_dir=Path(str(st.session_state.get("target_refold_alphafast_db") or ALPHAFAST_DB_DIR)),
+                        alphafast_weights_dir=Path(str(st.session_state.get("target_refold_af3_weights") or ALPHAFAST_WEIGHTS_DIR)),
+                        colabfold_cache_dir=Path(str(st.session_state.get("target_refold_colab_cache") or COLABFOLD_CACHE_DIR)),
+                        alphafast_num_recycles=int(st.session_state.get("target_refold_af3_recycles", 10)),
+                        alphafast_use_target_templates=bool(st.session_state.get("target_refold_af3_templates", True)),
+                        alphafast_query_only_msa=not bool(st.session_state.get("target_refold_af3_msa", True)),
+                        alphafast_gpu_device=str(target_gpu),
+                        af2_num_recycles=int(st.session_state.get("target_refold_af2_recycles", 3)),
+                        af2_multimer=bool(st.session_state.get("target_refold_af2_multimer", True)),
+                        af2_use_initial_guess=bool(st.session_state.get("target_refold_run_af2", True)),
+                        af2_use_binder_template=bool(st.session_state.get("target_refold_af2_fragment_template", True)),
+                        af2_use_interface_template=bool(st.session_state.get("target_refold_af2_layout_template", True)),
+                        colabfold_num_recycles=int(st.session_state.get("target_refold_colab_recycles", 3)),
+                        colabfold_num_models=int(st.session_state.get("target_refold_colab_models", 3)),
+                        colabfold_gpu_device=str(target_gpu),
+                        gpu_device=str(target_gpu),
+                        colabfold_use_target_templates=bool(st.session_state.get("target_refold_colab_templates", True)),
+                        colabfold_use_target_msa=bool(st.session_state.get("target_refold_colab_msa", True)),
+                        colabfold_max_template_hits=4,
+                        boltz2_use_target_template=bool(st.session_state.get("target_refold_boltz_template", True)),
+                        boltz2_use_target_msa=bool(st.session_state.get("target_refold_boltz_msa", True)),
+                        boltz2_recycling_steps=int(st.session_state.get("target_refold_boltz_recycles", 10)),
+                        boltz2_sampling_steps=int(st.session_state.get("target_refold_boltz_steps", 100)),
+                        boltz2_diffusion_samples=int(st.session_state.get("target_refold_boltz_samples", 3)),
+                        boltz2_write_full_pae=bool(st.session_state.get("target_refold_boltz_full_pae", True)),
+                        esmfold2_modes=list(st.session_state.get("target_refold_esm_modes") or target_esm_modes or ["initial_guess"]),
+                        esmfold2_use_target_msa=bool(st.session_state.get("target_refold_esm_msa", True)),
+                        num_sampling_steps=int(st.session_state.get("target_refold_esm_steps", 68)),
+                        num_loops=int(st.session_state.get("target_refold_esm_loops", 10)),
+                        seed=int(st.session_state.get("target_refold_esm_seed", 0)),
+                        rf3_checkpoint_path=Path(str(st.session_state.get("target_refold_rf3_checkpoint") or RF3_CHECKPOINT)),
+                        rf3_use_target_msa=bool(st.session_state.get("target_refold_rf3_msa", True)),
+                        rf3_use_target_template=bool(st.session_state.get("target_refold_rf3_template", True)),
+                        rf3_recycles=int(st.session_state.get("target_refold_rf3_recycles", 10)),
+                        rf3_num_steps=int(st.session_state.get("target_refold_rf3_steps", 50)),
+                        rf3_diffusion_batch_size=int(st.session_state.get("target_refold_rf3_samples", 5)),
+                        rf3_seed=int(st.session_state.get("target_refold_rf3_seed", 0)),
+                        openfold3_checkpoint_path=Path(str(st.session_state.get("target_refold_openfold3_checkpoint") or OPENFOLD3_CHECKPOINT)),
+                        openfold3_use_target_msa=bool(st.session_state.get("target_refold_openfold3_msa", True)),
+                        openfold3_num_diffusion_samples=int(st.session_state.get("target_refold_openfold3_samples", 5)),
+                        openfold3_num_model_seeds=int(st.session_state.get("target_refold_openfold3_seeds", 1)),
+                        openfold3_num_recycles=int(st.session_state.get("target_refold_openfold3_recycles", 3)),
+                        openfold3_use_msa_server=bool(st.session_state.get("target_refold_openfold3_msa_server", False)),
+                        protenix_use_msa=bool(st.session_state.get("target_refold_protenix_msa", True)),
+                        protenix_cycle=int(st.session_state.get("target_refold_protenix_cycle", 3)),
+                        protenix_diffusion_steps=int(st.session_state.get("target_refold_protenix_steps", 50)),
+                        protenix_samples=int(st.session_state.get("target_refold_protenix_samples", 5)),
+                        protenix_v1_model_name=str(st.session_state.get("target_refold_protenix_v1_model") or PROTENIX_V1_MODEL),
+                        protenix_v1_use_msa=bool(st.session_state.get("target_refold_protenix_v1_msa", True)),
+                        protenix_v1_use_template=bool(st.session_state.get("target_refold_protenix_v1_template", True)),
+                        protenix_v1_use_default_params=True,
+                        protenix_v1_cycle=int(st.session_state.get("target_refold_protenix_v1_cycle", 10)),
+                        protenix_v1_diffusion_steps=int(st.session_state.get("target_refold_protenix_v1_steps", 200)),
+                        protenix_v1_samples=int(st.session_state.get("target_refold_protenix_v1_samples", 5)),
+                        protenix_v2_model_name=str(st.session_state.get("target_refold_protenix_v2_model") or PROTENIX_V2_MODEL),
+                        protenix_v2_use_msa=bool(st.session_state.get("target_refold_protenix_v2_msa", True)),
+                        protenix_v2_use_template=bool(st.session_state.get("target_refold_protenix_v2_template", True)),
+                        protenix_v2_use_default_params=True,
+                        protenix_v2_cycle=int(st.session_state.get("target_refold_protenix_v2_cycle", 10)),
+                        protenix_v2_diffusion_steps=int(st.session_state.get("target_refold_protenix_v2_steps", 200)),
+                        protenix_v2_samples=int(st.session_state.get("target_refold_protenix_v2_samples", 5)),
+                        boltzgen_recycling_steps=int(st.session_state.get("target_refold_boltzgen_recycles", 3)),
+                        boltzgen_sampling_steps=int(st.session_state.get("target_refold_boltzgen_steps", 100)),
+                        boltzgen_diffusion_samples=int(st.session_state.get("target_refold_boltzgen_samples", 3)),
+                    )
+                    spawn_worker_for_run(run_dir)
+                    st.success("Target refolding queued. The worker will keep running independently of Streamlit.")
+                    show_pipeline_links(run_dir, [source_run_dir, run_dir])
+                except Exception as exc:
+                    st.error(str(exc))
+
+        with refold_results_tab:
+            refresh_results_button("target_preparation_refolding_refresh_results")
+            runs = _target_refolding_runs()
+            if not runs:
+                st.info("No target-refolding runs are available yet.")
             else:
-                st.warning(message)
-        if selected_split_fragment_count:
-            st.info("Split-fragment targets will be staged as one multi-chain target structure, regardless of the legacy residue-gap mode.")
-        estimate_engine_keys: list[str] = []
-        if st.session_state.get("target_refold_run_af3", True):
-            estimate_engine_keys.append("alphafast_af3")
-        if st.session_state.get("target_refold_run_colab", True):
-            estimate_engine_keys.append("colabfold")
-        if st.session_state.get("target_refold_run_af2", True):
-            estimate_engine_keys.append("af2_initial_guess")
-        if st.session_state.get("target_refold_run_boltz2", True):
-            estimate_engine_keys.append("boltz2_initial_guess")
-        if st.session_state.get("target_refold_run_esmfold2", True):
-            estimate_engine_keys.append("esmfold2")
-        if st.session_state.get("target_refold_run_rf3", True):
-            estimate_engine_keys.append("rf3")
-        if st.session_state.get("target_refold_run_openfold3", True):
-            estimate_engine_keys.append("openfold3")
-        if st.session_state.get("target_refold_run_protenix", True):
-            estimate_engine_keys.append("protenix")
-        if st.session_state.get("target_refold_run_protenix_v1", True):
-            estimate_engine_keys.append("protenix_v1")
-        if st.session_state.get("target_refold_run_protenix_v2", True):
-            estimate_engine_keys.append("protenix_v2")
-        if st.session_state.get("target_refold_run_boltzgen", False):
-            estimate_engine_keys.append("boltzgen_fold")
-        msa_needed = bool(
-            (
-                st.session_state.get("target_refold_run_af3", True)
-                and st.session_state.get("target_refold_af3_msa", True)
-            )
-            or (
-                st.session_state.get("target_refold_run_colab", True)
-                and st.session_state.get("target_refold_colab_msa", True)
-            )
-            or (st.session_state.get("target_refold_run_boltz2", True) and st.session_state.get("target_refold_boltz_msa", True))
-            or (st.session_state.get("target_refold_run_esmfold2", True) and st.session_state.get("target_refold_esm_msa", True))
-            or (st.session_state.get("target_refold_run_rf3", True) and st.session_state.get("target_refold_rf3_msa", True))
-            or (st.session_state.get("target_refold_run_openfold3", True) and st.session_state.get("target_refold_openfold3_msa", True))
-            or (st.session_state.get("target_refold_run_protenix", True) and st.session_state.get("target_refold_protenix_msa", True))
-            or (st.session_state.get("target_refold_run_protenix_v1", True) and st.session_state.get("target_refold_protenix_v1_msa", True))
-            or (st.session_state.get("target_refold_run_protenix_v2", True) and st.session_state.get("target_refold_protenix_v2_msa", True))
-        )
-        msa_repository_dir = Path(str(st.session_state.get("target_refold_msa_repository") or MSA_REPOSITORY_DIR))
-        missing_msa_chain_count = _selected_missing_cached_msa_count(selected_entries, msa_repository_dir) if msa_needed else 0
-        if msa_needed and missing_msa_chain_count:
-            estimate_engine_keys.insert(0, "alphafast_msa")
-        if st.session_state.get("target_refold_rosetta", False):
-            estimate_engine_keys.append("postprocessing")
-        estimate_count = len(selected_entries)
-        estimate_total_residues = sum(_target_entry_sequence_length(entry) for entry in selected_entries) or None
-        estimate_chain_count = sum(_target_entry_chain_count(entry) for entry in selected_entries)
-        estimate_engine_params: dict[str, dict[str, int]] = {}
-        if "esmfold2" in estimate_engine_keys:
-            estimate_engine_params["esmfold2"] = {
-                "num_loops": int(st.session_state.get("target_refold_esm_loops", 10)),
-                "num_sampling_steps": int(st.session_state.get("target_refold_esm_steps", 68)),
-            }
-        if estimate_engine_keys and estimate_count:
-            estimate = estimate_engines(
-                engines=estimate_engine_keys,
-                candidate_count=estimate_count,
-                total_residues=int(estimate_total_residues) if estimate_total_residues else None,
-                engine_params=estimate_engine_params,
-            )
-            if "alphafast_msa" in estimate_engine_keys and estimate_count:
-                msa_estimate = estimate_engines(
-                    engines=["alphafast_msa"],
-                    candidate_count=int(missing_msa_chain_count),
-                    observations=[],
+                runs_df = pd.DataFrame(runs)
+                hidden_columns = {"result", "run_dir", "source_run_dir"}
+                preferred_columns = [
+                    "job_code",
+                    "status",
+                    "target",
+                    "target_chain_ids",
+                    "evidence_mode",
+                    "evidence_detail",
+                    "warning",
+                    "target_structures",
+                    "target_chains",
+                    "records",
+                    "current_phase",
+                    "current_engine",
+                    "created_at",
+                    "run_id",
+                    "task_group",
+                ]
+                visible_columns = [
+                    column for column in preferred_columns if column in runs_df.columns and column not in hidden_columns
+                ]
+                visible_columns.extend(
+                    column for column in runs_df.columns if column not in hidden_columns and column not in visible_columns
                 )
-                msa_seconds = float((msa_estimate.get("rows") or [{}])[0].get("estimated_seconds") or 0.0)
-                for row in estimate.get("rows") or []:
-                    if row.get("engine") == "alphafast_msa":
-                        previous_seconds = float(row.get("estimated_seconds") or 0.0)
-                        row["estimated_seconds"] = msa_seconds
-                        row["estimated_time"] = msa_estimate.get("total_time")
-                        row["seconds_per_candidate"] = msa_seconds / float(missing_msa_chain_count) if missing_msa_chain_count else None
-                        row["seconds_per_residue"] = None
-                        row["basis"] = f"missing cached MSA chains ({missing_msa_chain_count})"
-                        estimate["total_seconds"] = max(0.0, float(estimate.get("total_seconds") or 0.0) - previous_seconds + msa_seconds)
-                        break
-                estimate["total_time"] = format_duration(float(estimate.get("total_seconds") or 0.0))
-            with st.expander("Runtime estimate", expanded=True):
-                runtime_cols = st.columns(5)
-                runtime_cols[0].metric("Estimated total", estimate["total_time"])
-                runtime_cols[1].metric("Target structures", f"{estimate_count:,}")
-                runtime_cols[2].metric("Target chains", f"{estimate_chain_count:,}" if estimate_chain_count else "n/a")
-                runtime_cols[3].metric("Residues", f"{int(estimate_total_residues):,}" if estimate_total_residues else "n/a")
-                runtime_cols[4].metric("Engines/steps", len(estimate_engine_keys))
-                estimate_df = _estimate_rows_dataframe(estimate)
-                if not estimate_df.empty:
-                    st.dataframe(
-                        estimate_df,
-                        width="stretch",
-                        hide_index=True,
-                        column_config={
-                        "seconds_per_candidate": st.column_config.NumberColumn("sec / target", format="%.1f"),
-                        "seconds_per_residue": st.column_config.NumberColumn("sec / residue", format="%.3f"),
+                display_df = runs_df.copy()
+                if {"job_code", "result"}.issubset(display_df.columns):
+                    display_df["job_code"] = display_df.apply(
+                        lambda row: f"{row['result']}&job_code={row['job_code']}",
+                        axis=1,
+                    )
+                table_key = "target_refolding_results"
+                event = st.dataframe(
+                    display_df[visible_columns],
+                    hide_index=True,
+                    width="stretch",
+                    key=f"{table_key}_jobs_table",
+                    on_select="rerun",
+                    selection_mode="multi-row",
+                    column_config={
+                        "job_code": st.column_config.LinkColumn("job_code", display_text=r"job_code=([^&]+)"),
                     },
                 )
-                st.caption(
-                    "Estimates use previous completed jobs when available and fallback rates otherwise. "
-                    "The MSA row is included when selected engines need shared target MSAs."
-                )
-        elif estimate_engine_keys:
-            st.caption("Runtime estimate needs at least one selected target chain.")
-        run_disabled = not selected_entries or not selected_engines or block_single_chain_template_run
-        if st.button("Run target refolding", type="primary", disabled=run_disabled, key="target_hub_run_refolding"):
-            try:
-                source_run_dir, run_dir = enqueue_target_refolding_evaluation(
-                    selected_entries,
-                    evaluation_name=str(eval_name or "Target refolding evaluation"),
-                    models=["af3", "boltz", "colabfold"],
-                    split_chain_breaks=bool(split_chain_breaks),
-                    chain_break_mode="split_fragments" if split_chain_breaks else "preserve_original_chain",
-                    run_common_interface_metrics=False,
-                    run_pyrosetta_input_metrics=False,
-                    run_predicted_rosetta_metrics=bool(st.session_state.get("target_refold_rosetta", False)),
-                    run_pymol_metrics=False,
-                    pyrosetta_nprocs=16,
-                    run_alphafast_af3=bool(st.session_state.get("target_refold_run_af3", True)),
-                    run_colabfold=bool(st.session_state.get("target_refold_run_colab", True)),
-                    run_af2_initial_guess=bool(st.session_state.get("target_refold_run_af2", True)),
-                    run_boltz2_initial_guess=bool(st.session_state.get("target_refold_run_boltz2", True)),
-                    run_esmfold2=bool(st.session_state.get("target_refold_run_esmfold2", True)),
-                    run_rf3=bool(st.session_state.get("target_refold_run_rf3", True)),
-                    run_openfold3=bool(st.session_state.get("target_refold_run_openfold3", True)),
-                    run_protenix=bool(st.session_state.get("target_refold_run_protenix", True)),
-                    run_protenix_v1=bool(st.session_state.get("target_refold_run_protenix_v1", True)),
-                    run_protenix_v2=bool(st.session_state.get("target_refold_run_protenix_v2", True)),
-                    run_boltzgen_fold=bool(st.session_state.get("target_refold_run_boltzgen", False)),
-                    colabfold_msa_source=(
-                        "msa_repository_then_alphafast_mmseqs_gpu"
-                        if bool(st.session_state.get("target_refold_colab_msa", True))
-                        else "repo_run_csv"
-                    ),
-                    msa_repository_dir=Path(str(st.session_state.get("target_refold_msa_repository") or MSA_REPOSITORY_DIR)),
-                    require_real_target_msa=bool(st.session_state.get("target_refold_require_real_msa", True)),
-                    alphafast_db_dir=Path(str(st.session_state.get("target_refold_alphafast_db") or ALPHAFAST_DB_DIR)),
-                    alphafast_weights_dir=Path(str(st.session_state.get("target_refold_af3_weights") or ALPHAFAST_WEIGHTS_DIR)),
-                    colabfold_cache_dir=Path(str(st.session_state.get("target_refold_colab_cache") or COLABFOLD_CACHE_DIR)),
-                    alphafast_num_recycles=int(st.session_state.get("target_refold_af3_recycles", 10)),
-                    alphafast_use_target_templates=bool(st.session_state.get("target_refold_af3_templates", True)),
-                    alphafast_query_only_msa=not bool(st.session_state.get("target_refold_af3_msa", True)),
-                    alphafast_gpu_device=str(target_gpu),
-                    af2_num_recycles=int(st.session_state.get("target_refold_af2_recycles", 3)),
-                    af2_multimer=bool(st.session_state.get("target_refold_af2_multimer", True)),
-                    af2_use_initial_guess=bool(st.session_state.get("target_refold_run_af2", True)),
-                    af2_use_binder_template=bool(st.session_state.get("target_refold_af2_fragment_template", True)),
-                    af2_use_interface_template=bool(st.session_state.get("target_refold_af2_layout_template", True)),
-                    colabfold_num_recycles=int(st.session_state.get("target_refold_colab_recycles", 3)),
-                    colabfold_num_models=int(st.session_state.get("target_refold_colab_models", 3)),
-                    colabfold_gpu_device=str(target_gpu),
-                    gpu_device=str(target_gpu),
-                    colabfold_use_target_templates=bool(st.session_state.get("target_refold_colab_templates", True)),
-                    colabfold_use_target_msa=bool(st.session_state.get("target_refold_colab_msa", True)),
-                    colabfold_max_template_hits=4,
-                    boltz2_use_target_template=bool(st.session_state.get("target_refold_boltz_template", True)),
-                    boltz2_use_target_msa=bool(st.session_state.get("target_refold_boltz_msa", True)),
-                    boltz2_recycling_steps=int(st.session_state.get("target_refold_boltz_recycles", 10)),
-                    boltz2_sampling_steps=int(st.session_state.get("target_refold_boltz_steps", 100)),
-                    boltz2_diffusion_samples=int(st.session_state.get("target_refold_boltz_samples", 3)),
-                    boltz2_write_full_pae=bool(st.session_state.get("target_refold_boltz_full_pae", True)),
-                    esmfold2_modes=list(st.session_state.get("target_refold_esm_modes") or target_esm_modes or ["initial_guess"]),
-                    esmfold2_use_target_msa=bool(st.session_state.get("target_refold_esm_msa", True)),
-                    num_sampling_steps=int(st.session_state.get("target_refold_esm_steps", 68)),
-                    num_loops=int(st.session_state.get("target_refold_esm_loops", 10)),
-                    seed=int(st.session_state.get("target_refold_esm_seed", 0)),
-                    rf3_checkpoint_path=Path(str(st.session_state.get("target_refold_rf3_checkpoint") or RF3_CHECKPOINT)),
-                    rf3_use_target_msa=bool(st.session_state.get("target_refold_rf3_msa", True)),
-                    rf3_use_target_template=bool(st.session_state.get("target_refold_rf3_template", True)),
-                    rf3_recycles=int(st.session_state.get("target_refold_rf3_recycles", 10)),
-                    rf3_num_steps=int(st.session_state.get("target_refold_rf3_steps", 50)),
-                    rf3_diffusion_batch_size=int(st.session_state.get("target_refold_rf3_samples", 5)),
-                    rf3_seed=int(st.session_state.get("target_refold_rf3_seed", 0)),
-                    openfold3_checkpoint_path=Path(str(st.session_state.get("target_refold_openfold3_checkpoint") or OPENFOLD3_CHECKPOINT)),
-                    openfold3_use_target_msa=bool(st.session_state.get("target_refold_openfold3_msa", True)),
-                    openfold3_num_diffusion_samples=int(st.session_state.get("target_refold_openfold3_samples", 5)),
-                    openfold3_num_model_seeds=int(st.session_state.get("target_refold_openfold3_seeds", 1)),
-                    openfold3_num_recycles=int(st.session_state.get("target_refold_openfold3_recycles", 3)),
-                    openfold3_use_msa_server=bool(st.session_state.get("target_refold_openfold3_msa_server", False)),
-                    protenix_use_msa=bool(st.session_state.get("target_refold_protenix_msa", True)),
-                    protenix_cycle=int(st.session_state.get("target_refold_protenix_cycle", 3)),
-                    protenix_diffusion_steps=int(st.session_state.get("target_refold_protenix_steps", 50)),
-                    protenix_samples=int(st.session_state.get("target_refold_protenix_samples", 5)),
-                    protenix_v1_model_name=str(st.session_state.get("target_refold_protenix_v1_model") or PROTENIX_V1_MODEL),
-                    protenix_v1_use_msa=bool(st.session_state.get("target_refold_protenix_v1_msa", True)),
-                    protenix_v1_use_template=bool(st.session_state.get("target_refold_protenix_v1_template", True)),
-                    protenix_v1_use_default_params=True,
-                    protenix_v1_cycle=int(st.session_state.get("target_refold_protenix_v1_cycle", 10)),
-                    protenix_v1_diffusion_steps=int(st.session_state.get("target_refold_protenix_v1_steps", 200)),
-                    protenix_v1_samples=int(st.session_state.get("target_refold_protenix_v1_samples", 5)),
-                    protenix_v2_model_name=str(st.session_state.get("target_refold_protenix_v2_model") or PROTENIX_V2_MODEL),
-                    protenix_v2_use_msa=bool(st.session_state.get("target_refold_protenix_v2_msa", True)),
-                    protenix_v2_use_template=bool(st.session_state.get("target_refold_protenix_v2_template", True)),
-                    protenix_v2_use_default_params=True,
-                    protenix_v2_cycle=int(st.session_state.get("target_refold_protenix_v2_cycle", 10)),
-                    protenix_v2_diffusion_steps=int(st.session_state.get("target_refold_protenix_v2_steps", 200)),
-                    protenix_v2_samples=int(st.session_state.get("target_refold_protenix_v2_samples", 5)),
-                    boltzgen_recycling_steps=int(st.session_state.get("target_refold_boltzgen_recycles", 3)),
-                    boltzgen_sampling_steps=int(st.session_state.get("target_refold_boltzgen_steps", 100)),
-                    boltzgen_diffusion_samples=int(st.session_state.get("target_refold_boltzgen_samples", 3)),
-                )
-                spawn_worker_for_run(run_dir)
-                st.success("Target refolding queued. The worker will keep running independently of Streamlit.")
-                show_pipeline_links(run_dir, [source_run_dir, run_dir])
-            except Exception as exc:
-                st.error(str(exc))
+                delete_result = st.session_state.pop(f"{table_key}_delete_result", None)
+                if delete_result:
+                    level, message = delete_result
+                    if level == "success":
+                        st.success(str(message))
+                    else:
+                        st.error(str(message))
 
-    with refold_results_tab:
-        refresh_results_button("target_preparation_refolding_refresh_results")
-        runs = _target_refolding_runs()
-        if not runs:
-            st.info("No target-refolding runs are available yet.")
-        else:
-            runs_df = pd.DataFrame(runs)
-            hidden_columns = {"result", "run_dir", "source_run_dir"}
-            preferred_columns = [
-                "job_code",
-                "status",
-                "target",
-                "target_chain_ids",
-                "evidence_mode",
-                "evidence_detail",
-                "warning",
-                "target_structures",
-                "target_chains",
-                "records",
-                "current_phase",
-                "current_engine",
-                "created_at",
-                "run_id",
-                "task_group",
-            ]
-            visible_columns = [
-                column for column in preferred_columns if column in runs_df.columns and column not in hidden_columns
-            ]
-            visible_columns.extend(
-                column for column in runs_df.columns if column not in hidden_columns and column not in visible_columns
-            )
-            display_df = runs_df.copy()
-            if {"job_code", "result"}.issubset(display_df.columns):
-                display_df["job_code"] = display_df.apply(
-                    lambda row: f"{row['result']}&job_code={row['job_code']}",
-                    axis=1,
+                selected_indices = [
+                    index
+                    for index in selected_dataframe_rows(event, f"{table_key}_jobs_table")
+                    if 0 <= index < len(runs_df)
+                ]
+                selected_rows = runs_df.iloc[selected_indices].copy() if selected_indices else runs_df.iloc[0:0].copy()
+                active_selected = selected_rows[selected_rows["status"].isin(ACTIVE_STATUSES)] if "status" in selected_rows.columns else selected_rows.iloc[0:0]
+                if not active_selected.empty:
+                    st.warning("Running, queued, or preparing target-refolding jobs cannot be deleted.")
+                if "status" in selected_rows.columns:
+                    selected_rows = selected_rows[~selected_rows["status"].isin(ACTIVE_STATUSES)]
+                selected_refs = [
+                    (str(row.get("task_group") or "target-refolding"), str(row.get("run_id") or ""))
+                    for row in selected_rows.to_dict(orient="records")
+                    if str(row.get("run_id") or "")
+                ]
+                selected_refs_key = f"{table_key}_selected_delete_refs"
+                if selected_refs:
+                    st.session_state[selected_refs_key] = selected_refs
+                cached_selected_refs = st.session_state.get(selected_refs_key) or []
+                delete_clicked = st.button(
+                    "Delete selected target-refolding jobs",
+                    type="primary",
+                    disabled=not cached_selected_refs,
+                    key=f"{table_key}_request_delete_jobs",
                 )
-            table_key = "target_refolding_results"
-            event = st.dataframe(
-                display_df[visible_columns],
-                hide_index=True,
-                width="stretch",
-                key=f"{table_key}_jobs_table",
-                on_select="rerun",
-                selection_mode="multi-row",
-                column_config={
-                    "job_code": st.column_config.LinkColumn("job_code", display_text=r"job_code=([^&]+)"),
-                },
-            )
-            delete_result = st.session_state.pop(f"{table_key}_delete_result", None)
-            if delete_result:
-                level, message = delete_result
-                if level == "success":
-                    st.success(str(message))
+                if delete_clicked and cached_selected_refs:
+                    show_delete_jobs_dialog(
+                        table_key=table_key,
+                        pending_refs=cached_selected_refs,
+                        selected_refs_key=selected_refs_key,
+                        label="target-refolding job",
+                    )
                 else:
-                    st.error(str(message))
-
-            selected_indices = [
-                index
-                for index in selected_dataframe_rows(event, f"{table_key}_jobs_table")
-                if 0 <= index < len(runs_df)
-            ]
-            selected_rows = runs_df.iloc[selected_indices].copy() if selected_indices else runs_df.iloc[0:0].copy()
-            active_selected = selected_rows[selected_rows["status"].isin(ACTIVE_STATUSES)] if "status" in selected_rows.columns else selected_rows.iloc[0:0]
-            if not active_selected.empty:
-                st.warning("Running, queued, or preparing target-refolding jobs cannot be deleted.")
-            if "status" in selected_rows.columns:
-                selected_rows = selected_rows[~selected_rows["status"].isin(ACTIVE_STATUSES)]
-            selected_refs = [
-                (str(row.get("task_group") or "target-refolding"), str(row.get("run_id") or ""))
-                for row in selected_rows.to_dict(orient="records")
-                if str(row.get("run_id") or "")
-            ]
-            selected_refs_key = f"{table_key}_selected_delete_refs"
-            if selected_refs:
-                st.session_state[selected_refs_key] = selected_refs
-            cached_selected_refs = st.session_state.get(selected_refs_key) or []
-            delete_clicked = st.button(
-                "Delete selected target-refolding jobs",
-                type="primary",
-                disabled=not cached_selected_refs,
-                key=f"{table_key}_request_delete_jobs",
-            )
-            if delete_clicked and cached_selected_refs:
-                show_delete_jobs_dialog(
-                    table_key=table_key,
-                    pending_refs=cached_selected_refs,
-                    selected_refs_key=selected_refs_key,
-                    label="target-refolding job",
-                )
-            else:
-                st.caption("Select finished target-refolding rows in the table to enable deletion.")
-            _render_target_refolding_result_browser(runs, key_prefix="target_refold_nested_results")
+                    st.caption("Select finished target-refolding rows in the table to enable deletion.")
+                _render_target_refolding_result_browser(runs, key_prefix="target_refold_nested_results")

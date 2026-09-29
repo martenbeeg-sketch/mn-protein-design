@@ -25,6 +25,7 @@ from mn_protein_design.core.gpu import docker_gpu_args, normalize_gpu_device
 from mn_protein_design.core.hotspot_metrics import calculate_hotspot_metrics, passes_hotspot_prefilter
 from mn_protein_design.core.jobs import collect_jobs, create_job, finish_job, read_json, update_status, write_json
 from mn_protein_design.core.manifests import load_manifest
+from mn_protein_design.core.scheduler import apply_docker_cpu_limit, apply_docker_cpu_limits_to_steps
 from mn_protein_design.core.structures import filter_pdb_text, pdb_summary
 from mn_protein_design.runtime import reference_root
 from mn_protein_design.workflows.target_msa import (
@@ -307,10 +308,13 @@ def build_rfdiffusion_run_parameters(
 
 
 def parse_binder_lengths(text: str) -> list[int]:
-    tokens = [token for token in re.split(r"[-,\s]+", text.strip()) if token]
-    if not tokens:
+    value = str(text or "").strip()
+    if not value:
         raise ValueError("Binder length is required.")
-    lengths = [int(token) for token in tokens]
+    match = re.fullmatch(r"(\d+)(?:\s*(?:-|,|\s)\s*(\d+))?", value)
+    if not match:
+        raise ValueError("Binder length should be a single value or a two-value range.")
+    lengths = [int(value) for value in match.groups() if value is not None]
     if any(length < 1 for length in lengths):
         raise ValueError("Binder lengths must be positive.")
     if len(lengths) > 2:
@@ -934,7 +938,7 @@ def _ensure_boltz_msa_for_sequence(run_dir: Path, sequence: str, label: str, gpu
         "BOLTZ_CACHE=/cache",
         "--ipc=host",
         "--shm-size=48G",
-        "ovoex-boltz2",
+        "mn-boltz2:cu128",
         "predict",
         "/work/input.yaml",
         "--out_dir",
@@ -954,6 +958,7 @@ def _ensure_boltz_msa_for_sequence(run_dir: Path, sequence: str, label: str, gpu
         stdout.write(f"$ {' '.join(command)}\n")
         stdout.write(f"MSA cache miss for {label}: {host_path} ({reason})\n")
         stdout.flush()
+        command = apply_docker_cpu_limit(command, run_dir)
         completed = subprocess.run(command, stdout=stdout, stderr=stderr, check=False)
     if completed.returncode != 0:
         raise RuntimeError(f"Boltz2 MSA preflight failed for {label} with return code {completed.returncode}.")
@@ -2211,6 +2216,7 @@ def _copy_target_for_design(job_run_dir: Path, target_pdb: Path, target_chains: 
 
 
 def _run_shell_steps(run_dir: Path, steps: list[dict]) -> int:
+    steps = apply_docker_cpu_limits_to_steps(run_dir, steps)
     write_json(run_dir / "command.json", {"mode": "docker", "steps": steps})
     update_status(run_dir, "running")
     with (run_dir / "stdout.log").open("a") as stdout, (run_dir / "stderr.log").open("a") as stderr:

@@ -13,11 +13,20 @@ from mn_protein_design.app.components.molstar_viewer import (
     StructureVisualization,
     molstar_custom_component,
 )
-from mn_protein_design.app.pages.common import result_link
+from mn_protein_design.app.pages.common import cpu_run_panel, result_link
 from mn_protein_design.core.candidates import STAGE_COMPLEX_REFOLDING
 from mn_protein_design.core.jobs import collect_jobs, read_json
+from mn_protein_design.core.workflow_queue import queued_workflow_alias
 from mn_protein_design.workflows.analysis import DEFAULT_THRESHOLDS, run_analysis_contract
 from mn_protein_design.workflows.modules import candidate_sources, load_source_candidates
+
+
+queue_analysis_contract = queued_workflow_alias(
+    run_analysis_contract,
+    task_group="analysis",
+    tool="ranking",
+    job_type="analysis",
+)
 
 
 st.title("Analysis")
@@ -1267,24 +1276,18 @@ else:
 if source_tool not in native_end_to_end_tools:
     st.subheader("Run App Re-analysis")
 
+analysis_cpu_cores = cpu_run_panel(key="analysis_reanalysis", default=4)
 if source_tool not in native_end_to_end_tools and st.button("Run app re-analysis", type="primary"):
     try:
-        run_dir = run_analysis_contract(
+        run_dir = queue_analysis_contract(
             source_run_dir=source["run_dir"],
             candidates_jsonl=source["candidates_jsonl"],
             tool=str(tool or "ranking"),
             keep_top_n=int(keep_top_n),
             thresholds=thresholds,
+            queue_cpu_cores=analysis_cpu_cores,
         )
-        st.success("App re-analysis job finished.")
+        st.success("App re-analysis queued. It will continue if you close Streamlit.")
         st.link_button("Open result", result_link("analysis", run_dir.name))
-        ranked_csv = run_dir / "artifacts" / "analysis" / "ranked_candidates.csv"
-        if ranked_csv.exists():
-            _show_ranked_analysis_csv(
-                ranked_csv,
-                title="New Completed Analysis Results",
-                thresholds=thresholds,
-                keep_top_n=int(keep_top_n),
-            )
     except Exception as exc:
         st.error(str(exc))

@@ -1,6 +1,6 @@
 tool: masif_seed
 group: ppi-detection
-image: masif_seed:latest
+image: mn-masif-seed:cpu
 gpu: true
 description: MaSIF-seed target surface/site prediction for one prepared target chain.
 inputs:

@@ -16,14 +16,16 @@ from mn_protein_design.core.candidates import (
     read_candidates,
     write_candidates,
 )
+from mn_protein_design.core.portable_paths import resolve_stored_path
 from mn_protein_design.core.hotspot_metrics import calculate_hotspot_metrics
 from mn_protein_design.core.jobs import create_job, finish_job, read_json, update_status, write_json
+from mn_protein_design.core.scheduler import apply_docker_cpu_limits_to_steps
 
 
 ANALYSIS_GROUP = "analysis"
 IPSAE_RUNNER = Path("/home/user/programs/ovo-git/ovo/pipelines/ipsae-tool/bin/run_ipsae.py")
 IPSAE_FULL_RUNNER = Path("tools_to_implement/de_novo_binder_scoring/scripts/ipsae_w_ipae.py")
-IPSAE_IMAGE = "ovoex-ipsae:latest"
+IPSAE_IMAGE = "mn-ipsae:latest"
 
 
 DEFAULT_THRESHOLDS = {
@@ -216,8 +218,7 @@ def _safe_float(value: Any) -> float | None:
 def _resolve_path(base_dir: Path, path_text: str | None) -> Path | None:
     if not path_text:
         return None
-    path = Path(str(path_text))
-    return path if path.is_absolute() else base_dir / path
+    return resolve_stored_path(path_text, run_dir=base_dir)
 
 
 def _safe_id(candidate: dict[str, Any]) -> str:
@@ -772,6 +773,7 @@ def _run_ipsae(source_run_dir: Path, run_dir: Path, candidates: list[dict[str, A
         enhanced.append({**candidate, "metrics": metrics})
 
     if steps:
+        steps = apply_docker_cpu_limits_to_steps(run_dir, steps)
         command_payload = {
             "mode": "internal+docker",
             "steps": steps,
